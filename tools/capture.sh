@@ -2,6 +2,8 @@
 # Captures rature's window on a file, in a nested headless Weston (with Xwayland: GPUI needs a
 # seat) and a private bus, never the user's session. Prints the start-up timing.
 # usage: tools/capture.sh <file.md> <out.png>
+# KEYS: keys typed into the window once it is up, as tools/xkeys.py takes them ("j j shift+g").
+# THEN: a shell command run afterwards (a change to the file, say).
 # needs: weston (with Xwayland), weston-screenshooter, dbus-daemon, ImageMagick.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
@@ -34,7 +36,9 @@ export DBUS_SESSION_BUS_ADDRESS=unix:path=$D/bus
 
 DISPLAY=$DISP RATURE_TIMING=1 "$BIN" "$FILE" >"$D/app.log" 2>&1 &
 APID=$!
-sleep 8
+sleep ${WAIT:-3}
+[ -n "${KEYS:-}" ] && DISPLAY=$DISP python3 "$here/xkeys.py" $KEYS && sleep 1
+[ -n "${THEN:-}" ] && sh -c "$THEN" && sleep 2
 (cd "$D" && XDG_RUNTIME_DIR=$D/wrun WAYLAND_DISPLAY=wl-rature weston-screenshooter >/dev/null 2>&1)
 cat "$D/app.log"; echo "dir: $D"
 
