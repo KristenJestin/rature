@@ -11,6 +11,7 @@ mod math;
 mod picker;
 mod reader;
 mod render;
+mod start;
 mod state;
 mod theme;
 mod tree;
@@ -89,6 +90,7 @@ fn main() {
         reader::bind_keys(cx);
         tree::bind_keys(cx);
         picker::bind_keys(cx);
+        start::bind_keys(cx);
         workspace::bind_keys(cx);
         let bounds = Bounds::centered(None, size(px(1180.), px(900.)), cx);
         let options = WindowOptions {

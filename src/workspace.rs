@@ -9,6 +9,7 @@ use crate::config::{Config, Side};
 use crate::formats::is_markdown;
 use crate::picker::{Choice, Picker, PickerEvent, Target};
 use crate::reader::{Jump, Reader, ReaderEvent};
+use crate::start::{Start, StartEvent};
 use crate::state::State;
 use crate::theme::theme;
 use crate::tree::{Tree, TreeEvent};
@@ -27,6 +28,10 @@ actions!(
 );
 
 pub fn bind_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("f", FindFile, Some("Start")),
+        KeyBinding::new("shift-o", OpenPath, Some("Start")),
+    ]);
     for at in ["Reader", "Tree"] {
         cx.bind_keys([
             KeyBinding::new("f", FindFile, Some(at)),
@@ -50,6 +55,8 @@ pub struct Workspace {
     tree_shown: bool,
     tree_subscription: Option<Subscription>,
     picker: Option<(Entity<Picker>, Subscription)>,
+    /// With nothing open: the recent files and the file chooser.
+    start: Option<(Entity<Start>, Subscription)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -74,6 +81,7 @@ impl Workspace {
             tree_shown: false,
             tree_subscription: None,
             picker: None,
+            start: None,
             _subscriptions: vec![subscription],
         }
     }
@@ -82,13 +90,24 @@ impl Workspace {
         &self.reader
     }
 
-    /// Opens a file, or a folder with its tree and the README it may hold. Nothing: an empty page.
+    /// Opens a file, or a folder with its tree and the README it may hold. Nothing: the start
+    /// page.
     pub fn open(&mut self, path: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        self.start = None;
         match path {
             None => {
-                self.reader.update(cx, |reader, cx| reader.show("", cx));
-                let focus = self.reader.read(cx).focus_handle().clone();
+                let recent = cx.global::<State>().recent.clone();
+                let start = cx.new(|cx| Start::new(recent, cx));
+                let subscription = cx.subscribe_in(
+                    &start,
+                    window,
+                    |this, _, StartEvent::Open(path), window, cx| {
+                        this.open(Some(path.clone()), window, cx)
+                    },
+                );
+                let focus = start.read(cx).focus_handle().clone();
                 window.focus(&focus, cx);
+                self.start = Some((start, subscription));
             }
             Some(path) if path.is_dir() => {
                 cx.global_mut::<State>().opened(&path);
@@ -178,7 +197,10 @@ impl Workspace {
                     PickerEvent::Dismissed => None,
                 };
                 this.picker = None;
-                let focus = this.reader.read(cx).focus_handle().clone();
+                let focus = match &this.start {
+                    Some((start, _)) => start.read(cx).focus_handle().clone(),
+                    None => this.reader.read(cx).focus_handle().clone(),
+                };
                 window.focus(&focus, cx);
                 match target {
                     Some(Target::File(path)) => this.open_file(path, Jump::Restore, window, cx),
@@ -328,9 +350,10 @@ impl Render for Workspace {
             .bg(t.background)
             .text_color(t.text)
             .font_family(config.font.clone())
-            .map(|d| match config.tree {
-                Side::Left => d.children(panel).child(reader),
-                Side::Right => d.child(reader).children(panel),
+            .map(|d| match (&self.start, config.tree) {
+                (Some((start, _)), _) => d.child(start.clone()),
+                (None, Side::Left) => d.children(panel).child(reader),
+                (None, Side::Right) => d.child(reader).children(panel),
             })
             .when_some(self.picker.as_ref(), |d, (picker, _)| {
                 d.child(

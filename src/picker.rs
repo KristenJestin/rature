@@ -305,7 +305,7 @@ impl Picker {
 }
 
 /// `path` with the home folder as `~`.
-fn shown(path: &Path) -> String {
+pub fn shown(path: &Path) -> String {
     match path.strip_prefix(home()) {
         Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
         Ok(rest) => format!("~/{}", rest.display()),
@@ -314,7 +314,7 @@ fn shown(path: &Path) -> String {
 }
 
 /// A file's name, a folder's with a `/`.
-fn name(path: &Path) -> String {
+pub fn name(path: &Path) -> String {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())

@@ -935,7 +935,7 @@ impl Reader {
                     None => file,
                 }
             })
-            .unwrap_or_else(|| "f opens a file or a folder".into())
+            .unwrap_or_else(|| "Rature".into())
     }
 
     fn footer(&self, cx: &Context<Self>) -> impl IntoElement {

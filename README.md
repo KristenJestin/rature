@@ -9,8 +9,9 @@ writes. Native, keyboard first, no webview.
 
 - **A file or a folder**: `rature file.md` or `rature folder/`. A folder shows a tree (left or
   right), ignoring what `.gitignore` ignores, and opens its README. One window: opening another
-  file sends it there. Started without one, `f` (or `O` at any time) opens a recent file or
-  folder, or any other by its path, Tab completing it.
+  file sends it there. Started without one, the window lists the recent files and folders, with
+  buttons to the desktop's file chooser (XDG portal). `f` there, or `O` at any time, opens one by
+  its path, Tab completing it.
 - **No trace in the folder**: config in `~/.config/rature/config.toml`, reading positions, recent
   files and read snapshots in `~/.local/state/rature`.
 - **Markdown**: tables, task lists, footnotes, highlighted code (copy button), Mermaid diagrams,
@@ -57,7 +58,7 @@ the file finder; dprint for Markdown formatting.
 `./install.sh` builds this clone and installs `rature` into `~/.local/bin`, with `rt` a link to
 it, and adds Rature to the application launcher (entry and icon in `$XDG_DATA_HOME`). On
 Omarchy it also adds `~/.config/omarchy/hooks/theme-set.d/rature`, so an open window follows a
-theme change. Run it again to update. Started from the launcher, without a file, the page is empty and `f` opens one.
+theme change. Run it again to update. Started from the launcher, without a file, it shows the recent files and folders.
 
 ## Using
 
