@@ -5746,8 +5746,10 @@ dependencies = [
  "serde_json",
  "similar 3.2.1",
  "syntect",
+ "tempfile",
  "toml 0.8.23",
  "two-face",
+ "unicode-normalization",
  "yaml-rust2",
 ]
 
