@@ -43,19 +43,34 @@ Rust and GPUI through gpui-kit, as Flottille. No webview.
 it, and adds Rature to the application launcher (entry and icon in `$XDG_DATA_HOME`). Run it
 again to update. Started from the launcher, without a file, the window says how to open one.
 
+## Using
+
+`rature file.md` (or `rt file.md`) opens the file and gives the terminal back. With a window
+already open, the file goes to it. The file is followed: written in place or replaced by a
+rename, as an agent does, it is read again where you are.
+
+| Keys | |
+|---|---|
+| `j` `k`, arrows | line down, up |
+| `Ctrl-d` `Ctrl-u` | half a page |
+| `Space` `Shift-Space`, `Ctrl-f` `Ctrl-b` | a page |
+| `gg` `G`, `Home` `End` | top, bottom |
+| `e` | the file in nvim, in the desktop's terminal (`xdg-terminal-exec`) |
+| `q` | quit |
+
 ## Prototype
 
 `cargo run --release -- examples/sample.md` renders a file with a Mermaid diagram, a display
 formula and inline math, natively. `tools/capture.sh <file.md> <out.png>` captures the window in a
 nested headless Weston, never the user's session, and prints the start-up timing
-(`RATURE_TIMING=1`).
+(`RATURE_TIMING=1`). `KEYS` types keys into it first, `THEN` runs a command afterwards.
 
 Measured on the prototype (release build, headless Weston, machine in use):
 
 - first frame of a plain file: about 155 ms after start;
-- the sample: about 200 ms, of which 40 ms of Mermaid on the main thread (the formulas take under
-  a millisecond). Diagrams are to be drawn off the main thread, the text first.
+- the sample: about 200 ms when Mermaid ran on the main thread (40 ms of it); diagrams are now
+  drawn in the background, once per source, and the first frame is at about 175 ms.
 
 ## Next step
 
-Draw diagrams in the background, then the real reader: live reload, vim keys, the folder tree.
+The folder tree, search, then "what changed".

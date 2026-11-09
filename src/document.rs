@@ -1,7 +1,7 @@
 use markdown::mdast::Node;
 use std::sync::Arc;
 
-use crate::{diagram, math};
+use crate::math;
 
 /// A picture drawn from source (a diagram, a formula): its SVG decoded by GPUI, and the size it
 /// takes on screen. The SVG is drawn at `diagram::SCALE` times that size, so it stays sharp on a
@@ -18,6 +18,8 @@ pub enum Block {
     Paragraph(Vec<Inline>),
     Code(String),
     Picture(Picture),
+    /// A Mermaid diagram, by its source: drawn off the main thread, once per source.
+    Diagram(String),
     /// Source that could not be drawn, shown as code with the reason.
     Broken {
         source: String,
@@ -52,6 +54,18 @@ pub struct Marks {
     pub link: bool,
 }
 
+/// The sources of the diagrams in `blocks`, at any depth.
+pub fn diagrams(blocks: &[Block], out: &mut Vec<String>) {
+    for block in blocks {
+        match block {
+            Block::Diagram(source) => out.push(source.clone()),
+            Block::Quote(inner) => diagrams(inner, out),
+            Block::List { items, .. } => items.iter().for_each(|item| diagrams(&item.blocks, out)),
+            _ => {}
+        }
+    }
+}
+
 pub fn parse(source: &str) -> Vec<Block> {
     let mut options = markdown::ParseOptions::gfm();
     options.constructs.math_flow = true;
@@ -68,13 +82,7 @@ fn block(node: &Node) -> Option<Block> {
     Some(match node {
         Node::Heading(h) => Block::Heading(h.depth, inlines(&h.children, Marks::default())),
         Node::Paragraph(p) => Block::Paragraph(inlines(&p.children, Marks::default())),
-        Node::Code(c) if c.lang.as_deref() == Some("mermaid") => match diagram::render(&c.value) {
-            Ok(picture) => Block::Picture(picture),
-            Err(error) => Block::Broken {
-                source: c.value.clone(),
-                error,
-            },
-        },
+        Node::Code(c) if c.lang.as_deref() == Some("mermaid") => Block::Diagram(c.value.clone()),
         Node::Code(c) => Block::Code(c.value.clone()),
         Node::Math(m) => match math::render(&m.value, true) {
             Ok(picture) => Block::Picture(picture),
@@ -184,14 +192,12 @@ mod tests {
     const SAMPLE: &str = include_str!("../examples/sample.md");
 
     #[test]
-    fn a_mermaid_block_and_a_display_formula_become_pictures() {
+    fn a_display_formula_becomes_a_picture_and_a_mermaid_block_a_diagram() {
         let blocks = parse(SAMPLE);
-        let pictures = blocks
-            .iter()
-            .filter(|b| matches!(b, Block::Picture(_)))
-            .count();
-        assert!(!blocks.iter().any(|b| matches!(b, Block::Broken { .. })));
-        assert_eq!(pictures, 2);
+        let count = |f: fn(&Block) -> bool| blocks.iter().filter(|b| f(b)).count();
+        assert_eq!(count(|b| matches!(b, Block::Broken { .. })), 0);
+        assert_eq!(count(|b| matches!(b, Block::Picture(_))), 1);
+        assert_eq!(count(|b| matches!(b, Block::Diagram(_))), 1);
     }
 
     #[test]

@@ -5584,9 +5584,11 @@ dependencies = [
 name = "rature"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "gpui-kit",
  "markdown",
  "mermaid-rs-renderer",
+ "notify",
  "ratex-layout",
  "ratex-parser",
  "ratex-svg",
