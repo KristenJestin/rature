@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 
+use gpui_kit::base::Button;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -89,9 +90,10 @@ impl Start {
 impl Render for Start {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme(cx).clone();
+        let this = cx.entity().downgrade();
         let button = |id: &'static str, label: &'static str, directories: bool| {
-            div()
-                .id(id)
+            let this = this.clone();
+            Button::new(id)
                 .px_3()
                 .py_1()
                 .rounded_md()
@@ -102,9 +104,10 @@ impl Render for Start {
                 .cursor_pointer()
                 .hover(|s| s.border_color(t.accent))
                 .child(label)
-                .on_click(
-                    cx.listener(move |this, _: &ClickEvent, _, cx| this.choose(directories, cx)),
-                )
+                .on_click(move |_, _, cx| {
+                    this.update(cx, |this, cx| this.choose(directories, cx))
+                        .ok();
+                })
         };
         div()
             .key_context("Start")
