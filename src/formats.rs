@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::document::{self, Document};
+use crate::ui::Icon;
 
 /// Larger than this, a file is not read: Rature is for reading, not for logs.
 const LARGEST: u64 = 10 * 1024 * 1024;
@@ -47,6 +48,22 @@ pub fn is_markdown(path: &Path) -> bool {
         extension(path).as_str(),
         "md" | "markdown" | "mdx" | "mdown"
     )
+}
+
+/// The icon a file or a folder is listed with.
+pub fn icon(path: &Path) -> Icon {
+    if path.is_dir() {
+        return Icon::Folder;
+    }
+    let ext = extension(path);
+    match ext.as_str() {
+        _ if is_markdown(path) => Icon::Text,
+        "json" | "yaml" | "yml" | "toml" => Icon::Data,
+        "csv" | "tsv" => Icon::Table,
+        _ if IMAGES.contains(&ext.as_str()) => Icon::Image,
+        "" | "txt" | "log" => Icon::File,
+        _ => Icon::Code,
+    }
 }
 
 fn extension(path: &Path) -> String {

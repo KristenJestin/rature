@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::theme::home;
+use crate::config::home;
 
 /// How many files the recent list keeps.
 const RECENT: usize = 50;
@@ -16,8 +16,11 @@ const RECENT: usize = 50;
 pub struct State {
     /// Per file, the top-level block at the top of the window and how far into it.
     pub positions: HashMap<PathBuf, (usize, f32)>,
-    /// The files opened last, the latest first.
+    /// The files and folders opened last, the latest first.
     pub recent: Vec<PathBuf>,
+    /// When each of them was last opened, in seconds since the epoch.
+    #[serde(default)]
+    pub opened_at: HashMap<PathBuf, u64>,
 }
 
 impl gpui_kit::Global for State {}
@@ -49,6 +52,12 @@ impl State {
         self.recent.retain(|p| p != path);
         self.recent.insert(0, path.to_path_buf());
         self.recent.truncate(RECENT);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        self.opened_at.insert(path.to_path_buf(), now);
+        let recent = &self.recent;
+        self.opened_at.retain(|p, _| recent.contains(p));
     }
 }
 

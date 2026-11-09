@@ -8,8 +8,13 @@ use futures::StreamExt as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::formats::is_markdown;
-use crate::theme::{theme, tint};
+use std::f32::consts::FRAC_PI_2;
+
+use crate::formats::{self, is_markdown};
+use crate::ui::color::mix;
+use crate::ui::listing::{Item, Listing};
+use crate::ui::rows::turning;
+use crate::ui::{Icon, Type, icon, palette, selectable, space};
 use crate::{state, watch};
 
 actions!(tree, [Down, Up, Open, Close, First, Last]);
@@ -52,6 +57,8 @@ pub struct Tree {
     changed: HashSet<PathBuf>,
     focus: FocusHandle,
     scroll: ScrollHandle,
+    /// The rows as drawn: a folder's rows rise in as it opens and fold away as it closes.
+    list: Listing<(Entry, usize)>,
     _watch: Option<(notify::RecommendedWatcher, Task<()>)>,
 }
 
@@ -85,6 +92,7 @@ impl Tree {
             changed: HashSet::new(),
             focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
+            list: Listing::default(),
             _watch: watch,
         };
         tree.load(&root, cx);
@@ -321,92 +329,158 @@ fn list(folder: &Path) -> Vec<Entry> {
 impl Tree {
     fn row(
         &self,
-        entry: Entry,
+        entry: &Entry,
         depth: usize,
         focused: bool,
-        t: &crate::theme::Theme,
-        cx: &Context<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
-        let selected = self.selected.as_ref() == Some(&entry.path);
+        let p = palette(cx);
+        let selected = focused && self.selected.as_ref() == Some(&entry.path);
         let current = self.current.as_ref() == Some(&entry.path);
         let changed = self.changed.contains(&entry.path);
+        let open = entry.dir && self.open.contains(&entry.path);
         let name = entry
             .path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let icon = match (entry.dir, self.open.contains(&entry.path)) {
-            (true, true) => "▾",
-            (true, false) => "▸",
-            (false, _) => " ",
-        };
-        let ink = if current {
-            t.accent
-        } else if entry.dir {
-            t.text
-        } else {
-            t.muted
-        };
-        let background = match (selected, focused) {
-            (true, true) => Some(Hsla::from(t.selection)),
-            (true, false) => Some(tint(t.selection, 0.5)),
-            _ => None,
+        let id = ElementId::Path(entry.path.clone().into());
+        // A folder's chevron turns as it opens; a file has the room of one, empty.
+        let chevron = entry.dir.then(|| {
+            let folded = turning(id.clone(), open, window, cx);
+            icon(Icon::Chevron)
+                .size(px(12.))
+                .text_color(p.faint)
+                .with_transformation(Transformation::rotate(radians(-FRAC_PI_2 * folded)))
+        });
+        let glyph = match (entry.dir, open) {
+            (true, true) => Icon::FolderOpen,
+            (true, false) => Icon::Folder,
+            (false, _) => formats::icon(&entry.path),
         };
         let path = entry.path.clone();
-        div()
-            .id(ElementId::Path(entry.path.into()))
+        let element = div()
+            .id(id)
             .flex()
             .items_center()
-            .gap_1()
-            .pl(px(12. + 14. * depth as f32))
-            .pr_2()
+            .gap(px(6.))
+            .h(px(28.))
+            .mx(px(6.))
+            .pl(px(6. + 14. * depth as f32))
+            .pr(space::SM)
+            .rounded(px(6.))
+            .border_1()
+            .border_color(if selected {
+                p.focus_line
+            } else {
+                p.side.opacity(0.)
+            })
             .cursor_pointer()
-            .when_some(background, |d, bg| d.bg(bg))
-            .text_color(ink)
-            .when(current, |d| d.font_weight(FontWeight::BOLD))
-            .child(div().w(px(12.)).flex_none().text_color(t.muted).child(icon))
+            .child(
+                div()
+                    .w(px(12.))
+                    .flex_none()
+                    .flex()
+                    .justify_center()
+                    .children(chevron),
+            )
+            .child(icon(glyph).text_color(if current { p.text } else { p.faint }))
             .child(
                 div()
                     .flex_1()
+                    .min_w_0()
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
+                    .text_color(if current || entry.dir { p.text } else { p.mute })
+                    .when(current, |d| d.medium())
                     .child(name),
             )
             .when(changed, |d| {
-                d.child(div().flex_none().text_color(t.green).child("●"))
+                d.child(div().flex_none().size(px(6.)).rounded_full().bg(p.wait))
             })
             .on_click(
                 cx.listener(move |this, _: &ClickEvent, _, cx| this.activate(path.clone(), cx)),
-            )
-            .into_any_element()
+            );
+        selectable(element, current, move |e, hover, chosen| {
+            e.bg(mix(p.hover.opacity(hover), p.sel, chosen))
+        })
+        .into_any_element()
     }
 }
 
 impl Render for Tree {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = theme(cx).clone();
+        let p = palette(cx);
         let focused = self.focus.contains_focused(window, cx);
         let name = self
             .root
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| self.root.display().to_string());
+        let now = cx.background_executor().now();
+        let reduce = cx.reduce_motion();
         let rows = self.rows();
+        self.list.sync(
+            rows.into_iter()
+                .map(|(entry, depth)| (entry.path.display().to_string(), (entry, depth))),
+            now,
+            reduce,
+        );
+        let shown: Vec<(String, Entry, usize, crate::ui::listing::Placement)> = self
+            .list
+            .rows()
+            .map(|row| {
+                (
+                    row.key.to_string(),
+                    row.value.0.clone(),
+                    row.value.1,
+                    row.placement,
+                )
+            })
+            .collect();
+        let items: Vec<AnyElement> = shown
+            .into_iter()
+            .map(|(key, entry, depth, placement)| {
+                let row = self.row(&entry, depth, focused, window, cx);
+                Item::new(
+                    ElementId::Name(format!("tree-{key}").into()),
+                    placement,
+                    row,
+                )
+                .rising()
+                .into_any_element()
+            })
+            .collect();
         div()
             .size_full()
             .flex()
             .flex_col()
-            .bg(t.surface)
-            .text_size(px(13.5))
+            .bg(p.side)
+            .ui_text()
             .child(
                 div()
                     .flex_none()
-                    .px_3()
-                    .py_2()
-                    .text_color(t.muted)
-                    .font_weight(FontWeight::BOLD)
-                    .child(name),
+                    .h(px(44.))
+                    .px(space::LG)
+                    .flex()
+                    .items_center()
+                    .gap(space::SM)
+                    .border_b_1()
+                    .border_color(p.line)
+                    .child(icon(Icon::Folder).text_color(p.mute))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .medium()
+                            .text_color(p.text)
+                            .child(name),
+                    ),
             )
             .child(
                 div()
@@ -422,11 +496,8 @@ impl Render for Tree {
                     .flex_1()
                     .track_scroll(&self.scroll)
                     .overflow_y_scroll()
-                    .pb_4()
-                    .children(
-                        rows.into_iter()
-                            .map(|(entry, depth)| self.row(entry, depth, focused, &t, cx)),
-                    ),
+                    .py(space::SM)
+                    .children(items),
             )
     }
 }

@@ -18,7 +18,8 @@ use crate::formats::{self, Content};
 use crate::highlight::{self, Lines};
 use crate::render::{self, Ctx};
 use crate::state::{self, State};
-use crate::theme::{Theme, theme, tint};
+use crate::ui::toast::Toast;
+use crate::ui::{Button, Icon, Type, enter, icon, palette, space, toast};
 use crate::{diagram, format, watch};
 
 /// What `j` and `k` move.
@@ -143,8 +144,13 @@ struct Editing {
     _events: Subscription,
 }
 
+/// What a button of the bar does to the reader.
+type Run = fn(&mut Reader, &mut Window, &mut Context<Reader>);
+
 pub struct Reader {
     path: Option<PathBuf>,
+    /// The ink formulas were drawn in: a theme with another draws them again.
+    ink: String,
     content: Content,
     baseline: Baseline,
     /// The file as the baseline has it, and how the file now differs from it.
@@ -160,7 +166,6 @@ pub struct Reader {
     search_field: Entity<InputState>,
     searching: bool,
     query: String,
-    toast: Option<(SharedString, Task<()>)>,
     editing: Option<Editing>,
     zoom: f32,
     _subscriptions: Vec<Subscription>,
@@ -186,10 +191,16 @@ impl Reader {
                     _ => {}
                 },
             ),
-            cx.observe_global::<Theme>(|this, cx| this.restyle(cx)),
+            // Each frame of a theme's cross-fade touches it: drawn again only for a new ink.
+            cx.observe_global::<crate::ui::theme::Theme>(|this, cx| {
+                if this.ink != render::ink(cx) {
+                    this.restyle(cx)
+                }
+            }),
         ];
         Self {
             path: None,
+            ink: render::ink(cx),
             content: Content::Message(String::new()),
             baseline: Baseline::LastRead,
             before: None,
@@ -204,7 +215,6 @@ impl Reader {
             search_field,
             searching: false,
             query: String::new(),
-            toast: None,
             editing: None,
             zoom: 1.,
             _subscriptions: subscriptions,
@@ -232,7 +242,7 @@ impl Reader {
         self.path = None;
         self.watch = None;
         self.before = None;
-        let ink = theme(cx).text_hex();
+        let ink = render::ink(cx);
         self.set_content(Content::Markdown(document::parse(source, &ink, None)), cx);
     }
 
@@ -280,7 +290,7 @@ impl Reader {
         let Some(path) = self.path.clone() else {
             return;
         };
-        let ink = theme(cx).text_hex();
+        let ink = render::ink(cx);
         let content = match formats::load(&path, &ink) {
             Ok(content) => content,
             // Between the removal and the rename of an atomic write: the next event brings it.
@@ -293,6 +303,7 @@ impl Reader {
 
     /// The colours changed: what was drawn in the old ones is drawn again.
     fn restyle(&mut self, cx: &mut Context<Self>) {
+        self.ink = render::ink(cx);
         self.drawings.clear();
         self.highlights.clear();
         match self.path {
@@ -300,7 +311,7 @@ impl Reader {
             None => {
                 if let Content::Markdown(doc) = &self.content {
                     let source = doc.source.clone();
-                    let ink = theme(cx).text_hex();
+                    let ink = render::ink(cx);
                     self.set_content(Content::Markdown(document::parse(&source, &ink, None)), cx);
                 }
             }
@@ -308,7 +319,8 @@ impl Reader {
     }
 
     fn set_content(&mut self, content: Content, cx: &mut Context<Self>) {
-        let dark = theme(cx).dark;
+        let dark = render::is_dark(cx);
+        let colors = diagram::Colors::of(&crate::ui::theme::target_palette(cx));
         // Diagrams: each new one is drawn in the background, the one that stood at its place
         // shown meanwhile so the page does not jump.
         let (mut sources, mut before) = (Vec::new(), Vec::new());
@@ -331,8 +343,8 @@ impl Reader {
             self.drawings
                 .insert(source.clone(), Slot::Pending(stand_in));
             let drawn = cx.background_executor().spawn({
-                let source = source.clone();
-                async move { diagram::render(&source, dark) }
+                let (source, colors) = (source.clone(), colors.clone());
+                async move { diagram::render(&source, &colors) }
             });
             cx.spawn(async move |this, cx| {
                 let slot = match drawn.await {
@@ -402,7 +414,7 @@ impl Reader {
                 None => return,
             },
         };
-        let ink = theme(cx).text_hex();
+        let ink = render::ink(cx);
         let old = document::parse(&source, &ink, None);
         let changes = diff::compare(&old, doc);
         self.before = Some((old, changes));
@@ -506,10 +518,10 @@ impl Reader {
             return self.jump(jump, window, cx);
         };
         let Ok(target) = std::fs::canonicalize(&target) else {
-            return self.say(format!("{} is not there", target.display()), cx);
+            return self.fail(format!("{} is not there", target.display()), cx);
         };
         if target.is_dir() {
-            return self.say(format!("{} is a folder", target.display()), cx);
+            return self.fail(format!("{} is a folder", target.display()), cx);
         }
         self.remember(cx);
         self.forward.clear();
@@ -564,20 +576,14 @@ impl Reader {
         self.copy(format!("{name}#{slug}"), "Link copied", cx);
     }
 
-    /// A short message at the foot of the window, gone after a while.
+    /// The result of what was asked, in a toast that leaves by itself.
     pub fn say(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
-        let gone = cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(2500))
-                .await;
-            this.update(cx, |this, cx| {
-                this.toast = None;
-                cx.notify();
-            })
-            .ok();
-        });
-        self.toast = Some((message.into(), gone));
-        cx.notify();
+        toast(Toast::success(message), cx);
+    }
+
+    /// What could not be done, in a toast that stays until it is dismissed.
+    fn fail(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        toast(Toast::failure(message), cx);
     }
 
     pub fn toggle_fold(&mut self, path: Vec<usize>, cx: &mut Context<Self>) {
@@ -673,7 +679,7 @@ impl Reader {
             .stdin(std::process::Stdio::null())
             .spawn();
         if let Err(error) = spawned {
-            self.say(format!("Cannot open nvim: {error}"), cx);
+            self.fail(format!("Cannot open nvim: {error}"), cx);
         }
     }
 
@@ -873,7 +879,7 @@ impl Reader {
                 "The block changed on disk: your text is in the clipboard",
                 cx,
             ),
-            Err(error) => self.say(format!("Cannot write: {error}"), cx),
+            Err(error) => self.fail(format!("Cannot write: {error}"), cx),
         }
     }
 
@@ -915,7 +921,7 @@ impl Reader {
         match result {
             Ok(true) => self.say("Formatted and saved", cx),
             Ok(false) => self.say("Saved", cx),
-            Err(error) => self.say(format!("Cannot save: {error}"), cx),
+            Err(error) => self.fail(format!("Cannot save: {error}"), cx),
         }
         if let Some(editing) = &self.editing {
             let original = editing.original.clone();
@@ -924,97 +930,180 @@ impl Reader {
         }
     }
 
-    fn name(&self) -> String {
-        self.path
-            .as_deref()
-            .map(|p| {
-                let file = p
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                match p.parent().and_then(Path::file_name) {
-                    Some(folder) => format!("{}/{file}", folder.to_string_lossy()),
-                    None => file,
-                }
-            })
-            .unwrap_or_else(|| "Rature".into())
-    }
-
-    fn footer(&self, cx: &Context<Self>) -> impl IntoElement {
-        let t = theme(cx);
+    /// The bar over the page: where the file is, what changed, and the search.
+    fn bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
         let changes = self.changes().map_or(0, Changes::count);
-        let hits = if self.query.is_empty() {
-            None
-        } else {
-            Some(self.hits().len())
+        let this = cx.entity().downgrade();
+        let act = move |id: &'static str, glyph: Icon, tip: &'static str, run: Run| {
+            let this = this.clone();
+            Button::icon(id, glyph, tip).on_click(move |_, window, cx| {
+                this.update(cx, |this, cx| run(this, window, cx)).ok();
+            })
         };
-        let status = match (&self.toast, self.searching) {
-            (_, true) => None,
-            (Some((message, _)), _) => Some(message.clone()),
-            (None, _) => match (hits, changes) {
-                (Some(n), _) => Some(
-                    format!(
-                        "{n} blocks match “{}” · n N to go · Esc to clear",
-                        self.query
-                    )
-                    .into(),
-                ),
-                (None, 0) if self.before.is_some() => Some("Nothing changed".into()),
-                (None, 0) => None,
-                (None, n) => Some(
-                    format!(
-                        "{n} change{} since {} · ]c [c to go · m marks read",
-                        if n == 1 { "" } else { "s" },
-                        match self.baseline {
-                            Baseline::LastRead => "last read",
-                            Baseline::Head => "the last commit",
-                        }
-                    )
-                    .into(),
-                ),
-            },
-        };
-        div()
-            .flex_none()
-            .h(px(30.))
-            .px_4()
-            .flex()
-            .items_center()
-            .gap_4()
-            .border_t_1()
-            .border_color(t.border)
-            .bg(t.surface)
-            .text_size(px(13.))
-            .text_color(t.muted)
-            .child(div().flex_none().child(self.name()))
-            .when(self.searching, |d| {
-                d.child(
+        let crumbs = self.path.as_deref().map(|path| {
+            let folder = path
+                .parent()
+                .and_then(Path::file_name)
+                .map(|n| n.to_string_lossy().into_owned());
+            let file = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            div()
+                .flex()
+                .items_center()
+                .gap(space::SM)
+                .min_w_0()
+                .overflow_hidden()
+                .child(icon(formats::icon(path)).text_color(p.mute))
+                .children(folder.map(|folder| {
+                    div()
+                        .flex()
+                        .gap(space::SM)
+                        .text_color(p.faint)
+                        .child(folder)
+                        .child("/")
+                }))
+                .child(
+                    div()
+                        .text_color(p.text)
+                        .medium()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .overflow_hidden()
+                        .child(file),
+                )
+        });
+        let hits = (!self.query.is_empty()).then(|| self.hits().len());
+        let status: AnyElement = if self.searching || hits.is_some() {
+            div()
+                .flex()
+                .items_center()
+                .gap(space::SM)
+                .h(px(28.))
+                .w(px(300.))
+                .px(space::SM)
+                .rounded(px(7.))
+                .border_1()
+                .border_color(if self.searching {
+                    p.focus_line
+                } else {
+                    p.field_line
+                })
+                .bg(p.field)
+                .child(icon(Icon::Search).text_color(p.faint))
+                .child(
                     div()
                         .key_context("SearchBar")
                         .on_action(cx.listener(Self::clear_search))
                         .flex_1()
-                        .text_color(t.text)
+                        .min_w_0()
+                        .text_color(p.text)
                         .child(Input::new(&self.search_field)),
                 )
-            })
-            .when_some(status, |d, status| {
-                d.child(
+                .children(hits.map(|n| {
                     div()
-                        .flex_1()
+                        .flex_none()
+                        .mono(11.5)
+                        .text_color(if n == 0 { p.fail } else { p.mute })
+                        .child(format!("{n} block{}", if n == 1 { "" } else { "s" }))
+                }))
+                .into_any_element()
+        } else if changes > 0 {
+            let since = match self.baseline {
+                Baseline::LastRead => "since read",
+                Baseline::Head => "since commit",
+            };
+            div()
+                .flex()
+                .items_center()
+                .gap(px(2.))
+                .child(
+                    div()
                         .flex()
-                        .justify_end()
-                        .text_color(if changes > 0 && self.toast.is_none() {
-                            t.green
-                        } else {
-                            t.muted
-                        })
-                        .child(status),
+                        .items_center()
+                        .gap(px(6.))
+                        .h(px(24.))
+                        .px(space::SM)
+                        .mr(space::XS)
+                        .rounded_full()
+                        .bg(p.wait_bg)
+                        .text_color(p.wait)
+                        .mono(11.5)
+                        .medium()
+                        .child(div().size(px(6.)).rounded_full().bg(p.wait))
+                        .child(format!(
+                            "{changes} change{} {since}",
+                            if changes == 1 { "" } else { "s" }
+                        )),
                 )
+                .child(act(
+                    "previous-change",
+                    Icon::ChevronUp,
+                    "Previous change  [c",
+                    |this, window, cx| this.previous_change(&PreviousChange, window, cx),
+                ))
+                .child(act(
+                    "next-change",
+                    Icon::Chevron,
+                    "Next change  ]c",
+                    |this, window, cx| this.next_change(&NextChange, window, cx),
+                ))
+                .child(act(
+                    "mark-read",
+                    Icon::Check,
+                    "Mark read  m",
+                    |this, window, cx| this.mark_read(&MarkRead, window, cx),
+                ))
+                .into_any_element()
+        } else if self.before.is_some() {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .mono(11.5)
+                .text_color(p.faint)
+                .child(icon(Icon::Check).text_color(p.ok))
+                .child("Up to date")
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        };
+        div()
+            .flex_none()
+            .h(px(44.))
+            .px(space::LG)
+            .flex()
+            .items_center()
+            .gap(space::MD)
+            .border_b_1()
+            .border_color(p.line)
+            .bg(p.bg)
+            .ui_text()
+            .children(crumbs)
+            .child(div().flex_1())
+            .child(status)
+            .when(!self.searching && hits.is_none(), |d| {
+                d.child(act(
+                    "search",
+                    Icon::Search,
+                    "Search  /",
+                    |this, window, cx| this.search(&Search, window, cx),
+                ))
+            })
+            .when(self.path.is_some(), |d| {
+                d.child(act(
+                    "open-in-nvim",
+                    Icon::OpenInEditor,
+                    "Open in nvim  e",
+                    |this, window, cx| this.open_in_nvim(&OpenInNvim, window, cx),
+                ))
             })
     }
 
     fn items(&self, ctx: &Ctx, cx: &Context<Self>) -> Vec<AnyElement> {
-        let t = theme(cx);
+        let t = palette(cx);
         let column = cx.global::<Config>().column;
         let wrap = |element: AnyElement| -> AnyElement {
             div()
@@ -1039,21 +1128,36 @@ impl Reader {
                     }
                     let mark = changes.map(|(_, c)| &c.marks[ix]);
                     let editing = self.editing.as_ref().filter(|e| e.block == ix);
-                    let shown = match editing {
-                        Some(editing) => div()
-                            .key_context("Editing")
-                            .on_action(cx.listener(Self::stop_editing))
-                            .on_action(cx.listener(Self::save))
-                            .border_1()
-                            .border_color(t.accent)
-                            .rounded_md()
-                            .p_2()
-                            .font_family(cx.global::<Config>().code_font.clone())
-                            .text_size(ctx.size(0.9))
-                            .child(Textarea::new(&editing.field))
-                            .into_any_element(),
-                        None => self.block_element(ctx, doc, ix, block, mark, cx),
-                    };
+                    let shown =
+                        match editing {
+                            Some(editing) => {
+                                div()
+                                    .key_context("Editing")
+                                    .on_action(cx.listener(Self::stop_editing))
+                                    .on_action(cx.listener(Self::save))
+                                    .mx(px(-16.))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(space::XS)
+                                    .child(
+                                        div()
+                                            .rounded(px(8.))
+                                            .border_1()
+                                            .border_color(t.focus_line)
+                                            .bg(t.field)
+                                            .px(px(15.))
+                                            .py(space::SM)
+                                            .font_family(cx.global::<Config>().code_font.clone())
+                                            .text_size(ctx.size(0.9))
+                                            .child(Textarea::new(&editing.field)),
+                                    )
+                                    .child(div().px(px(16.)).mono(11.).text_color(t.faint).child(
+                                        "Saved as you type · Esc done · Ctrl-S save and format",
+                                    ))
+                                    .into_any_element()
+                            }
+                            None => self.block_element(ctx, doc, ix, block, mark, cx),
+                        };
                     item = item.child(shown);
                     items.push(wrap(item.into_any_element()));
                 }
@@ -1094,7 +1198,7 @@ impl Reader {
             Content::Message(message) => vec![wrap(
                 div()
                     .pt_10()
-                    .text_color(t.muted)
+                    .text_color(t.mute)
                     .child(message.clone())
                     .into_any_element(),
             )],
@@ -1110,7 +1214,7 @@ impl Reader {
         mark: Option<&Mark>,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let t = theme(cx);
+        let t = palette(cx);
         let inner = match (block, mark) {
             (Block::Paragraph(_), Some(Mark::Changed(Some(words)))) => {
                 render::changed_words(ctx, words).into_any_element()
@@ -1125,22 +1229,20 @@ impl Reader {
             .iter()
             .find(|h| h.block == ix)
             .map(|h| h.slug.clone());
+        let inner = match mark {
+            Some(Mark::Added) => render::marked(ctx, t.ok, t.ok_bg, inner),
+            Some(Mark::Changed(_)) => render::marked(ctx, t.wait, t.wait_bg, inner),
+            _ => inner,
+        };
+        // A block that arrives while the page is read rises into place.
+        let arrived = enter(
+            ElementId::Name(format!("block-{}", fingerprint(doc.source_of(ix))).into()),
+            0,
+            inner,
+        );
         div()
             .id(("block", ix))
-            .when_some(mark, |d, mark| match mark {
-                Mark::Same => d,
-                Mark::Added => d
-                    .border_l_4()
-                    .border_color(t.green)
-                    .bg(tint(t.green, 0.08))
-                    .pl_3(),
-                Mark::Changed(_) => d
-                    .border_l_4()
-                    .border_color(t.yellow)
-                    .bg(tint(t.yellow, 0.06))
-                    .pl_3(),
-            })
-            .child(inner)
+            .child(arrived)
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 if event.click_count() >= 2 {
                     this.edit_block(ix, window, cx);
@@ -1150,6 +1252,14 @@ impl Reader {
             }))
             .into_any_element()
     }
+}
+
+/// A short name for a block's source: the same text keeps its entrance played.
+fn fingerprint(source: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// The file as the last commit has it.
@@ -1172,7 +1282,7 @@ fn git_head(path: &Path) -> Option<String> {
 
 impl Render for Reader {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = theme(cx).clone();
+        let t = palette(cx);
         let config = cx.global::<Config>().clone();
         let folder = self
             .path
@@ -1194,15 +1304,13 @@ impl Render for Reader {
             );
             self.items(&ctx, cx)
         };
+        let bar = self.bar(cx);
         div()
             .size_full()
             .flex()
             .flex_col()
-            .bg(t.background)
-            .text_color(t.text)
-            .font_family(config.font.clone())
-            .text_size(px(config.font_size * self.zoom))
-            .line_height(rems(1.6))
+            .bg(t.bg)
+            .child(bar)
             .child(
                 div()
                     .id("page")
@@ -1243,15 +1351,18 @@ impl Render for Reader {
                     .on_action(cx.listener(Self::zoom_reset))
                     .flex_1()
                     .w_full()
+                    .text_color(t.text)
+                    .font_family(config.font.clone())
+                    .text_size(px(config.font_size * self.zoom))
+                    .line_height(rems(1.6))
                     .track_scroll(&self.scroll)
                     .overflow_y_scroll()
                     .flex()
                     .flex_col()
                     .items_center()
-                    .pt_10()
-                    .pb_20()
+                    .pt(space::XXXL)
+                    .pb(px(160.))
                     .children(items),
             )
-            .child(self.footer(cx))
     }
 }

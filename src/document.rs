@@ -585,7 +585,11 @@ mod tests {
 
     #[test]
     fn a_diagram_is_drawn_larger_than_it_shows() {
-        let picture = crate::diagram::render("flowchart LR\n A --> B", true).unwrap();
+        let picture = crate::diagram::render(
+            "flowchart LR\n A --> B",
+            &crate::diagram::Colors::of(&crate::ui::Palette::base()),
+        )
+        .unwrap();
         let svg = std::str::from_utf8(picture.image.bytes()).unwrap();
         let drawn = format!("width=\"{}\"", picture.width * crate::diagram::SCALE);
         assert!(

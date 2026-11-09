@@ -5,7 +5,7 @@
 //! tree_width = 260
 //! column = 760         # the reading column's width
 //! font = "Noto Sans"
-//! code_font = "JetBrainsMono Nerd Font"
+//! code_font = "Geist Mono"
 //! font_size = 16
 //! ```
 
@@ -13,8 +13,6 @@ use std::path::PathBuf;
 
 use gpui_kit::Global;
 use serde::Deserialize;
-
-use crate::theme::home;
 
 #[derive(Clone, Deserialize)]
 #[serde(default)]
@@ -41,7 +39,7 @@ impl Default for Config {
             tree_width: 260.,
             column: 760.,
             font: "Noto Sans".into(),
-            code_font: "JetBrainsMono Nerd Font".into(),
+            code_font: "Geist Mono".into(),
             font_size: 16.,
         }
     }
@@ -68,6 +66,12 @@ fn folder() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".config"))
         .join("rature")
+}
+
+pub fn home() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| "/".into())
 }
 
 #[cfg(test)]

@@ -11,8 +11,9 @@ use crate::picker::{Choice, Picker, PickerEvent, Target};
 use crate::reader::{Jump, Reader, ReaderEvent};
 use crate::start::{Start, StartEvent};
 use crate::state::State;
-use crate::theme::theme;
 use crate::tree::{Tree, TreeEvent};
+use crate::ui::ToastStack;
+use crate::ui::palette;
 
 actions!(
     workspace,
@@ -57,6 +58,7 @@ pub struct Workspace {
     picker: Option<(Entity<Picker>, Subscription)>,
     /// With nothing open: the recent files and the file chooser.
     start: Option<(Entity<Start>, Subscription)>,
+    toasts: Entity<ToastStack>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -82,6 +84,7 @@ impl Workspace {
             tree_subscription: None,
             picker: None,
             start: None,
+            toasts: cx.new(ToastStack::new),
             _subscriptions: vec![subscription],
         }
     }
@@ -96,8 +99,7 @@ impl Workspace {
         self.start = None;
         match path {
             None => {
-                let recent = cx.global::<State>().recent.clone();
-                let start = cx.new(|cx| Start::new(recent, cx));
+                let start = cx.new(Start::new);
                 let subscription = cx.subscribe_in(
                     &start,
                     window,
@@ -198,7 +200,21 @@ impl Workspace {
                     PickerEvent::Picked(target) => Some(target.clone()),
                     PickerEvent::Dismissed => None,
                 };
-                this.picker = None;
+                // Drawn a little longer, the time it fades out.
+                let closing = this.picker.as_ref().map(|(p, _)| p.downgrade());
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(crate::ui::motion::MODAL)
+                        .await;
+                    this.update(cx, |this, cx| {
+                        if this.picker.as_ref().map(|(p, _)| p.downgrade()) == closing {
+                            this.picker = None;
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
                 let focus = match &this.start {
                     Some((start, _)) => start.read(cx).focus_handle().clone(),
                     None => this.reader.read(cx).focus_handle().clone(),
@@ -324,7 +340,7 @@ fn first_page(folder: &Path) -> Option<PathBuf> {
 
 impl Render for Workspace {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = theme(cx).clone();
+        let t = palette(cx);
         let config = cx.global::<Config>().clone();
         let panel = self.tree.as_ref().filter(|_| self.tree_shown).map(|tree| {
             div()
@@ -333,7 +349,7 @@ impl Render for Workspace {
                 .h_full()
                 .when(config.tree == Side::Left, |d| d.border_r_1())
                 .when(config.tree == Side::Right, |d| d.border_l_1())
-                .border_color(t.border)
+                .border_color(t.line)
                 .child(tree.clone())
         });
         let reader = div().flex_1().h_full().min_w_0().child(self.reader.clone());
@@ -349,7 +365,7 @@ impl Render for Workspace {
             .size_full()
             .relative()
             .flex()
-            .bg(t.background)
+            .bg(t.bg)
             .text_color(t.text)
             .font_family(config.font.clone())
             .map(|d| match (&self.start, config.tree) {
@@ -357,18 +373,7 @@ impl Render for Workspace {
                 (None, Side::Left) => d.children(panel).child(reader),
                 (None, Side::Right) => d.child(reader).children(panel),
             })
-            .when_some(self.picker.as_ref(), |d, (picker, _)| {
-                d.child(
-                    div()
-                        .absolute()
-                        .top(px(64.))
-                        .left_0()
-                        .right_0()
-                        .px_4()
-                        .flex()
-                        .justify_center()
-                        .child(picker.clone()),
-                )
-            })
+            .children(self.picker.as_ref().map(|(picker, _)| picker.clone()))
+            .child(self.toasts.clone())
     }
 }

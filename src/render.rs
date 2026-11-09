@@ -15,10 +15,10 @@ use crate::document::{Alert, Block, Inline, Item, Marks, Picture};
 use crate::formats::{Kind, Node, Value};
 use crate::highlight::Lines;
 use crate::reader::Reader;
-use crate::theme::{Theme, tint};
+use crate::ui::{Icon, Palette, icon};
 
 pub struct Ctx<'a, 'b> {
-    pub theme: &'a Theme,
+    pub theme: &'a Palette,
     pub config: &'a Config,
     pub zoom: f32,
     /// The folder of the file, against which images are found.
@@ -34,7 +34,7 @@ pub struct Ctx<'a, 'b> {
 impl<'a, 'b> Ctx<'a, 'b> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        theme: &'a Theme,
+        theme: &'a Palette,
         config: &'a Config,
         zoom: f32,
         folder: Option<&'a Path>,
@@ -65,6 +65,28 @@ impl<'a, 'b> Ctx<'a, 'b> {
     pub fn size(&self, scale: f32) -> Pixels {
         px(self.config.font_size * self.zoom * scale)
     }
+}
+
+/// The ink formulas are drawn in, as `#rrggbb`: the text colour of the theme being shown.
+pub fn ink(cx: &App) -> String {
+    hex(crate::ui::theme::target_palette(cx).text)
+}
+
+/// `color` as `#rrggbb`, for what is drawn as SVG.
+pub fn hex(color: Hsla) -> String {
+    let color = Rgba::from(color);
+    let byte = |v: f32| (v.clamp(0., 1.) * 255.).round() as u8;
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        byte(color.r),
+        byte(color.g),
+        byte(color.b)
+    )
+}
+
+/// Whether the theme being shown is dark: diagrams and code take their dark colours.
+pub fn is_dark(cx: &App) -> bool {
+    crate::ui::theme::target_palette(cx).bg.l < 0.5
 }
 
 /// A heading's size, against the text's.
@@ -98,7 +120,7 @@ pub fn block(ctx: &Ctx, block: &Block) -> AnyElement {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_color(t.muted)
+                .text_color(t.mute)
                 .child("Drawing the diagram…")
                 .into_any_element(),
         },
@@ -120,9 +142,9 @@ pub fn block(ctx: &Ctx, block: &Block) -> AnyElement {
             .into_any_element(),
         Block::Quote(blocks) => div()
             .border_l_4()
-            .border_color(t.border)
+            .border_color(t.line)
             .pl_4()
-            .text_color(t.muted)
+            .text_color(t.mute)
             .flex()
             .flex_col()
             .gap_2()
@@ -130,16 +152,16 @@ pub fn block(ctx: &Ctx, block: &Block) -> AnyElement {
             .into_any_element(),
         Block::Alert(kind, blocks) => {
             let (color, label) = match kind {
-                Alert::Note => (t.blue, "Note"),
-                Alert::Tip => (t.green, "Tip"),
-                Alert::Important => (t.magenta, "Important"),
-                Alert::Warning => (t.yellow, "Warning"),
-                Alert::Caution => (t.red, "Caution"),
+                Alert::Note => (t.run, "Note"),
+                Alert::Tip => (t.ok, "Tip"),
+                Alert::Important => (t.acc, "Important"),
+                Alert::Warning => (t.wait, "Warning"),
+                Alert::Caution => (t.fail, "Caution"),
             };
             div()
                 .border_l_4()
                 .border_color(color)
-                .bg(tint(color, 0.08))
+                .bg(color.opacity(0.08))
                 .rounded_r_md()
                 .px_4()
                 .py_2()
@@ -168,9 +190,9 @@ pub fn block(ctx: &Ctx, block: &Block) -> AnyElement {
         .into_any_element(),
         Block::FrontMatter(pairs) => div()
             .text_size(ctx.size(0.85))
-            .text_color(t.muted)
+            .text_color(t.mute)
             .border_b_1()
-            .border_color(t.border)
+            .border_color(t.line)
             .pb_2()
             .flex()
             .flex_col()
@@ -186,7 +208,7 @@ pub fn block(ctx: &Ctx, block: &Block) -> AnyElement {
             .text_size(ctx.size(0.88))
             .flex()
             .gap_2()
-            .child(div().text_color(t.accent).child(format!("{label}.")))
+            .child(div().text_color(t.run).child(format!("{label}.")))
             .child(
                 div()
                     .flex_1()
@@ -201,11 +223,11 @@ pub fn block(ctx: &Ctx, block: &Block) -> AnyElement {
                 centered(img(path).max_w_full().into_any_element())
             }
             _ => div()
-                .text_color(t.muted)
+                .text_color(t.mute)
                 .child(format!("[{alt}] {url}"))
                 .into_any_element(),
         },
-        Block::Rule => div().h(px(1.)).my_2().bg(t.border).into_any_element(),
+        Block::Rule => div().h(px(1.)).my_2().bg(t.line).into_any_element(),
     }
 }
 
@@ -231,7 +253,7 @@ fn broken(ctx: &Ctx, source: &str, error: &str) -> Div {
         .gap_1()
         .child(
             div()
-                .text_color(ctx.theme.red)
+                .text_color(ctx.theme.fail)
                 .text_size(ctx.size(0.8))
                 .child(error.to_string()),
         )
@@ -240,11 +262,34 @@ fn broken(ctx: &Ctx, source: &str, error: &str) -> Div {
 
 fn item(ctx: &Ctx, ordered: bool, number: usize, item: &Item) -> impl IntoElement {
     let t = ctx.theme;
-    let marker = match (item.checked, ordered) {
-        (Some(true), _) => "☑".to_string(),
-        (Some(false), _) => "☐".to_string(),
-        (None, true) => format!("{number}."),
-        (None, false) => "•".to_string(),
+    let box_size = ctx.size(0.95);
+    let marker: AnyElement = match (item.checked, ordered) {
+        (Some(done), _) => div()
+            .mt(ctx.size(0.33))
+            .size(box_size)
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(4.))
+            .border_1()
+            .border_color(if done { t.ok } else { t.line2 })
+            .when(done, |d| d.bg(t.ok))
+            .when(done, |d| {
+                d.child(icon(Icon::Check).size(ctx.size(0.7)).text_color(t.bg))
+            })
+            .into_any_element(),
+        (None, true) => div()
+            .text_color(t.faint)
+            .font_family(crate::ui::typography::MONO)
+            .text_size(ctx.size(0.85))
+            .child(format!("{number}."))
+            .into_any_element(),
+        (None, false) => div()
+            .mt(ctx.size(0.68))
+            .size(ctx.size(0.3))
+            .rounded_full()
+            .bg(t.faint)
+            .into_any_element(),
     };
     div()
         .flex()
@@ -253,11 +298,8 @@ fn item(ctx: &Ctx, ordered: bool, number: usize, item: &Item) -> impl IntoElemen
             div()
                 .min_w(ctx.size(1.4))
                 .flex_none()
-                .text_color(if item.checked == Some(true) {
-                    t.green
-                } else {
-                    t.muted
-                })
+                .flex()
+                .justify_center()
                 .child(marker),
         )
         .child(
@@ -266,7 +308,7 @@ fn item(ctx: &Ctx, ordered: bool, number: usize, item: &Item) -> impl IntoElemen
                 .flex()
                 .flex_col()
                 .gap_1()
-                .when(item.checked == Some(true), |d| d.text_color(t.muted))
+                .when(item.checked == Some(true), |d| d.text_color(t.mute))
                 .children(item.blocks.iter().map(|b| block(ctx, b))),
         )
 }
@@ -343,20 +385,20 @@ fn word(ctx: &Ctx, text: &str, marks: &Marks, change: Change) -> AnyElement {
         .when(marks.code, |d| {
             d.font_family(ctx.config.code_font.clone())
                 .text_size(ctx.size(0.875))
-                .bg(t.surface)
+                .bg(t.card)
                 .rounded_sm()
                 .px_1()
         })
         .when(marks.link.is_some(), |d| {
-            d.text_color(if marks.broken { t.red } else { t.accent })
+            d.text_color(if marks.broken { t.fail } else { t.run })
                 .underline()
                 .cursor_pointer()
         })
-        .when(change == Change::Inserted, |d| d.bg(tint(t.green, 0.25)))
+        .when(change == Change::Inserted, |d| d.bg(t.ok.opacity(0.25)))
         .when(change == Change::Deleted, |d| {
-            d.bg(tint(t.red, 0.2)).line_through().text_color(t.muted)
+            d.bg(t.fail.opacity(0.2)).line_through().text_color(t.mute)
         })
-        .when(hit, |d| d.bg(tint(t.yellow, 0.35)))
+        .when(hit, |d| d.bg(t.wait.opacity(0.35)))
         .child(text.to_string());
     match &marks.link {
         Some(link) => {
@@ -384,7 +426,7 @@ pub fn code(ctx: &Ctx, lang: &str, text: &str) -> Div {
     div()
         .group(group.clone())
         .relative()
-        .bg(t.surface)
+        .bg(t.card)
         .rounded_md()
         .child(
             div()
@@ -409,9 +451,9 @@ pub fn code(ctx: &Ctx, lang: &str, text: &str) -> Div {
                 .right_2()
                 .px_2()
                 .rounded_sm()
-                .bg(t.background)
+                .bg(t.bg)
                 .text_size(ctx.size(0.75))
-                .text_color(t.muted)
+                .text_color(t.mute)
                 .cursor_pointer()
                 .opacity(0.)
                 .group_hover(group, |s| s.opacity(1.))
@@ -449,7 +491,7 @@ fn code_line(ctx: &Ctx, line: &str, spans: Option<&[crate::highlight::Span]>) ->
     };
     div()
         .whitespace_nowrap()
-        .when(hit, |d| d.bg(tint(ctx.theme.yellow, 0.2)))
+        .when(hit, |d| d.bg(ctx.theme.wait.opacity(0.2)))
         .child(styled)
         .into_any_element()
 }
@@ -463,17 +505,15 @@ fn grid(ctx: &Ctx, rows: Vec<Vec<AnyElement>>) -> Stateful<Div> {
             .flex()
             .flex_col()
             .border_1()
-            .border_color(t.border)
+            .border_color(t.line)
             .rounded_md()
             .children(rows.into_iter().enumerate().map(|(ix, row)| {
                 let mut cells = row;
                 cells.resize_with(columns, || div().into_any_element());
                 div()
                     .flex()
-                    .when(ix == 0, |row| {
-                        row.bg(t.surface).font_weight(FontWeight::BOLD)
-                    })
-                    .when(ix > 0, |row| row.border_t_1().border_color(t.border))
+                    .when(ix == 0, |row| row.bg(t.card).font_weight(FontWeight::BOLD))
+                    .when(ix > 0, |row| row.border_t_1().border_color(t.line))
                     .children(
                         cells
                             .into_iter()
@@ -496,7 +536,7 @@ pub fn table(ctx: &Ctx, rows: &[Vec<String>]) -> AnyElement {
                         .query
                         .is_some_and(|q| !q.is_empty() && cell.to_lowercase().contains(q));
                     div()
-                        .when(hit, |d| d.bg(tint(ctx.theme.yellow, 0.35)))
+                        .when(hit, |d| d.bg(ctx.theme.wait.opacity(0.35)))
                         .child(cell.clone())
                         .into_any_element()
                 })
@@ -511,7 +551,7 @@ pub fn table(ctx: &Ctx, rows: &[Vec<String>]) -> AnyElement {
         .when(rows.len() > LIMIT, |d| {
             d.child(
                 div()
-                    .text_color(ctx.theme.muted)
+                    .text_color(ctx.theme.mute)
                     .child(format!("The first {LIMIT} rows of {}.", rows.len())),
             )
         })
@@ -545,7 +585,7 @@ fn data_rows(
     let t = ctx.theme;
     let key = node.key.as_ref().map(|k| {
         div()
-            .text_color(t.accent)
+            .text_color(t.run)
             .child(format!("{k}:"))
             .into_any_element()
     });
@@ -553,10 +593,10 @@ fn data_rows(
     match &node.value {
         Value::Scalar(text, kind) => {
             let color = match kind {
-                Kind::Text => t.green,
-                Kind::Number => t.yellow,
-                Kind::Bool => t.magenta,
-                Kind::Null => t.muted,
+                Kind::Text => t.ok,
+                Kind::Number => t.wait,
+                Kind::Bool => t.acc,
+                Kind::Null => t.mute,
             };
             let hit = ctx.query.is_some_and(|q| {
                 !q.is_empty()
@@ -571,7 +611,7 @@ fn data_rows(
                     .flex()
                     .gap_2()
                     .pl(indent + px(16.))
-                    .when(hit, |d| d.bg(tint(t.yellow, 0.2)))
+                    .when(hit, |d| d.bg(t.wait.opacity(0.2)))
                     .children(key)
                     .child(div().text_color(color).child(text.clone()))
                     .into_any_element(),
@@ -594,13 +634,13 @@ fn data_rows(
                     .gap_2()
                     .pl(indent)
                     .cursor_pointer()
-                    .child(div().w(px(12.)).text_color(t.muted).child(if closed {
+                    .child(div().w(px(12.)).text_color(t.mute).child(if closed {
                         "▸"
                     } else {
                         "▾"
                     }))
                     .children(key)
-                    .child(div().text_color(t.muted).child(summary))
+                    .child(div().text_color(t.mute).child(summary))
                     .on_click(ctx.cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.toggle_fold(toggled.clone(), cx)
                     }))
@@ -628,14 +668,40 @@ pub fn picture_element(picture: &Picture) -> AnyElement {
 /// A block as it was, struck: what "what changed" shows of a removed block.
 pub fn ghost(ctx: &Ctx, block: &Block) -> AnyElement {
     let t = ctx.theme;
+    marked(
+        ctx,
+        t.fail,
+        t.fail_bg,
+        div()
+            .opacity(0.55)
+            .line_through()
+            .child(self::block(ctx, block)),
+    )
+}
+
+/// A block that changed since the baseline: tinted, a bar at its left in the colour of what
+/// happened to it. The text stays where it would be unmarked.
+pub fn marked(ctx: &Ctx, ink: Hsla, tint: Hsla, content: impl IntoElement) -> AnyElement {
+    let t = ctx.theme;
     div()
-        .border_l_4()
-        .border_color(t.red)
-        .bg(tint(t.red, 0.07))
-        .pl_3()
-        .opacity(0.6)
-        .line_through()
-        .child(self::block(ctx, block))
+        .relative()
+        .mx(px(-16.))
+        .px(px(16.))
+        .py(px(6.))
+        .rounded(px(8.))
+        .bg(tint)
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .top(px(8.))
+                .bottom(px(8.))
+                .w(px(3.))
+                .rounded_full()
+                .bg(ink),
+        )
+        .text_color(t.text)
+        .child(content)
         .into_any_element()
 }
 

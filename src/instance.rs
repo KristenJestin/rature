@@ -12,45 +12,20 @@ pub fn socket() -> PathBuf {
     folder.join("rature.sock")
 }
 
-/// What a second `rature` asks of the running one.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Ask {
-    /// The window to the front, with this file or folder in it if any.
-    Show(Option<PathBuf>),
-    /// The Omarchy theme changed: read it again.
-    Theme,
-}
-
-impl Ask {
-    fn line(&self) -> String {
-        match self {
-            Ask::Show(path) => path
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            Ask::Theme => "!theme".into(),
-        }
-    }
-
-    fn from_line(line: &str) -> Self {
-        match line {
-            "!theme" => Ask::Theme,
-            "" => Ask::Show(None),
-            path => Ask::Show(Some(PathBuf::from(path))),
-        }
-    }
-}
-
-/// Gives `ask` to the running Rature. False when none runs.
-pub fn hand_over(socket: &Path, ask: &Ask) -> bool {
+/// Brings the running Rature to the front, with `path` in it if any. False when none runs.
+pub fn hand_over(socket: &Path, path: Option<&Path>) -> bool {
     let Ok(mut stream) = UnixStream::connect(socket) else {
         return false;
     };
-    writeln!(stream, "{}", ask.line()).is_ok()
+    let line = path.map(|p| p.to_string_lossy()).unwrap_or_default();
+    writeln!(stream, "{line}").is_ok()
 }
 
 /// Listens for what other `rature` ask, on a thread of its own.
-pub fn serve(socket: &Path, on_ask: impl Fn(Ask) + Send + 'static) -> std::io::Result<()> {
+pub fn serve(
+    socket: &Path,
+    on_ask: impl Fn(Option<PathBuf>) + Send + 'static,
+) -> std::io::Result<()> {
     // Nobody answered `hand_over`: a socket left there is a dead instance's.
     let _ = std::fs::remove_file(socket);
     let listener = UnixListener::bind(socket)?;
@@ -58,7 +33,8 @@ pub fn serve(socket: &Path, on_ask: impl Fn(Ask) + Send + 'static) -> std::io::R
         for stream in listener.incoming().flatten() {
             let mut line = String::new();
             if BufReader::new(stream).read_line(&mut line).is_ok() {
-                on_ask(Ask::from_line(line.trim_end_matches('\n')));
+                let line = line.trim_end_matches('\n');
+                on_ask((!line.is_empty()).then(|| PathBuf::from(line)));
             }
         }
     });
@@ -76,20 +52,18 @@ mod tests {
         let folder = std::env::temp_dir().join(format!("rature-instance-{}", std::process::id()));
         std::fs::create_dir_all(&folder).unwrap();
         let socket = folder.join("rature.sock");
-        assert!(!hand_over(&socket, &Ask::Show(None)), "nobody listens yet");
+        assert!(!hand_over(&socket, None), "nobody listens yet");
 
         let (tx, rx) = mpsc::channel();
         serve(&socket, move |path| tx.send(path).unwrap()).unwrap();
-        assert!(hand_over(&socket, &Ask::Show(Some("/notes/a.md".into()))));
-        assert!(hand_over(&socket, &Ask::Show(None)));
-        assert!(hand_over(&socket, &Ask::Theme));
+        assert!(hand_over(&socket, Some(Path::new("/notes/a.md"))));
+        assert!(hand_over(&socket, None));
         let wait = Duration::from_secs(2);
         assert_eq!(
             rx.recv_timeout(wait).unwrap(),
-            Ask::Show(Some("/notes/a.md".into()))
+            Some(PathBuf::from("/notes/a.md"))
         );
-        assert_eq!(rx.recv_timeout(wait).unwrap(), Ask::Show(None));
-        assert_eq!(rx.recv_timeout(wait).unwrap(), Ask::Theme);
+        assert_eq!(rx.recv_timeout(wait).unwrap(), None);
         std::fs::remove_dir_all(folder).unwrap();
     }
 }
