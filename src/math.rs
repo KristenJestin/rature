@@ -9,15 +9,15 @@ use crate::document::Picture;
 const INLINE_EM: f64 = 18.0;
 const DISPLAY_EM: f64 = 22.0;
 
-pub fn render(source: &str, display: bool) -> Result<Picture, String> {
+/// Draws `source` in the colour `ink` (`#rrggbb`).
+pub fn render(source: &str, display: bool, ink: &str) -> Result<Picture, String> {
     let ast = ratex_parser::parse(source).map_err(|e| e.to_string())?;
     let style = if display {
         MathStyle::Display
     } else {
         MathStyle::Text
     };
-    let color =
-        Color::parse(crate::theme::TEXT_HEX).expect("the theme's text colour is a hex colour");
+    let color = Color::parse(ink).ok_or_else(|| format!("{ink} is not a colour"))?;
     let tree = layout(
         &ast,
         &LayoutOptions::default().with_style(style).with_color(color),
@@ -35,5 +35,7 @@ pub fn render(source: &str, display: bool) -> Result<Picture, String> {
     let svg = render_to_svg(&list, &options);
     let width = list.width * em + 2.0 * padding;
     let height = (list.height + list.depth) * em + 2.0 * padding;
-    Ok(picture(svg, width as f32, height as f32))
+    let mut picture = picture(svg, width as f32, height as f32);
+    picture.depth = (list.depth * em + padding) as f32;
+    Ok(picture)
 }

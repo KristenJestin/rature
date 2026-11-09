@@ -22,6 +22,22 @@ pub fn file(path: &Path) -> notify::Result<(RecommendedWatcher, UnboundedReceive
     Ok((watcher, rx))
 }
 
+/// Watches a folder and all it holds. Each change sends the paths it touched.
+pub fn folder(
+    path: &Path,
+) -> notify::Result<(RecommendedWatcher, UnboundedReceiver<Vec<PathBuf>>)> {
+    let (tx, rx) = unbounded();
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        if let Ok(event) = event
+            && !event.kind.is_access()
+        {
+            let _ = tx.unbounded_send(event.paths);
+        }
+    })?;
+    watcher.watch(path, RecursiveMode::Recursive)?;
+    Ok((watcher, rx))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
