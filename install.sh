@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds Rature from this clone and installs it into ~/.local/bin, without root: `rt` is a link
 # to `rature`. The launcher's entry and icon go to $XDG_DATA_HOME, the entry running the binary
-# by its real path. Run again to update.
+# by its real path; on Omarchy, a theme-set hook. Run again to update.
 set -eu
 cd "$(dirname "$0")"
 
@@ -31,5 +31,13 @@ done
 # A desktop's cache of the icon theme is stale when the folder is newer than it.
 touch "$data/icons/hicolor"
 command -v update-desktop-database >/dev/null && update-desktop-database "$data/applications"
+
+# On Omarchy, an open window follows the theme: the theme-set hook tells it.
+hooks=$HOME/.config/omarchy/hooks/theme-set.d
+if [ -d "$hooks" ]; then
+  printf '#!/bin/sh\n"%s" --theme-changed\n' "$real" >"$hooks/.rature.new"
+  chmod 0755 "$hooks/.rature.new"
+  mv -f "$hooks/.rature.new" "$hooks/rature"
+fi
 
 echo "Installed $bin/rature (and rt), and added Rature to the application launcher ($data)."
