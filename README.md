@@ -5,7 +5,9 @@ writes. Native, keyboard first, no webview.
 
 ## What it does
 
-![A folder](docs/images/folder.png) ![What changed since the last read](docs/images/what-changed.png)
+![Started without a file](docs/images/start.png)
+![A folder](docs/images/folder.png)
+![What changed since the last read](docs/images/changed.png)
 
 - **A file or a folder**: `rature file.md` or `rature folder/`. A folder shows a tree (left or
   right), ignoring what `.gitignore` ignores, and opens its README. One window: opening another
@@ -30,8 +32,8 @@ writes. Native, keyboard first, no webview.
 - **Edit in place**: double-click a block, or `i` for the block at the top, and its Markdown opens
   where it was. Saved 800 ms after you stop typing; `Ctrl-s` saves and formats (Markdown by
   dprint, JSON pretty-printed).
-- **Theme**: Rature's own, or the current Omarchy theme, followed live through a `theme-set.d`
-  hook.
+- **Theme**: Flottille's own colours, or the current Omarchy theme, followed live: a theme
+  change cross-fades the open window, formulas and diagrams drawn again in its colours.
 
 ## Config
 
@@ -41,14 +43,18 @@ writes. Native, keyboard first, no webview.
 tree = "left"            # or "right"
 tree_width = 260
 column = 760             # reading width
-font = "Noto Sans"
-code_font = "JetBrainsMono Nerd Font"
+font = "Noto Sans"       # the text read
+code_font = "Geist Mono" # code, bundled
 font_size = 16
 ```
 
 ## Stack
 
-Rust and GPUI through gpui-kit, as Flottille. No webview. Markdown parsed by `markdown` (mdast)
+Rust and GPUI through gpui-kit, as Flottille. No webview. The window is built from Flottille's
+own components (`src/ui/`, copied from `flottille-ui`): its colours, Geist and Geist Mono
+(bundled, SIL OFL), Lucide icons, buttons, rows, the search modal, toasts, and its motion
+(entrances that rise and fade in, hovers and choices that fade, rows that fold, a theme that
+cross-fades). Markdown parsed by `markdown` (mdast)
 and drawn by our own elements; Mermaid by `mermaid-rs-renderer` and math by RaTeX, both to SVG;
 syntect with two-face for code; `similar` for the diff; `notify` to follow files; `nucleo` for
 the file finder; dprint for Markdown formatting.
@@ -56,9 +62,9 @@ the file finder; dprint for Markdown formatting.
 ## Installing
 
 `./install.sh` builds this clone and installs `rature` into `~/.local/bin`, with `rt` a link to
-it, and adds Rature to the application launcher (entry and icon in `$XDG_DATA_HOME`). On
-Omarchy it also adds `~/.config/omarchy/hooks/theme-set.d/rature`, so an open window follows a
-theme change. Run it again to update. Started from the launcher, without a file, it shows the recent files and folders.
+it, and adds Rature to the application launcher (entry and icon in `$XDG_DATA_HOME`). Run it
+again to update. Started from the launcher, without a file, it shows the recent files and
+folders.
 
 ## Using
 
