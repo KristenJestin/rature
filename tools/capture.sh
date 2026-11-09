@@ -2,6 +2,7 @@
 # Captures rature's window on a file, in a nested headless Weston (with Xwayland: GPUI needs a
 # seat) and a private bus, never the user's session. Prints the start-up timing.
 # usage: tools/capture.sh <file.md> <out.png>
+# STATE: a folder copied in as $XDG_STATE_HOME/rature (what was read before, say).
 # KEYS: keys typed into the window once it is up, as tools/xkeys.py takes them ("j j shift+g").
 # THEN: a shell command run afterwards (a change to the file, say).
 # needs: weston (with Xwayland), weston-screenshooter, dbus-daemon, ImageMagick.
@@ -9,9 +10,14 @@ set -u
 here=$(cd "$(dirname "$0")" && pwd)
 BIN=${RATURE_BIN:-$here/../target/release/rature}
 FILE=$(realpath "$1"); OUT=$(realpath -m "$2")
-W=960; H=${H:-1700}
+W=${W:-1280}; H=${H:-1700}
 D=$(mktemp -d /tmp/rature-capture.XXXX)
-mkdir -p "$D"/{home,runtime,wrun}; chmod 700 "$D"/*
+mkdir -p "$D"/{home,runtime,wrun,state,config}; chmod 700 "$D"/*
+# OMARCHY=1: a copy of the current Omarchy theme, read-only, so the capture shows it.
+if [ -n "${OMARCHY:-}" ]; then
+  mkdir -p "$D/state/omarchy/current/theme"
+  cp "${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/current/theme/colors.toml" "$D/state/omarchy/current/theme/"
+fi
 cleanup() {
   kill "${APID:-}" "${WPID:-}" 2>/dev/null
   [ -f "$D/dbus.pid" ] && kill "$(cat "$D/dbus.pid")" 2>/dev/null
@@ -19,9 +25,10 @@ cleanup() {
   [ -n "${KEEP:-}" ] || rm -rf "$D"
 }
 trap cleanup EXIT
-export HOME=$D/home XDG_RUNTIME_DIR=$D/runtime
+export HOME=$D/home XDG_RUNTIME_DIR=$D/runtime XDG_STATE_HOME=$D/state XDG_CONFIG_HOME=$D/config
 unset WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS
 
+[ -n "${STATE:-}" ] && cp -r "$STATE" "$D/state/rature"
 XDG_RUNTIME_DIR=$D/wrun weston --backend=headless --renderer=gl --xwayland --shell=kiosk --fake-seat --debug \
   --socket=wl-rature --width=$W --height=$H >"$D/weston.log" 2>&1 &
 WPID=$!
