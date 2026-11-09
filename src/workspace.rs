@@ -44,10 +44,6 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
-const WELCOME: &str = "# Rature\n\n`f` opens a recent file or folder, or any other by its path \
-(`~/notes/`, Tab completes). From a terminal: `rature file.md` or `rature notes/`, `rt` is the \
-same.\n\nOnce one is open, `O` opens another.\n";
-
 pub struct Workspace {
     reader: Entity<Reader>,
     tree: Option<Entity<Tree>>,
@@ -86,12 +82,11 @@ impl Workspace {
         &self.reader
     }
 
-    /// Opens a file, or a folder with its tree and the README it may hold. Nothing: the welcome.
+    /// Opens a file, or a folder with its tree and the README it may hold. Nothing: an empty page.
     pub fn open(&mut self, path: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         match path {
             None => {
-                self.reader
-                    .update(cx, |reader, cx| reader.show(WELCOME, cx));
+                self.reader.update(cx, |reader, cx| reader.show("", cx));
                 let focus = self.reader.read(cx).focus_handle().clone();
                 window.focus(&focus, cx);
             }

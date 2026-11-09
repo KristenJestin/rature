@@ -57,7 +57,7 @@ the file finder; dprint for Markdown formatting.
 `./install.sh` builds this clone and installs `rature` into `~/.local/bin`, with `rt` a link to
 it, and adds Rature to the application launcher (entry and icon in `$XDG_DATA_HOME`). On
 Omarchy it also adds `~/.config/omarchy/hooks/theme-set.d/rature`, so an open window follows a
-theme change. Run it again to update. Started from the launcher, without a file, the window says how to open one.
+theme change. Run it again to update. Started from the launcher, without a file, the page is empty and `f` opens one.
 
 ## Using
 
