@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Rature
+GenericName=Markdown reader
+Comment=Read and edit Markdown, and see what changed
+Exec=rature %f
+Icon=rature
+Terminal=false
+Categories=Utility;TextEditor;Viewer;
+StartupWMClass=rature

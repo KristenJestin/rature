@@ -153,6 +153,8 @@ fn flow(inlines: &[Inline]) -> Div {
         match inline {
             Inline::Math(picture) => row = row.child(div().mr_1().child(image(picture))),
             Inline::Text(text, _) if text == "\n" => row = row.child(div().w_full()),
+            // A code span is one piece: split, its background would show a gap per word.
+            Inline::Text(text, marks) if marks.code => row = row.child(word_element(text, *marks)),
             Inline::Text(text, marks) => {
                 for word in text.split_inclusive(char::is_whitespace) {
                     row = row.child(word_element(&word.replace('\n', " "), *marks));
@@ -165,6 +167,7 @@ fn flow(inlines: &[Inline]) -> Div {
 
 fn word_element(word: &str, marks: Marks) -> Div {
     div()
+        .flex_none()
         .whitespace_nowrap()
         .when(marks.strong, |d| d.font_weight(FontWeight::BOLD))
         .when(marks.emphasis, |d| d.italic())

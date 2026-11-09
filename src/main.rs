@@ -8,18 +8,21 @@ use std::time::Instant;
 
 use gpui_kit::*;
 
+const WELCOME: &str =
+    "# Rature\n\nOpen a file from a terminal: `rature file.md`, or `rt file.md`.\n";
+
 fn main() {
     let started = Instant::now();
-    let Some(path) = std::env::args().nth(1) else {
-        eprintln!("usage: rature <file.md>");
-        std::process::exit(2);
-    };
-    let source = match std::fs::read_to_string(&path) {
-        Ok(source) => source,
-        Err(error) => {
-            eprintln!("rature: {path}: {error}");
-            std::process::exit(1);
-        }
+    // Started from the launcher, there is no file: the window says how to open one.
+    let source = match std::env::args().nth(1) {
+        None => WELCOME.to_string(),
+        Some(path) => match std::fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(error) => {
+                eprintln!("rature: {path}: {error}");
+                std::process::exit(1);
+            }
+        },
     };
     let blocks = document::parse(&source);
     let parsed = started.elapsed();

@@ -37,6 +37,12 @@ Rust and GPUI through gpui-kit, as Flottille. No webview.
 - Mermaid: `mermaid-rs-renderer` (fallback `merman`), to SVG, drawn through resvg.
 - Math: RaTeX, to SVG with `embed_glyphs`.
 
+## Installing
+
+`./install.sh` builds this clone and installs `rature` into `~/.local/bin`, with `rt` a link to
+it, and adds Rature to the application launcher (entry and icon in `$XDG_DATA_HOME`). Run it
+again to update. Started from the launcher, without a file, the window says how to open one.
+
 ## Prototype
 
 `cargo run --release -- examples/sample.md` renders a file with a Mermaid diagram, a display
