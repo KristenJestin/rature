@@ -37,7 +37,19 @@ Rust and GPUI through gpui-kit, as Flottille. No webview.
 - Mermaid: `mermaid-rs-renderer` (fallback `merman`), to SVG, drawn through resvg.
 - Math: RaTeX, to SVG with `embed_glyphs`.
 
+## Prototype
+
+`cargo run --release -- examples/sample.md` renders a file with a Mermaid diagram, a display
+formula and inline math, natively. `tools/capture.sh <file.md> <out.png>` captures the window in a
+nested headless Weston, never the user's session, and prints the start-up timing
+(`RATURE_TIMING=1`).
+
+Measured on the prototype (release build, headless Weston, machine in use):
+
+- first frame of a plain file: about 155 ms after start;
+- the sample: about 200 ms, of which 40 ms of Mermaid on the main thread (the formulas take under
+  a millisecond). Diagrams are to be drawn off the main thread, the text first.
+
 ## Next step
 
-A prototype that settles the technical risk: one `.md` with a Mermaid block and a formula,
-rendered natively, and the start-up time measured.
+Draw diagrams in the background, then the real reader: live reload, vim keys, the folder tree.

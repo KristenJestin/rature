@@ -1,0 +1,13 @@
+[package]
+name = "rature"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gpui-kit = { version = "=0.8.0", default-features = false, features = ["assets", "gpui-fast"] }
+markdown = "1"
+mermaid-rs-renderer = { version = "0.3.1", default-features = false }
+ratex-layout = "0.1.15"
+ratex-parser = "0.1.15"
+ratex-svg = { version = "0.1.15", features = ["embed-fonts"] }
+ratex-types = "0.1.15"
