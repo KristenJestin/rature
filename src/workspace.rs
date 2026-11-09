@@ -17,6 +17,7 @@ actions!(
     workspace,
     [
         FindFile,
+        OpenPath,
         SearchFolder,
         Outline,
         ToggleTree,
@@ -31,6 +32,7 @@ pub fn bind_keys(cx: &mut App) {
             KeyBinding::new("f", FindFile, Some(at)),
             KeyBinding::new("s", SearchFolder, Some(at)),
             KeyBinding::new("t", ToggleTree, Some(at)),
+            KeyBinding::new("shift-o", OpenPath, Some(at)),
         ]);
     }
     cx.bind_keys([
@@ -42,8 +44,9 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
-const WELCOME: &str = "# Rature\n\nOpen a file from a terminal: `rature file.md`, or a folder: `rature notes/`. \
-`rt` is the same.\n\n`f` finds a file, `s` searches the folder, `o` goes to a heading, `t` shows the tree.\n";
+const WELCOME: &str = "# Rature\n\n`f` opens a recent file or folder, or any other by its path \
+(`~/notes/`, Tab completes). From a terminal: `rature file.md` or `rature notes/`, `rt` is the \
+same.\n\nOnce one is open, `O` opens another.\n";
 
 pub struct Workspace {
     reader: Entity<Reader>,
@@ -86,10 +89,14 @@ impl Workspace {
     /// Opens a file, or a folder with its tree and the README it may hold. Nothing: the welcome.
     pub fn open(&mut self, path: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         match path {
-            None => self
-                .reader
-                .update(cx, |reader, cx| reader.show(WELCOME, cx)),
+            None => {
+                self.reader
+                    .update(cx, |reader, cx| reader.show(WELCOME, cx));
+                let focus = self.reader.read(cx).focus_handle().clone();
+                window.focus(&focus, cx);
+            }
             Some(path) if path.is_dir() => {
+                cx.global_mut::<State>().opened(&path);
                 self.set_root(path.clone(), window, cx);
                 self.tree_shown = true;
                 match first_page(&path) {
@@ -105,7 +112,19 @@ impl Workspace {
                     }
                 }
             }
-            Some(path) => self.open_file(path, Jump::Restore, window, cx),
+            Some(path) => {
+                // A file from elsewhere leaves the folder.
+                if self
+                    .tree
+                    .as_ref()
+                    .is_some_and(|t| !path.starts_with(t.read(cx).root()))
+                {
+                    self.tree = None;
+                    self.tree_subscription = None;
+                    self.tree_shown = false;
+                }
+                self.open_file(path, Jump::Restore, window, cx)
+            }
         }
         cx.notify();
     }
@@ -168,6 +187,7 @@ impl Workspace {
                 window.focus(&focus, cx);
                 match target {
                     Some(Target::File(path)) => this.open_file(path, Jump::Restore, window, cx),
+                    Some(Target::Open(path)) => this.open(Some(path), window, cx),
                     Some(Target::Line(path, line)) => {
                         this.open_file(path, Jump::Line(line), window, cx)
                     }
@@ -184,9 +204,17 @@ impl Workspace {
     }
 
     fn find_file(&mut self, _: &FindFile, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(root) = self.root(cx) else { return };
+        let Some(root) = self.root(cx) else {
+            return self.open_path(&OpenPath, window, cx);
+        };
         let recent = cx.global::<State>().recent.clone();
         let picker = cx.new(|cx| Picker::files(root, recent, window, cx));
+        self.show_picker(picker, window, cx);
+    }
+
+    fn open_path(&mut self, _: &OpenPath, window: &mut Window, cx: &mut Context<Self>) {
+        let recent = cx.global::<State>().recent.clone();
+        let picker = cx.new(|cx| Picker::open(recent, window, cx));
         self.show_picker(picker, window, cx);
     }
 
@@ -293,6 +321,7 @@ impl Render for Workspace {
         div()
             .key_context("Workspace")
             .on_action(cx.listener(Self::find_file))
+            .on_action(cx.listener(Self::open_path))
             .on_action(cx.listener(Self::search_folder))
             .on_action(cx.listener(Self::outline))
             .on_action(cx.listener(Self::toggle_tree))

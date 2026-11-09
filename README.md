@@ -9,7 +9,8 @@ writes. Native, keyboard first, no webview.
 
 - **A file or a folder**: `rature file.md` or `rature folder/`. A folder shows a tree (left or
   right), ignoring what `.gitignore` ignores, and opens its README. One window: opening another
-  file sends it there.
+  file sends it there. Started without one, `f` (or `O` at any time) opens a recent file or
+  folder, or any other by its path, Tab completing it.
 - **No trace in the folder**: config in `~/.config/rature/config.toml`, reading positions, recent
   files and read snapshots in `~/.local/state/rature`.
 - **Markdown**: tables, task lists, footnotes, highlighted code (copy button), Mermaid diagrams,
@@ -71,7 +72,8 @@ rename, as an agent does, it is read again where you are.
 | `Space` `Shift-Space`, `Ctrl-f` `Ctrl-b` | a page |
 | `gg` `G`, `Home` `End` | top, bottom |
 | `/`, `n` `N`, `Esc` | search the file, next and previous hit, clear |
-| `f`, `Ctrl-p` | find a file |
+| `f`, `Ctrl-p` | find a file (with nothing open: open one) |
+| `O` | open a recent file or folder, or a path (`Tab` completes) |
 | `s`, `Ctrl-Shift-f` | search the folder (ripgrep) |
 | `o` | outline |
 | `Ctrl-o` `Ctrl-i`, `Alt-Left` `Alt-Right` | back, forward |

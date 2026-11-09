@@ -1,5 +1,5 @@
 //! The box that finds something to go to: a file by a few letters of its path, a line of the
-//! folder by ripgrep, or a heading of the file being read.
+//! folder by ripgrep, a heading of the file being read, or any file or folder to open.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -10,12 +10,12 @@ use gpui_kit::*;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as MatcherConfig, Matcher};
 
-use crate::theme::theme;
+use crate::theme::{home, theme};
 
 /// How many results the box keeps.
 const SHOWN: usize = 200;
 
-actions!(picker, [Next, Previous, Pick, Dismiss]);
+actions!(picker, [Next, Previous, Pick, Dismiss, Complete]);
 
 pub fn bind_keys(cx: &mut App) {
     let at = Some("Picker");
@@ -27,6 +27,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-p", Previous, at),
         KeyBinding::new("ctrl-k", Previous, at),
         KeyBinding::new("escape", Dismiss, at),
+        // Over the field's own tab, which indents.
+        KeyBinding::new("tab", Complete, Some("Picker > Input")),
     ]);
 }
 
@@ -35,6 +37,8 @@ pub enum Target {
     File(PathBuf),
     Line(PathBuf, usize),
     Block(usize),
+    /// A file or a folder, opened as `rature` opens it.
+    Open(PathBuf),
 }
 
 #[derive(Clone)]
@@ -57,6 +61,8 @@ enum Source {
     Fixed(Vec<Choice>),
     /// ripgrep in this folder, run again as the query changes.
     Grep(PathBuf),
+    /// These by name, or, for a query that is a path, what its folder holds.
+    Paths(Vec<Choice>),
 }
 
 pub struct Picker {
@@ -158,6 +164,27 @@ impl Picker {
         )
     }
 
+    /// The files and folders read last, and any other by its path.
+    pub fn open(recent: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let choices = recent
+            .iter()
+            .filter(|p| p.exists())
+            .map(|p| Choice {
+                label: name(p),
+                detail: p.parent().map(shown).unwrap_or_default(),
+                indent: 0,
+                target: Target::Open(p.clone()),
+            })
+            .collect();
+        Self::new(
+            "Open",
+            "A recent file or folder, or a path: ~/notes/  (Tab completes)",
+            Source::Paths(choices),
+            window,
+            cx,
+        )
+    }
+
     pub fn outline(choices: Vec<Choice>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self::new(
             "Outline",
@@ -172,7 +199,11 @@ impl Picker {
         let query = self.field.read(cx).value().to_string();
         self.selected = 0;
         match &self.source {
-            Source::Fixed(choices) => {
+            Source::Paths(_) if query.starts_with(['/', '~']) => {
+                self.shown = children(&query);
+                cx.notify();
+            }
+            Source::Fixed(choices) | Source::Paths(choices) => {
                 self.shown = if query.trim().is_empty() {
                     choices.iter().take(SHOWN).cloned().collect()
                 } else {
@@ -253,6 +284,98 @@ impl Picker {
     fn dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<Self>) {
         cx.emit(PickerEvent::Dismissed);
     }
+
+    /// Puts the chosen path in the field: a folder, to go on into it.
+    fn complete(&mut self, _: &Complete, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Choice {
+            target: Target::Open(path),
+            ..
+        }) = self.shown.get(self.selected)
+        else {
+            return;
+        };
+        let mut text = shown(path);
+        if path.is_dir() {
+            text.push('/');
+        }
+        self.field
+            .update(cx, |field, cx| field.set_value(text, window, cx));
+        self.refresh(cx);
+    }
+}
+
+/// `path` with the home folder as `~`.
+fn shown(path: &Path) -> String {
+    match path.strip_prefix(home()) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// A file's name, a folder's with a `/`.
+fn name(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    if path.is_dir() {
+        format!("{name}/")
+    } else {
+        name
+    }
+}
+
+/// For a query such as `~/notes/sp`: the folder typed first, if it is one, then what that folder
+/// holds whose name starts with `sp` (case aside), folders first. Hidden ones only asked by a dot.
+fn children(query: &str) -> Vec<Choice> {
+    let path = match query.strip_prefix('~') {
+        Some(rest) => home().join(rest.trim_start_matches('/')),
+        None => PathBuf::from(query),
+    };
+    let (folder, start) = if query.ends_with('/') || query == "~" {
+        (path.clone(), String::new())
+    } else {
+        let start = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        (
+            path.parent().map(Path::to_path_buf).unwrap_or_default(),
+            start,
+        )
+    };
+    let choice = |path: PathBuf| Choice {
+        label: name(&path),
+        detail: String::new(),
+        indent: 0,
+        target: Target::Open(path),
+    };
+    let mut found: Vec<PathBuf> = std::fs::read_dir(&folder)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| {
+                    let name = p
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_lowercase())
+                        .unwrap_or_default();
+                    name.starts_with(&start) && (start.starts_with('.') || !name.starts_with('.'))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    found.sort_by_key(|p| (!p.is_dir(), p.file_name().map(|n| n.to_ascii_lowercase())));
+    let mut choices: Vec<Choice> = Vec::new();
+    if start.is_empty() && folder.is_dir() {
+        choices.push(Choice {
+            label: format!("{} (open this folder)", shown(&folder)),
+            ..choice(folder)
+        });
+    }
+    choices.extend(found.into_iter().take(SHOWN).map(choice));
+    choices
 }
 
 fn file_choice(root: &Path, path: &Path) -> Choice {
@@ -343,6 +466,7 @@ impl Render for Picker {
             .on_action(cx.listener(Self::next))
             .on_action(cx.listener(Self::previous))
             .on_action(cx.listener(Self::dismiss))
+            .on_action(cx.listener(Self::complete))
             .w(px(680.))
             .max_w_full()
             .overflow_hidden()
