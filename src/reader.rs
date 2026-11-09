@@ -267,7 +267,9 @@ impl Reader {
         self.folded.clear();
         self.scroll.set_offset(point(px(0.), px(0.)));
         self.reload(cx);
+        // Kept at once: a window killed rather than closed still lists it.
         cx.global_mut::<State>().opened(&path);
+        cx.global::<State>().save();
         cx.emit(ReaderEvent::Opened(path));
         self.jump(jump, window, cx);
     }

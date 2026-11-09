@@ -110,7 +110,9 @@ impl Workspace {
                 self.start = Some((start, subscription));
             }
             Some(path) if path.is_dir() => {
+                // Kept at once: a window killed rather than closed still lists it.
                 cx.global_mut::<State>().opened(&path);
+                cx.global::<State>().save();
                 self.set_root(path.clone(), window, cx);
                 self.tree_shown = true;
                 match first_page(&path) {
