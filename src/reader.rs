@@ -32,7 +32,7 @@ use crate::start::key_hint;
 use crate::state::{self, State};
 use crate::table::TableEdit;
 use crate::workspace::ToggleTree;
-use crate::{diagram, format, watch};
+use crate::{diagram, format, timing, watch};
 use gpui_design_system::field::{field_style, follow_theme};
 use gpui_design_system::motion::{ENTER, MODAL};
 use gpui_design_system::toast::Toast;
@@ -148,11 +148,6 @@ pub enum Jump {
     Anchor(String),
     Line(usize),
 }
-
-/// When Rature started, set when `RATURE_TIMING` asks for the timings.
-pub struct Started(pub Instant);
-
-impl Global for Started {}
 
 /// A file of code, shown in an editor: it is changed where it is read.
 struct CodeFile {
@@ -405,7 +400,8 @@ impl Reader {
         }
         self.finish_editing(window, cx);
         self.put_down(cx);
-        self.watch = match watch::file(&path) {
+        let watched = timing::time("  open: watcher made", || watch::file(&path));
+        self.watch = match watched {
             Ok((watcher, mut changes)) => {
                 let task = cx.spawn(async move |this, cx| {
                     while changes.next().await.is_some() {
@@ -439,7 +435,7 @@ impl Reader {
         self.reload(cx);
         // Kept at once: a window killed rather than closed still lists it.
         cx.global_mut::<State>().opened(&path);
-        cx.global::<State>().save();
+        timing::time("  open: state saved", || cx.global::<State>().save());
         cx.emit(ReaderEvent::Opened(path));
         self.jump(jump, window, cx);
     }
@@ -454,12 +450,16 @@ impl Reader {
         };
         let (load, compare) = (self.loads.next(), self.compares.next());
         let (ink, baseline, cached) = (render::ink(cx), self.baseline, self.old.clone());
-        let work = cx
-            .background_executor()
-            .spawn(async move { load::load(path, ink, baseline, cached) });
+        let work = cx.background_executor().spawn(async move {
+            timing::mark("  file read begins, off the main thread");
+            let done = load::load(path, ink, baseline, cached);
+            timing::mark("  file read ends, off the main thread");
+            done
+        });
         let window = self.window;
         cx.spawn(async move |this, cx| {
             let done = work.await;
+            timing::mark("  file read picked up by the main thread");
             cx.update_window(window, |_, window, cx| {
                 this.update(cx, |this, cx| this.loaded(load, compare, done, window, cx))
             })
@@ -481,6 +481,7 @@ impl Reader {
             return;
         }
         let started = Instant::now();
+        timing::mark("file read, back on the main thread");
         let (content, editable) = match done.loaded {
             Ok(Loaded { content, editable }) => (content, editable),
             // Between the removal and the rename of an atomic write: the next event brings it.
@@ -498,28 +499,44 @@ impl Reader {
             let now = cx.background_executor().now();
             self.entrances.changed(&self.prints, &done.prints, now);
         }
-        self.set_content(content, done.prints, cx);
-        if self.compares.is_current(compare) {
-            self.compared(done.against, cx);
-        } else {
-            // A comparison asked for meanwhile compared the file before this one.
-            self.before = None;
-            self.compare(cx);
-        }
-        if let Some(jump) = self.pending_jump.take() {
-            self.jump(jump, window, cx);
-        }
+        timing::time("  put in place: content set", || {
+            self.set_content(content, done.prints, cx)
+        });
+        timing::time("  put in place: compared", || {
+            if self.compares.is_current(compare) {
+                self.compared(done.against, cx);
+            } else {
+                // A comparison asked for meanwhile compared the file before this one.
+                self.before = None;
+                self.compare(cx);
+            }
+        });
+        timing::time("  put in place: jumped", || {
+            if let Some(jump) = self.pending_jump.take() {
+                self.jump(jump, window, cx);
+            }
+        });
         if let Some(block) = self.pending_edit.take() {
             self.edit_block(block, Caret::Start, window, cx);
         }
-        if cx.has_global::<Started>() {
+        if let Some(at) = timing::started() {
             eprintln!(
                 "rature: {} read in {:?} off the main thread, put in place in {:?} on it, shown at {:?}",
                 done.path.display(),
                 done.took,
                 started.elapsed(),
-                cx.global::<Started>().0.elapsed(),
+                at.elapsed(),
             );
+            timing::mark("file put in place");
+            if opened {
+                window.on_next_frame(|window, _| {
+                    timing::mark("frame showing the file requested");
+                    window.on_next_frame(|_, _| {
+                        timing::mark("frame after it requested (the file shown)");
+                        timing::end();
+                    });
+                });
+            }
         }
     }
 
@@ -711,7 +728,9 @@ impl Reader {
             Against::Nothing => {}
             Against::FirstRead => {
                 if let (Some(path), Content::Markdown(doc)) = (&self.path, &self.content) {
-                    state::mark_read(path, &doc.source);
+                    timing::time("  compared: first read, marked read", || {
+                        state::mark_read(path, &doc.source)
+                    });
                 }
             }
             Against::NoHead => {
@@ -1051,6 +1070,7 @@ impl Reader {
         self.finish_editing(window, cx);
         self.put_down(cx);
         cx.global::<State>().save();
+        state::flush();
         cx.quit();
     }
 

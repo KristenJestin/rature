@@ -3,10 +3,15 @@
 //! read (`read/`), which "what changed" compares to. It is the user's alone (the folder 0700,
 //! its files 0600: a copy of a private note stays private), and it does not grow for ever: what
 //! was not read for long is let go.
+//!
+//! It is written by a thread of its own, in the order the writes were asked for: each write waits
+//! for the disk to keep it (tens of milliseconds on some disks), which the window does not.
 
 use std::collections::HashMap;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -42,26 +47,30 @@ impl gpui_kit::Global for State {}
 impl State {
     /// The state kept, and what was kept too long let go.
     pub fn load() -> Self {
-        prune_read(&folder().join("read"), READ_FILES, KEPT, SystemTime::now());
-        let mut state: Self = std::fs::read_to_string(folder().join("state.json"))
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default();
+        crate::timing::time("  state: read copies pruned", || {
+            prune_read(&folder().join("read"), READ_FILES, KEPT, SystemTime::now())
+        });
+        let mut state: Self = crate::timing::time("  state: state.json read", || {
+            std::fs::read_to_string(folder().join("state.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .unwrap_or_default()
+        });
         state.prune_positions(now());
         state
     }
 
+    /// Kept as it is now, written off the main thread.
     pub fn save(&self) {
         let folder = folder();
-        let written = private_folder(&folder).and_then(|()| {
-            fsio::write_private(
-                &folder.join("state.json"),
-                &serde_json::to_vec(self).expect("the state serializes"),
-            )
+        let bytes = serde_json::to_vec(self).expect("the state serializes");
+        later(move || {
+            let written = private_folder(&folder)
+                .and_then(|()| fsio::write_private(&folder.join("state.json"), &bytes));
+            if let Err(error) = written {
+                eprintln!("rature: cannot keep the state: {error}");
+            }
         });
-        if let Err(error) = written {
-            eprintln!("rature: cannot keep the state: {error}");
-        }
     }
 
     pub fn opened(&mut self, path: &Path) {
@@ -140,26 +149,98 @@ fn name(path: &Path) -> String {
     format!("{hash:016x}")
 }
 
-/// The file as it was last marked read, if it ever was.
+/// The file as it was last marked read, if it ever was: as it is being written, if it is.
 pub fn last_read(path: &Path) -> Option<String> {
-    std::fs::read_to_string(folder().join("read").join(name(path))).ok()
+    last_read_in(&folder(), path)
 }
 
+fn last_read_in(folder: &Path, path: &Path) -> Option<String> {
+    let file = folder.join("read").join(name(path));
+    if let Some(source) = unwritten().get(&file) {
+        return Some(source.to_string());
+    }
+    std::fs::read_to_string(file).ok()
+}
+
+/// Keeps `source` as the file at `path` was read, written off the main thread; `last_read` has
+/// it at once.
 pub fn mark_read(path: &Path, source: &str) {
-    let folder = folder();
+    mark_read_in(folder(), path, source);
+}
+
+fn mark_read_in(folder: PathBuf, path: &Path, source: &str) {
     let read = folder.join("read");
     let file = read.join(name(path));
-    let new = !file.exists();
-    let written = private_folder(&folder)
-        .and_then(|()| private_folder(&read))
-        .and_then(|()| fsio::write_private(&file, source.as_bytes()));
-    if let Err(error) = written {
-        eprintln!("rature: cannot keep what was read: {error}");
+    let source: Arc<str> = source.into();
+    unwritten().insert(file.clone(), source.clone());
+    later(move || {
+        let new = !file.exists();
+        let written = private_folder(&folder)
+            .and_then(|()| private_folder(&read))
+            .and_then(|()| fsio::write_private(&file, source.as_bytes()));
+        if let Err(error) = written {
+            eprintln!("rature: cannot keep what was read: {error}");
+        }
+        // Written, or not writable: the disk has the last word, unless it was marked again.
+        let mut unwritten = unwritten();
+        if unwritten
+            .get(&file)
+            .is_some_and(|s| Arc::ptr_eq(s, &source))
+        {
+            unwritten.remove(&file);
+        }
+        drop(unwritten);
+        // A file more: the oldest may go.
+        if new {
+            prune_read(&read, READ_FILES, KEPT, SystemTime::now());
+        }
+    });
+}
+
+/// Waits until what was asked to be kept is written (a few seconds at most): before quitting.
+pub fn flush() {
+    let (done, written) = mpsc::channel();
+    later(move || {
+        let _ = done.send(());
+    });
+    let _ = written.recv_timeout(Duration::from_secs(5));
+}
+
+type Job = Box<dyn FnOnce() + Send>;
+
+/// Runs `job` on the thread that writes the state, after the jobs asked for before it; here, if
+/// that thread cannot be had.
+fn later(job: impl FnOnce() + Send + 'static) {
+    static WRITER: OnceLock<Option<Sender<Job>>> = OnceLock::new();
+    let writer = WRITER.get_or_init(|| {
+        let (jobs, queue) = mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("rature-state".into())
+            .spawn(move || {
+                for job in queue {
+                    job();
+                }
+            })
+            .ok()
+            .map(|_| jobs)
+    });
+    let job: Job = Box::new(job);
+    let left = match writer {
+        Some(jobs) => jobs.send(job).err().map(|failed| failed.0),
+        None => Some(job),
+    };
+    if let Some(job) = left {
+        job();
     }
-    // A file more: the oldest may go.
-    if new {
-        prune_read(&read, READ_FILES, KEPT, SystemTime::now());
-    }
+}
+
+/// The copies marked read and not yet written, by the file they go to.
+fn unwritten() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Arc<str>>> {
+    static UNWRITTEN: OnceLock<Mutex<HashMap<PathBuf, Arc<str>>>> = OnceLock::new();
+    UNWRITTEN
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Lets go of the files of `read` marked longer than `kept` before `now`, then of the oldest
@@ -251,6 +332,27 @@ mod tests {
         state.prune_positions(now);
         assert_eq!(state.positions.len(), 1);
         assert!(state.positions.contains_key(Path::new("/fresh.md")));
+    }
+
+    #[test]
+    fn a_copy_marked_read_is_had_at_once_and_written_in_the_order_asked() {
+        let folder =
+            std::env::temp_dir().join(format!("rature-state-marked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        let path = Path::new("/notes/a.md");
+        mark_read_in(folder.clone(), path, "one");
+        mark_read_in(folder.clone(), path, "two");
+        // At once, written or not: the latest.
+        assert_eq!(last_read_in(&folder, path).as_deref(), Some("two"));
+        flush();
+        // Written in the order asked: the latest is the one kept, and nothing waits any more.
+        let file = folder.join("read").join(name(path));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "two");
+        assert!(!unwritten().contains_key(&file));
+        assert_eq!(last_read_in(&folder, path).as_deref(), Some("two"));
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_dir_all(folder).unwrap();
     }
 
     #[test]

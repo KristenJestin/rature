@@ -33,3 +33,9 @@ toml = "0.8"
 two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"] }
 yaml-rust2 = "0.13.0"
 
+[profile.release]
+# The symbol tables (22 MB of the 96) are never loaded: start-up is the same without them. A
+# panic's backtrace then names no functions. Never `panic = "abort"`: diagram::guard catches
+# the panics of the diagram renderer.
+strip = true
+

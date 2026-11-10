@@ -11,6 +11,7 @@ use crate::picker::{Choice, Picker, PickerEvent, Target};
 use crate::reader::{Jump, Reader, ReaderEvent};
 use crate::start::{Start, StartEvent};
 use crate::state::State;
+use crate::timing;
 use crate::tree::{Tree, TreeEvent};
 use gpui_design_system::ToastStack;
 use gpui_design_system::motion::PANEL;
@@ -358,6 +359,7 @@ fn first_page(folder: &Path) -> Option<PathBuf> {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        timing::mark("workspace render");
         let t = palette(cx);
         let config = cx.global::<Config>().clone();
         // The panel folds to nothing and back, its tree sliding under the reader's edge.
@@ -404,5 +406,16 @@ impl Render for Workspace {
             })
             .children(self.picker.as_ref().map(|(picker, _)| picker.clone()))
             .child(self.toasts.clone())
+            // Under RATURE_TIMING, the last element laid out and painted: it says when they end.
+            .when(timing::on(), |d| {
+                d.child(
+                    canvas(
+                        |_, _, _| timing::mark("  window laid out"),
+                        |_, _, _, _| timing::mark("  window painted"),
+                    )
+                    .absolute()
+                    .size_0(),
+                )
+            })
     }
 }
