@@ -18,6 +18,8 @@ pub enum Content {
     Data(Vec<Node>),
     Table(Vec<Vec<String>>),
     Image(PathBuf),
+    /// No file open.
+    Empty,
     /// Why the file is not shown.
     Message(String),
 }
@@ -81,14 +83,13 @@ pub fn load(path: &Path, ink: &str) -> std::io::Result<Content> {
     let size = std::fs::metadata(path)?.len();
     if size > LARGEST {
         return Ok(Content::Message(format!(
-            "{} is {} MB: too large to read here. `e` opens it in nvim.",
-            path.display(),
+            "It is {} MB: too large to read here. e opens it in nvim.",
             size / 1024 / 1024
         )));
     }
     let bytes = std::fs::read(path)?;
     if bytes[..bytes.len().min(8192)].contains(&0) {
-        return Ok(Content::Message(format!("{} is not text.", path.display())));
+        return Ok(Content::Message("It is not text.".into()));
     }
     let text = String::from_utf8_lossy(&bytes).into_owned();
     Ok(read(path, &ext, text, ink))

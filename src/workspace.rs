@@ -128,9 +128,7 @@ impl Workspace {
                 match first_page(&path) {
                     Some(page) => self.open_file(page, Jump::Restore, window, cx),
                     None => {
-                        self.reader.update(cx, |reader, cx| {
-                            reader.show("Pick a file in the tree, or `f` to find one.", cx)
-                        });
+                        self.reader.update(cx, |reader, cx| reader.close(cx));
                         if let Some(tree) = &self.tree {
                             let focus = tree.read(cx).focus_handle().clone();
                             window.focus(&focus, cx);

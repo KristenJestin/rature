@@ -22,10 +22,11 @@ use crate::formats::{self, Content};
 use crate::highlight::Highlighter;
 use crate::highlight::{self, Lines};
 use crate::render::{self, Ctx};
+use crate::start::key_hint;
 use crate::state::{self, State};
 use crate::ui::field::{field_style, focus_frame, follow_theme, ring};
 use crate::ui::toast::Toast;
-use crate::ui::{Button, Icon, Type, enter, icon, palette, space, toast};
+use crate::ui::{Button, Icon, Palette, Type, enter, icon, palette, space, toast};
 use crate::workspace::ToggleTree;
 use crate::{diagram, format, watch};
 
@@ -223,7 +224,7 @@ impl Reader {
         Self {
             path: None,
             ink: render::ink(cx),
-            content: Content::Message(String::new()),
+            content: Content::Empty,
             baseline: Baseline::LastRead,
             before: None,
             drawings: Cache::new(),
@@ -265,14 +266,13 @@ impl Reader {
         }
     }
 
-    /// Shows the Markdown `source`, with no file behind it.
-    pub fn show(&mut self, source: &str, cx: &mut Context<Self>) {
+    /// Shows no file: a folder opened without a page to show first.
+    pub fn close(&mut self, cx: &mut Context<Self>) {
         self.keep_position(cx);
         self.path = None;
         self.watch = None;
         self.before = None;
-        let ink = render::ink(cx);
-        self.set_content(Content::Markdown(document::parse(source, &ink, None)), cx);
+        self.set_content(Content::Empty, cx);
     }
 
     /// Shows the file at `path`, follows its changes, and puts the reading position where
@@ -325,7 +325,7 @@ impl Reader {
             Ok(content) => content,
             // Between the removal and the rename of an atomic write: the next event brings it.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-            Err(error) => Content::Message(format!("{}: {error}", path.display())),
+            Err(error) => Content::Message(format!("It cannot be read: {error}.")),
         };
         self.set_content(content, cx);
         self.compare(cx);
@@ -1323,12 +1323,21 @@ impl Reader {
                     .into_any_element(),
             ],
             Content::Image(path) => vec![wrap(render::image_file(path))],
-            Content::Message(message) => vec![wrap(
-                div()
-                    .pt_10()
-                    .text_color(t.mute)
-                    .child(message.clone())
-                    .into_any_element(),
+            Content::Empty => vec![notice(
+                "no-file",
+                Icon::Text,
+                "No file open",
+                "Pick one in the tree.",
+                &[("f", "find a file"), ("s", "search the folder")],
+                &t,
+            )],
+            Content::Message(message) => vec![notice(
+                "not-shown",
+                Icon::Warning,
+                "This file is not shown",
+                message.clone(),
+                &[],
+                &t,
             )],
         }
     }
@@ -1406,6 +1415,67 @@ fn git_head(path: &Path) -> Option<String> {
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// What the page says when it has no file to show: a sign, a title, a sentence and the keys
+/// that lead on, in the window's own type rather than as a page.
+fn notice(
+    id: &'static str,
+    glyph: Icon,
+    title: &'static str,
+    sentence: impl Into<SharedString>,
+    keys: &[(&'static str, &'static str)],
+    p: &Palette,
+) -> AnyElement {
+    enter(
+        id,
+        0,
+        div()
+            .pt(px(96.))
+            .px_8()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(space::SM)
+            .ui_text()
+            .child(
+                div()
+                    .size(px(48.))
+                    .mb(space::SM)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(12.))
+                    .border_1()
+                    .border_color(p.line2)
+                    .bg(p.card)
+                    .child(icon(glyph).size(px(20.)).text_color(p.mute)),
+            )
+            .child(
+                div()
+                    .text_size(px(15.))
+                    .medium()
+                    .text_color(p.text)
+                    .child(title),
+            )
+            .child(
+                div()
+                    .max_w(px(420.))
+                    .text_center()
+                    .text_color(p.mute)
+                    .child(sentence.into()),
+            )
+            .when(!keys.is_empty(), |d| {
+                d.child(
+                    div()
+                        .pt(space::MD)
+                        .flex()
+                        .gap(space::LG)
+                        .children(keys.iter().map(|(key, what)| key_hint(key, what, p))),
+                )
+            }),
+    )
+    .into_any_element()
 }
 
 impl Render for Reader {
