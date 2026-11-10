@@ -6,7 +6,7 @@ use gpui_kit::*;
 
 use crate::live::{Caret, Edge, LiveBlock, LiveEvent};
 use crate::render;
-use crate::ui::palette;
+use crate::ui::{palette, space};
 
 actions!(list, [Indent, Outdent]);
 
@@ -197,20 +197,13 @@ impl ListEdit {
         self.enter(to, at, window, cx);
     }
 
-    /// Enter at `at` in the line `ix`: what follows the caret becomes a new item. On an empty
-    /// item, the item is outdented, or at the left edge the list is left without it.
+    /// Enter at `at` in the line `ix`: what follows the caret becomes a new item. An empty item
+    /// is taken out of the list instead.
     fn break_line(&mut self, ix: usize, at: usize, window: &mut Window, cx: &mut Context<Self>) {
         let line = &self.lines[ix];
         let text = line.cell.read(cx).value().to_string();
         if text.is_empty() && line.bullet.is_some() {
-            if !line.indent.is_empty() {
-                return self.outdent_line(ix, cx);
-            }
-            if ix + 1 == self.lines.len() && ix > 0 {
-                self.lines.remove(ix);
-                self.change(cx);
-                return cx.emit(LiveEvent::Leave(Edge::Below));
-            }
+            return self.unlist(ix, cx);
         }
         let (head, rest) = text.split_at(at.min(text.len()));
         let (head, rest) = (head.to_string(), rest.to_string());
@@ -235,8 +228,12 @@ impl ListEdit {
         self.change(cx);
     }
 
-    /// Backspace at the start of the line `ix`: its text joins the line above.
+    /// Backspace at the start of the line `ix`: an item loses its bullet, other text joins the
+    /// line above.
     fn join(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.lines[ix].bullet.is_some() {
+            return self.unlist(ix, cx);
+        }
         if ix == 0 {
             return;
         }
@@ -299,6 +296,26 @@ impl ListEdit {
         self.change(cx);
     }
 
+    /// Takes the item `ix` out of the list: a nested one up a level, else it becomes a paragraph
+    /// of its own, the list going on after it.
+    fn unlist(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if !self.lines[ix].indent.is_empty() {
+            return self.outdent_line(ix, cx);
+        }
+        let line = &mut self.lines[ix];
+        line.bullet = None;
+        line.task = None;
+        if ix > 0 {
+            line.blank = line.blank.max(1);
+        }
+        if let Some(next) = self.lines.get_mut(ix + 1)
+            && next.bullet.is_some()
+        {
+            next.blank = next.blank.max(1);
+        }
+        self.change(cx);
+    }
+
     fn toggle(&mut self, ix: usize, cx: &mut Context<Self>) {
         if let Some(done) = &mut self.lines[ix].task {
             *done = !*done;
@@ -356,8 +373,21 @@ impl Render for ListEdit {
         // read: numbered from the first item of each level.
         let mut open: Vec<(usize, Option<usize>)> = Vec::new();
         let mut rows = Vec::with_capacity(self.lines.len());
+        // A paragraph taken out of the list stands apart from it, as blocks do.
+        let mut apart = false;
         for (ix, line) in self.lines.iter().enumerate() {
             let indent = line.indent.len();
+            let gap = ix > 0 && line.blank > 0;
+            if line.bullet.is_none() && line.indent.is_empty() && (gap || open.is_empty()) {
+                open.clear();
+                rows.push(
+                    div()
+                        .when(gap, |d| d.mt(space::MD))
+                        .child(line.cell.clone()),
+                );
+                apart = true;
+                continue;
+            }
             let marker = match &line.bullet {
                 Some(bullet) => {
                     let number = bullet
@@ -396,6 +426,7 @@ impl Render for ListEdit {
             };
             rows.push(
                 render::bullet(size, marker, line.cell.clone())
+                    .when(std::mem::take(&mut apart) && gap, |d| d.mt(space::MD))
                     .pl(step * depth as f32)
                     .when(line.task == Some(true), |d| d.text_color(p.mute)),
             );
