@@ -2,6 +2,7 @@
 
 use std::cell::Cell;
 use std::collections::HashSet;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -316,6 +317,102 @@ fn item(ctx: &Ctx, ordered: bool, number: usize, item: &Item) -> impl IntoElemen
 
 /// Text that wraps word by word, so a formula can sit inside a sentence.
 pub fn flow(ctx: &Ctx, inlines: &[Inline]) -> Div {
+    if inlines.iter().all(|inline| matches!(inline, Inline::Text(..))) {
+        return div().child(text_flow(ctx, inlines));
+    }
+    word_flow(ctx, inlines)
+}
+
+/// Text with no formula in it, laid out whole as the block's editor lays it out: clicked to
+/// edit, it keeps its width to the pixel.
+fn text_flow(ctx: &Ctx, inlines: &[Inline]) -> AnyElement {
+    let t = ctx.theme;
+    let mut text = String::new();
+    let mut pieces = Vec::new();
+    for inline in inlines {
+        if let Inline::Text(piece, marks) = inline {
+            let start = text.len();
+            if piece == "\n" {
+                text.push('\n');
+            } else {
+                text.push_str(&piece.replace('\n', " "));
+            }
+            pieces.push((start..text.len(), marks));
+        }
+    }
+    let mut each = vec![HighlightStyle::default(); text.len()];
+    let mut code = Vec::new();
+    let mut links = Vec::new();
+    for (range, marks) in &pieces {
+        let style = HighlightStyle {
+            font_weight: marks.strong.then_some(FontWeight::BOLD),
+            font_style: marks.emphasis.then_some(FontStyle::Italic),
+            strikethrough: marks.strike.then_some(StrikethroughStyle {
+                thickness: px(1.),
+                color: None,
+            }),
+            color: marks
+                .link
+                .as_ref()
+                .map(|_| if marks.broken { t.fail } else { t.run }),
+            underline: marks.link.as_ref().map(|_| UnderlineStyle {
+                thickness: px(1.),
+                color: None,
+                wavy: false,
+            }),
+            background_color: marks.code.then_some(t.card2),
+            ..Default::default()
+        };
+        each[range.clone()].fill(style);
+        if marks.code {
+            code.push((range.clone(), SharedString::from(ctx.config.code_font.clone())));
+        }
+        if let Some(link) = &marks.link {
+            links.push((range.clone(), link.clone()));
+        }
+    }
+    if let Some(query) = ctx.query.filter(|q| !q.is_empty()) {
+        let lower = text.to_lowercase();
+        // Lowercasing can move bytes: the hits are only marked when it did not.
+        if lower.len() == text.len() {
+            for (at, _) in lower.match_indices(query) {
+                for style in &mut each[at..at + query.len()] {
+                    style.background_color = Some(t.wait.opacity(0.35));
+                }
+            }
+        }
+    }
+    let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    for (ix, style) in each.into_iter().enumerate() {
+        match highlights.last_mut() {
+            Some((range, last)) if *last == style || !text.is_char_boundary(ix) => {
+                range.end = ix + 1
+            }
+            _ => highlights.push((ix..ix + 1, style)),
+        }
+    }
+    let styled = StyledText::new(text)
+        .with_highlights(highlights)
+        .with_font_family_overrides(code);
+    if links.is_empty() {
+        return styled.into_any_element();
+    }
+    let reader = ctx.cx.entity().downgrade();
+    let (ranges, targets): (Vec<_>, Vec<_>) = links.into_iter().unzip();
+    InteractiveText::new(ctx.id("text"), styled)
+        .on_click(ranges, move |ix, window, cx| {
+            // Followed, not edited.
+            cx.stop_propagation();
+            let link = targets[ix].clone();
+            reader
+                .update(cx, |this, cx| this.follow(&link, window, cx))
+                .ok();
+        })
+        .into_any_element()
+}
+
+/// Text with formulas: laid out word by word, a formula kept on the line of what follows it.
+fn word_flow(ctx: &Ctx, inlines: &[Inline]) -> Div {
     let mut row = div().flex().flex_wrap().items_baseline();
     // Noto Sans: ascent 1.069 em, descent 0.293 em, in a line 1.6 rem high.
     let size = f32::from(ctx.size(1.));

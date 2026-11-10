@@ -772,7 +772,7 @@ impl Render for LiveBlock {
                         Ink::Mark => p.faint.opacity(shown),
                         Ink::Link => p.run,
                     },
-                    background_color: look.shade.then_some(p.hover),
+                    background_color: look.shade.then_some(p.card2),
                     underline: None,
                     strikethrough: look.strike.then_some(StrikethroughStyle {
                         thickness: px(1.),
