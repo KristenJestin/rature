@@ -6,6 +6,8 @@
 # STATE: a folder copied in as $XDG_STATE_HOME/rature (what was read before, say).
 # KEYS: keys typed into the window once it is up, as tools/xkeys.py takes them ("j j shift+g").
 # THEN: a shell command run afterwards (a change to the file, say).
+# RENDERER: Weston's renderer, pixman by default (with gl, weston-screenshooter writes the image
+# upside down).
 # needs: weston (with Xwayland), weston-screenshooter, dbus-daemon, ImageMagick.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
@@ -30,7 +32,7 @@ export HOME=$D/home XDG_RUNTIME_DIR=$D/runtime XDG_STATE_HOME=$D/state XDG_CONFI
 unset WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS
 
 [ -n "${STATE:-}" ] && cp -r "$STATE" "$D/state/rature"
-XDG_RUNTIME_DIR=$D/wrun weston --backend=headless --renderer=gl --xwayland --shell=kiosk --fake-seat --debug \
+XDG_RUNTIME_DIR=$D/wrun weston --backend=headless --renderer=${RENDERER:-pixman} --xwayland --shell=kiosk --fake-seat --debug \
   --socket=wl-rature --width=$W --height=$H >"$D/weston.log" 2>&1 &
 WPID=$!
 for _ in $(seq 50); do grep -q 'xserver listening on display' "$D/weston.log" && break; sleep 0.2; done
