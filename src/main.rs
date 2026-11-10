@@ -5,6 +5,7 @@ mod diff;
 mod document;
 mod format;
 mod formats;
+mod fsio;
 mod highlight;
 mod icons;
 mod instance;

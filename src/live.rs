@@ -227,17 +227,22 @@ impl LiveBlock {
     pub fn enter_at(&mut self, at: usize, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
         self.goal = None;
-        self.move_to(at.min(self.text.len()), cx);
+        self.move_to(floor_char(&self.text, at), cx);
     }
 
     pub fn value(&self) -> &str {
         &self.text
     }
 
+    /// Gives the block a new text, the formatted one: the caret and the selection keep their
+    /// offsets where the new text has them, moved back to the start of a character they would
+    /// fall inside.
     pub fn set_value(&mut self, text: String, cx: &mut Context<Self>) {
-        let end = text.len();
         self.text = text;
-        self.selected = self.selected.start.min(end)..self.selected.end.min(end);
+        self.selected =
+            floor_char(&self.text, self.selected.start)..floor_char(&self.text, self.selected.end);
+        self.marked = None;
+        self.goal = None;
         cx.notify();
     }
 
@@ -335,7 +340,8 @@ impl LiveBlock {
         let shown = layout
             .index_for_position(point(here.x, y))
             .unwrap_or_else(|ix| ix);
-        Some(from_shown(&self.hidden, shown))
+        // The layout can be a frame older than the text.
+        Some(floor_char(&self.text, from_shown(&self.hidden, shown)))
     }
 
     fn step(&mut self, down: bool, select: bool, cx: &mut Context<Self>) {
@@ -548,15 +554,14 @@ impl LiveBlock {
     }
 
     fn index_at(&self, position: Point<Pixels>) -> usize {
-        self.layout
-            .as_ref()
-            .map_or(0, |layout| {
-                from_shown(
-                    &self.hidden,
-                    layout.index_for_position(position).unwrap_or_else(|ix| ix),
-                )
-            })
-            .min(self.text.len())
+        let at = self.layout.as_ref().map_or(0, |layout| {
+            from_shown(
+                &self.hidden,
+                layout.index_for_position(position).unwrap_or_else(|ix| ix),
+            )
+        });
+        // The layout and its hidden marks can be a frame older than the text.
+        floor_char(&self.text, at)
     }
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -754,6 +759,16 @@ impl EntityInputHandler for LiveBlock {
     ) -> Option<usize> {
         Some(self.utf16(self.index_at(point)))
     }
+}
+
+/// The offset `at`, within `text` and at the start of the character it falls in: an offset kept
+/// from another text can fall inside an `é`.
+fn floor_char(text: &str, at: usize) -> usize {
+    let mut at = at.min(text.len());
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
 }
 
 /// Where the offset `at` of the text falls in what is drawn of it, `hidden` left out.
@@ -1274,7 +1289,7 @@ fn inline(node: &Node, each: &mut [Look], broken: &dyn Fn(&str) -> bool) {
 #[cfg(test)]
 mod tests {
     // Not the glob: GPUI's own `test` attribute would come with it.
-    use super::{Ink, from_shown, link_at, looks, to_shown};
+    use super::{Ink, floor_char, from_shown, link_at, looks, to_shown};
 
     fn marked(text: &str) -> String {
         looks(text, &[], &|_| false)
@@ -1333,6 +1348,23 @@ mod tests {
         );
         let fence = looks("```rust\nlet x;\n```", &[], &|_| false);
         assert!(fence.iter().all(|(_, l)| l.mono));
+    }
+
+    #[test]
+    fn an_offset_kept_from_another_text_lands_on_a_character() {
+        // Every offset of a longer ASCII text, kept once formatting gave `é ü🎉`.
+        let text = "é ü🎉";
+        for at in 0..text.len() + 3 {
+            let floor = floor_char(text, at);
+            assert!(text.is_char_boundary(floor), "{at} -> {floor}");
+            assert!(floor <= at);
+            // What used to panic: slicing at the kept offset.
+            let _ = &text[..floor];
+        }
+        assert_eq!(floor_char(text, 1), 0);
+        assert_eq!(floor_char(text, 4), 3);
+        assert_eq!(floor_char(text, 6), 5);
+        assert_eq!(floor_char(text, 99), text.len());
     }
 
     #[test]

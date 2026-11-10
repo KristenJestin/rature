@@ -18,6 +18,7 @@ use crate::config::{Config, Side};
 use crate::diff::{self, Changes, Mark};
 use crate::document::{self, Block, Document, Links, Picture};
 use crate::formats::{self, Content};
+use crate::fsio::{self, Update};
 use crate::highlight::Highlighter;
 use crate::highlight::{self, Lines};
 use crate::icons;
@@ -39,6 +40,8 @@ use gpui_design_system::{Button, Icon, Palette, Type, enter, icon, palette, spac
 const LINE: f32 = 64.;
 /// How long typing rests before the block being edited is written.
 const AUTOSAVE: Duration = Duration::from_millis(800);
+/// Why a file that is not UTF-8 is not edited.
+const NOT_UTF8: &str = "Not UTF-8 text: shown, never edited, so its bytes stay as they are";
 
 actions!(
     reader,
@@ -152,6 +155,8 @@ struct CodeFile {
     field: Entity<EditorState>,
     /// The text as the file holds it: as read, or as last written.
     on_disk: String,
+    /// The editor's text when it was given `on_disk`: it differs only once something is typed.
+    shown: String,
     autosave: Option<Task<()>>,
     _events: Subscription,
 }
@@ -223,6 +228,8 @@ pub struct Reader {
     /// The ink formulas were drawn in: a theme with another draws them again.
     ink: String,
     content: Content,
+    /// The file is UTF-8 text, which may be edited and written back.
+    editable: bool,
     baseline: Baseline,
     /// The file as the baseline has it, and how the file now differs from it.
     before: Option<(Document, Changes)>,
@@ -286,6 +293,7 @@ impl Reader {
             path: None,
             ink: render::ink(cx),
             content: Content::Empty,
+            editable: false,
             baseline: Baseline::LastRead,
             before: None,
             drawings: Cache::new(),
@@ -385,20 +393,53 @@ impl Reader {
             return;
         };
         let ink = render::ink(cx);
-        let content = match formats::load(&path, &ink) {
-            Ok(content) => content,
+        let (content, editable) = match formats::load(&path, &ink) {
+            Ok(loaded) => (loaded.content, loaded.editable),
             // Between the removal and the rename of an atomic write: the next event brings it.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-            Err(error) => Content::Message(format!("It cannot be read: {error}.")),
+            Err(error) => (
+                Content::Message(format!("It cannot be read: {error}.")),
+                false,
+            ),
         };
+        self.keep_typed_code(&content, cx);
+        self.editable = editable;
         self.set_content(content, cx);
         self.compare(cx);
+    }
+
+    /// The file changed on disk while code typed into it was not yet written: the editor takes
+    /// the file's new text, and what was typed goes to the clipboard rather than over it.
+    fn keep_typed_code(&mut self, content: &Content, cx: &mut Context<Self>) {
+        let Some(code) = &mut self.code else {
+            return;
+        };
+        let typed = code.field.read(cx).value().to_string();
+        let same_file = matches!(content, Content::Code { text, .. } if *text == code.on_disk);
+        if typed == code.shown || same_file {
+            return;
+        }
+        // Not written later, nor offered again by the next reload.
+        code.autosave = None;
+        code.shown = typed.clone();
+        self.rescue(
+            typed,
+            "The file changed on disk: what you typed is in the clipboard",
+            cx,
+        );
+    }
+
+    /// Text that could not be written: it goes to the clipboard, and the reason stays shown.
+    fn rescue(&mut self, text: String, why: impl Into<SharedString>, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.fail(why, cx);
     }
 
     /// The colours changed: what was drawn in the old ones is drawn again.
     fn restyle(&mut self, cx: &mut Context<Self>) {
         self.ink = render::ink(cx);
-        // Coloured again in the new theme's colours.
+        // Coloured again in the new theme's colours, what was typed written first.
+        self.write_code(cx);
         self.code = None;
         self.drawings.clear();
         self.highlights.clear();
@@ -520,16 +561,17 @@ impl Reader {
         self.before.as_ref().map(|(_, c)| c)
     }
 
-    /// What is kept of the file the reader leaves, for the next time it opens: where it was
-    /// read up to, and that its changes were seen.
-    pub fn put_down(&self, cx: &mut Context<Self>) {
+    /// What is kept of the file the reader leaves, for the next time it opens: what was typed
+    /// and not yet written, where it was read up to, and that its changes were seen.
+    pub fn put_down(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.path.clone() else {
             return;
         };
+        self.write_edit(cx);
+        self.write_code(cx);
         let (block, within) = self.scroll.logical_scroll_top();
         cx.global_mut::<State>()
-            .positions
-            .insert(path.clone(), (block, -f32::from(within)));
+            .set_position(&path, (block, -f32::from(within)));
         if let (Content::Markdown(doc), Some(_)) = (&self.content, &self.before) {
             state::mark_read(&path, &doc.source);
             cx.emit(ReaderEvent::MarkedRead(path));
@@ -596,9 +638,15 @@ impl Reader {
     /// Follows a link: a page on the web, an anchor of this file, or another file (and its
     /// anchor), which the back key returns from.
     pub fn follow(&mut self, link: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if link.contains("://") || link.starts_with("mailto:") {
-            cx.open_url(link);
-            return;
+        match document::target(link) {
+            document::Target::Web => return cx.open_url(link.trim()),
+            document::Target::Foreign => {
+                return self.fail(
+                    format!("Not opened: {link}. Only http, https and mailto links open from here"),
+                    cx,
+                );
+            }
+            document::Target::Local => {}
         }
         let (file, anchor) = link.split_once('#').unwrap_or((link, ""));
         let jump = if anchor.is_empty() {
@@ -912,6 +960,9 @@ impl Reader {
         cx: &mut Context<Self>,
     ) {
         self.finish_editing(window, cx);
+        if !self.editable && matches!(self.content, Content::Markdown(_) | Content::Code { .. }) {
+            return self.say(NOT_UTF8, cx);
+        }
         let (Some(path), Content::Markdown(doc)) = (&self.path, &self.content) else {
             return self.say("Only Markdown is edited here: `e` opens nvim", cx);
         };
@@ -1001,6 +1052,8 @@ impl Reader {
     /// Writes the block being edited into the file, in place of what it was. When the file
     /// changed around it so much that it is not found once, nothing is written and the text goes
     /// to the clipboard.
+    /// The file is read again just before it is written, and replaced whole: what another
+    /// program wrote elsewhere in it is kept.
     fn write_edit(&mut self, cx: &mut Context<Self>) {
         let (Some(path), Some(editing)) = (self.path.clone(), &mut self.editing) else {
             return;
@@ -1009,31 +1062,40 @@ impl Reader {
         if text == editing.original {
             return;
         }
-        let written = std::fs::read_to_string(&path).and_then(|now| {
-            match now.matches(editing.original.as_str()).count() {
-                1 => {
-                    std::fs::write(&path, now.replacen(&editing.original, &text, 1)).map(|()| true)
-                }
-                _ => Ok(false),
-            }
+        let original = editing.original.clone();
+        let written = fsio::update(&path, |now| {
+            (now.matches(original.as_str()).count() == 1)
+                .then(|| now.replacen(original.as_str(), &text, 1))
         });
         match written {
-            Ok(true) => {
+            Ok(Update::Written { .. }) => {
                 // Your own change is read already: what is shown as new stays what others wrote.
                 if let Some(read) = state::last_read(&path)
-                    && read.matches(editing.original.as_str()).count() == 1
+                    && read.matches(original.as_str()).count() == 1
                 {
-                    state::mark_read(&path, &read.replacen(&editing.original, &text, 1));
+                    state::mark_read(&path, &read.replacen(original.as_str(), &text, 1));
                     cx.emit(ReaderEvent::MarkedRead(path));
                 }
                 editing.original = text;
+                // Shown at once as written, rather than when the watch tells of it: the page
+                // left now is marked read with the change in it.
+                self.reload(cx);
             }
-            Ok(false) => self.copy(
+            Ok(Update::Left(_)) => self.rescue(
                 text,
                 "The block changed on disk: your text is in the clipboard",
                 cx,
             ),
-            Err(error) => self.fail(format!("Cannot write: {error}"), cx),
+            Ok(Update::Busy) => self.rescue(
+                text,
+                "The file kept changing: not written, your text is in the clipboard",
+                cx,
+            ),
+            Err(error) => self.rescue(
+                text,
+                format!("Cannot write: {error}. Your text is in the clipboard"),
+                cx,
+            ),
         }
     }
 
@@ -1092,6 +1154,11 @@ impl Reader {
             self.code = None;
             return;
         };
+        // Shown as text that is read, not in an editor that would write it back.
+        if !self.editable {
+            self.code = None;
+            return;
+        }
         if let Some(code) = &mut self.code {
             if code.on_disk != *text {
                 code.on_disk = text.clone();
@@ -1099,6 +1166,7 @@ impl Reader {
                 let text = text.clone();
                 code.field
                     .update(cx, |field, cx| field.set_value(text, window, cx));
+                code.shown = code.field.read(cx).value().to_string();
             }
             return;
         }
@@ -1132,57 +1200,83 @@ impl Reader {
                 }));
             }
         });
+        // What the editor holds before anything is typed: opening it writes nothing.
+        let shown = field.read(cx).value().to_string();
         self.code = Some(CodeFile {
             field,
             on_disk: text,
+            shown,
             autosave: None,
             _events: events,
         });
     }
 
-    /// Writes the code editor's text into the file, when it differs from it.
+    /// Writes the code editor's text into the file, once something was typed, and only over
+    /// the text it was given: a file another program changed meanwhile is not written over.
     fn write_code(&mut self, cx: &mut Context<Self>) {
         let (Some(path), Some(code)) = (self.path.clone(), &mut self.code) else {
             return;
         };
         let text = code.field.read(cx).value().to_string();
-        if text == code.on_disk {
+        if text == code.shown || !self.editable {
             return;
         }
-        match std::fs::write(&path, &text) {
-            Ok(()) => code.on_disk = text,
+        code.autosave = None;
+        let expected = code.on_disk.clone();
+        match fsio::update(&path, |now| (now == expected).then(|| text.clone())) {
+            Ok(Update::Written { .. }) => {
+                code.on_disk = text.clone();
+                code.shown = text;
+            }
+            Ok(Update::Left(_)) => {
+                // Taken as typed: the reload gives the editor the file's text.
+                code.shown = text.clone();
+                self.rescue(
+                    text,
+                    "The file changed on disk: what you typed is in the clipboard",
+                    cx,
+                );
+                self.reload(cx);
+            }
+            Ok(Update::Busy) => self.fail("The file kept changing: not written yet", cx),
             Err(error) => self.fail(format!("Cannot write: {error}"), cx),
         }
     }
 
     /// Writes the edit, then formats the whole file as its kind says.
     fn save(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
+        match self.content {
+            Content::Markdown(_) | Content::Code { .. } | Content::Data(_) | Content::Table(_) => {}
+            Content::Image(_) | Content::Empty | Content::Message(_) => return,
+        }
+        if !self.editable {
+            return self.say(NOT_UTF8, cx);
+        }
         self.write_edit(cx);
         self.write_code(cx);
         let Some(path) = self.path.clone() else {
             return;
         };
-        let result = std::fs::read_to_string(&path).and_then(|now| {
-            let formatted = format::format(&path, &now);
-            if formatted == now {
-                return Ok(false);
-            }
-            std::fs::write(&path, &formatted)?;
-            if state::last_read(&path).as_deref() == Some(now.as_str()) {
-                state::mark_read(&path, &formatted);
-            }
-            if let Some(editing) = &mut self.editing {
-                // The block moved under the formatting: its text is the formatted one now.
-                let doc = document::parse(&formatted, "#000000", None);
-                if let Some(span) = doc.spans.get(editing.block) {
-                    editing.original = formatted[span.clone()].to_string();
-                }
-            }
-            Ok(true)
+        let result = fsio::update(&path, |now| {
+            let formatted = format::format(&path, now);
+            (formatted != now).then_some(formatted)
         });
         match result {
-            Ok(true) => self.say("Formatted and saved", cx),
-            Ok(false) => self.say("Saved", cx),
+            Ok(Update::Written { before, after }) => {
+                if state::last_read(&path).as_deref() == Some(before.as_str()) {
+                    state::mark_read(&path, &after);
+                }
+                if let Some(editing) = &mut self.editing {
+                    // The block moved under the formatting: its text is the formatted one now.
+                    let doc = document::parse(&after, "#000000", None);
+                    if let Some(span) = doc.spans.get(editing.block) {
+                        editing.original = after[span.clone()].to_string();
+                    }
+                }
+                self.say("Formatted and saved", cx)
+            }
+            Ok(Update::Left(_)) => self.say("Saved", cx),
+            Ok(Update::Busy) => self.fail("The file kept changing: not formatted", cx),
             Err(error) => self.fail(format!("Cannot save: {error}"), cx),
         }
         if let Some(editing) = &self.editing {

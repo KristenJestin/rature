@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::document::{self, Document};
-use crate::icons;
+use crate::{fsio, icons};
 use gpui_design_system::Icon;
 
 /// Larger than this, a file is not read: Rature is for reading, not for logs.
@@ -75,25 +75,73 @@ fn extension(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Reads the file at `path`, as its kind says. Formulas are drawn in `ink`.
-pub fn load(path: &Path, ink: &str) -> std::io::Result<Content> {
+/// A file read, and whether Rature may write it back.
+pub struct Loaded {
+    pub content: Content,
+    /// Its text is UTF-8: what is shown is what it holds. Text that is not is shown with its
+    /// bad bytes replaced, and never edited, so it is never written back with them lost.
+    pub editable: bool,
+}
+
+impl Loaded {
+    fn shown(content: Content) -> Self {
+        Self {
+            content,
+            editable: false,
+        }
+    }
+}
+
+/// Reads the file at `path`, as its kind says. Formulas are drawn in `ink`. Only a regular file
+/// is read: a pipe or a device would hold the window waiting.
+pub fn load(path: &Path, ink: &str) -> std::io::Result<Loaded> {
+    use std::io::Read as _;
+    if let Some(what) = fsio::not_a_file(&std::fs::metadata(path)?) {
+        return Ok(Loaded::shown(not_read(what)));
+    }
     let ext = extension(path);
     if IMAGES.contains(&ext.as_str()) {
-        return Ok(Content::Image(path.to_path_buf()));
+        return Ok(Loaded::shown(Content::Image(path.to_path_buf())));
     }
-    let size = std::fs::metadata(path)?.len();
-    if size > LARGEST {
-        return Ok(Content::Message(format!(
+    let file = std::fs::File::open(path)?;
+    // Looked at again through the file opened: the path may have changed meanwhile.
+    let meta = file.metadata()?;
+    if let Some(what) = fsio::not_a_file(&meta) {
+        return Ok(Loaded::shown(not_read(what)));
+    }
+    let too_large = |size: u64| {
+        Loaded::shown(Content::Message(format!(
             "It is {} MB: too large to read here. e opens it in nvim.",
             size / 1024 / 1024
-        )));
+        )))
+    };
+    if meta.len() > LARGEST {
+        return Ok(too_large(meta.len()));
     }
-    let bytes = std::fs::read(path)?;
+    // No more than the limit, even from a file that grows while it is read.
+    let mut bytes = Vec::new();
+    file.take(LARGEST + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > LARGEST {
+        return Ok(too_large(bytes.len() as u64));
+    }
     if bytes[..bytes.len().min(8192)].contains(&0) {
-        return Ok(Content::Message("It is not text.".into()));
+        return Ok(Loaded::shown(Content::Message("It is not text.".into())));
     }
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-    Ok(read(path, &ext, text, ink))
+    let (text, editable) = match String::from_utf8(bytes) {
+        Ok(text) => (text, true),
+        Err(error) => (
+            String::from_utf8_lossy(error.as_bytes()).into_owned(),
+            false,
+        ),
+    };
+    Ok(Loaded {
+        content: read(path, &ext, text, ink),
+        editable,
+    })
+}
+
+fn not_read(what: &str) -> Content {
+    Content::Message(format!("It is {what}: only regular files are read here."))
 }
 
 fn read(path: &Path, ext: &str, text: String, ink: &str) -> Content {
@@ -213,6 +261,49 @@ mod tests {
             panic!("not a table")
         };
         assert_eq!(rows[1], ["Basil", "120"]);
+    }
+
+    fn folder(name: &str) -> PathBuf {
+        let folder =
+            std::env::temp_dir().join(format!("rature-formats-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        folder
+    }
+
+    #[test]
+    fn text_that_is_not_utf8_is_shown_but_not_editable() {
+        let folder = folder("utf8");
+        let bad = folder.join("a.rs");
+        std::fs::write(&bad, b"// caf\xe9\nfn main() {}\n").unwrap();
+        let loaded = load(&bad, "#ffffff").unwrap();
+        assert!(!loaded.editable);
+        let Content::Code { text, .. } = loaded.content else {
+            panic!("not code")
+        };
+        assert!(text.contains("caf\u{fffd}"));
+        let good = folder.join("b.md");
+        std::fs::write(&good, "# Café ü 🎉\n").unwrap();
+        assert!(load(&good, "#ffffff").unwrap().editable);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn a_pipe_or_a_device_is_not_read() {
+        let folder = folder("pipe");
+        let pipe = folder.join("p.md");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&pipe)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        // Read, it would wait for a writer forever: this returns at once.
+        let loaded = load(&pipe, "#ffffff").unwrap();
+        assert!(matches!(loaded.content, Content::Message(m) if m.contains("named pipe")));
+        let loaded = load(Path::new("/dev/zero"), "#ffffff").unwrap();
+        assert!(matches!(loaded.content, Content::Message(m) if m.contains("device")));
+        assert!(!loaded.editable);
+        std::fs::remove_dir_all(folder).unwrap();
     }
 
     #[test]

@@ -422,8 +422,38 @@ impl Links {
     }
 }
 
+/// Where a link leads.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Target {
+    /// A page on the web or a mail to write: opened by the desktop.
+    Web,
+    /// Any other scheme (`file:`, `smb:`, `vscode:`...): a file read is not trusted to open it.
+    Foreign,
+    /// A file beside this one, or an anchor of it.
+    Local,
+}
+
+/// Where `link` leads: its scheme, if it has one, says it.
+pub fn target(link: &str) -> Target {
+    let link = link.trim();
+    let scheme = link
+        .split_once(':')
+        .map(|(scheme, _)| scheme)
+        .filter(|scheme| {
+            scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        });
+    match scheme.map(str::to_ascii_lowercase).as_deref() {
+        None => Target::Local,
+        Some("http" | "https" | "mailto") => Target::Web,
+        Some(_) => Target::Foreign,
+    }
+}
+
 fn is_broken(link: &str, folder: &Path, anchors: &[String]) -> bool {
-    if link.contains("://") || link.starts_with("mailto:") {
+    if target(link) != Target::Local {
         return false;
     }
     let (file, anchor) = link.split_once('#').unwrap_or((link, ""));
@@ -640,6 +670,37 @@ mod tests {
         };
         assert_eq!(pairs[0], ("title".into(), "Tomatoes".into()));
         assert_eq!(pairs[1], ("tags".into(), "garden, summer".into()));
+    }
+
+    #[test]
+    fn only_the_web_and_mail_open_outside() {
+        for web in [
+            "https://x.org",
+            "http://x.org/a",
+            "mailto:a@b.c",
+            "HTTPS://X.ORG",
+        ] {
+            assert_eq!(target(web), Target::Web, "{web}");
+        }
+        for foreign in [
+            "file:///etc/passwd",
+            "file:/etc/passwd",
+            "smb://host/share",
+            "vscode://file/x",
+            "javascript:alert(1)",
+            "ftp://x.org",
+        ] {
+            assert_eq!(target(foreign), Target::Foreign, "{foreign}");
+        }
+        for local in [
+            "a.md",
+            "../b.md#c",
+            "#anchor",
+            "docs/x y.md",
+            "/abs/path.md",
+        ] {
+            assert_eq!(target(local), Target::Local, "{local}");
+        }
     }
 
     #[test]
