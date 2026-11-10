@@ -210,7 +210,7 @@ pub fn block(ctx: &Ctx, block: &Block) -> AnyElement {
             .text_size(ctx.size(0.88))
             .flex()
             .gap_2()
-            .child(div().text_color(t.run).child(format!("{label}.")))
+            .child(div().text_color(t.link).child(format!("{label}.")))
             .child(
                 div()
                     .flex_1()
@@ -425,7 +425,9 @@ fn text_flow(ctx: &Ctx, inlines: &[Inline]) -> AnyElement {
         .on_click(ranges, move |ix, _, cx| {
             // The block's own click edits it, or follows this with Ctrl held.
             let link = targets[ix].clone();
-            reader.update(cx, |this, _| this.clicked_link = Some(link.to_string())).ok();
+            reader
+                .update(cx, |this, _| this.clicked_link = Some(link.to_string()))
+                .ok();
         })
         .into_any_element()
 }
@@ -522,14 +524,17 @@ fn word(ctx: &Ctx, text: &str, marks: &Marks, change: Change) -> AnyElement {
             let link = link.clone();
             element
                 .id(ctx.id("link"))
-                .on_click(ctx.cx.listener(move |this, event: &ClickEvent, window, cx| {
-                    // A click edits, as anywhere else; ctrl-click follows.
-                    if !event.modifiers().secondary() {
-                        return;
-                    }
-                    cx.stop_propagation();
-                    this.follow(&link, window, cx)
-                }))
+                .on_click(
+                    ctx.cx
+                        .listener(move |this, event: &ClickEvent, window, cx| {
+                            // A click edits, as anywhere else; ctrl-click follows.
+                            if !event.modifiers().secondary() {
+                                return;
+                            }
+                            cx.stop_propagation();
+                            this.follow(&link, window, cx)
+                        }),
+                )
                 .into_any_element()
         }
         None => element.into_any_element(),

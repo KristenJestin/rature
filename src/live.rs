@@ -4,6 +4,7 @@
 //! the caret, the selection, the keys and the input of text.
 
 use std::ops::Range;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::prelude::FluentBuilder as _;
@@ -11,6 +12,7 @@ use gpui_kit::*;
 use markdown::mdast::Node;
 
 use crate::config::Config;
+use crate::document::Links;
 use crate::highlight;
 use crate::ui::motion::{ENTER, MODAL, Motion};
 use crate::ui::palette;
@@ -155,11 +157,19 @@ pub struct LiveBlock {
     shown: Motion,
     /// A table's cell or a list's line: Enter and Backspace at its start go to its owner.
     single_line: bool,
+    /// What its links are checked against: a broken one is drawn as reading draws it.
+    links: Rc<Links>,
     _blur: Subscription,
 }
 
 impl LiveBlock {
-    pub fn new(text: String, caret: Caret, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        text: String,
+        caret: Caret,
+        links: Rc<Links>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus = cx.focus_handle();
         let blur = cx.on_blur(&focus, window, |_, _, cx| cx.emit(LiveEvent::Blur));
         let mut shown = Motion::settled(0.);
@@ -186,6 +196,7 @@ impl LiveBlock {
             last_edit: None,
             shown,
             single_line: false,
+            links,
             _blur: blur,
         }
     }
@@ -817,6 +828,7 @@ impl Render for LiveBlock {
         let looks = looks(
             &self.text,
             self.colours.as_ref().map_or(&[], |(_, _, colours)| colours),
+            &|link| self.links.broken(link),
         );
         // Marks show around the caret only. Closing, they go at once but for a line's leading
         // ones, which slide away; a block not yet given its caret is laid out as it is read,
@@ -868,13 +880,16 @@ impl Render for LiveBlock {
                         Ink::Text => look.colour.map_or(base.color, Hsla::from),
                         Ink::Mark => p.faint.opacity(shown),
                         Ink::Link => p.link,
+                        Ink::Broken => p.fail,
                     },
                     background_color: look.shade.then_some(p.card2),
-                    underline: (look.ink == Ink::Link).then_some(UnderlineStyle {
-                        thickness: px(1.),
-                        color: None,
-                        wavy: false,
-                    }),
+                    underline: matches!(look.ink, Ink::Link | Ink::Broken).then_some(
+                        UnderlineStyle {
+                            thickness: px(1.),
+                            color: None,
+                            wavy: false,
+                        },
+                    ),
                     strikethrough: look.strike.then_some(StrikethroughStyle {
                         thickness: px(1.),
                         color: None,
@@ -1007,6 +1022,8 @@ enum Ink {
     /// A Markdown mark: `#`, `**`, a backtick, a link's address.
     Mark,
     Link,
+    /// A link to a file or an anchor that is not there.
+    Broken,
 }
 
 /// How a piece of the text is drawn.
@@ -1027,7 +1044,11 @@ struct Look {
 
 /// The looks of `text`, in runs that cover it whole: its marks faint, what they mark drawn as it
 /// reads.
-fn looks(text: &str, colours: &[(Range<usize>, Rgba)]) -> Vec<(Range<usize>, Look)> {
+fn looks(
+    text: &str,
+    colours: &[(Range<usize>, Rgba)],
+    broken: &dyn Fn(&str) -> bool,
+) -> Vec<(Range<usize>, Look)> {
     let mut each = vec![Look::default(); text.len()];
     for (range, colour) in colours {
         paint(&mut each, range.clone(), |l| l.colour = Some(*colour));
@@ -1061,7 +1082,7 @@ fn looks(text: &str, colours: &[(Range<usize>, Rgba)]) -> Vec<(Range<usize>, Loo
         });
     }
     if let Ok(tree) = markdown::to_mdast(text, &markdown::ParseOptions::gfm()) {
-        inline(&tree, &mut each);
+        inline(&tree, &mut each, broken);
     }
     let mut runs: Vec<(Range<usize>, Look)> = Vec::new();
     for (ix, look) in each.into_iter().enumerate() {
@@ -1156,7 +1177,10 @@ fn link_at(text: &str, at: usize) -> Option<String> {
         }
         node.children()?.iter().find_map(|child| find(child, at))
     }
-    find(&markdown::to_mdast(text, &markdown::ParseOptions::gfm()).ok()?, at)
+    find(
+        &markdown::to_mdast(text, &markdown::ParseOptions::gfm()).ok()?,
+        at,
+    )
 }
 
 fn paint(each: &mut [Look], range: Range<usize>, change: impl Fn(&mut Look)) {
@@ -1189,7 +1213,7 @@ fn marks(each: &mut [Look], node: &Node) {
     }
 }
 
-fn inline(node: &Node, each: &mut [Look]) {
+fn inline(node: &Node, each: &mut [Look], broken: &dyn Fn(&str) -> bool) {
     match node {
         Node::Strong(_) => {
             if let Some(range) = span(node) {
@@ -1209,9 +1233,14 @@ fn inline(node: &Node, each: &mut [Look]) {
             }
             marks(each, node);
         }
-        Node::Link(_) => {
+        Node::Link(link) => {
+            let ink = if broken(&link.url) {
+                Ink::Broken
+            } else {
+                Ink::Link
+            };
             if let Some(range) = inner(node) {
-                paint(each, range, |l| l.ink = Ink::Link);
+                paint(each, range, |l| l.ink = ink);
             }
             marks(each, node);
         }
@@ -1236,7 +1265,7 @@ fn inline(node: &Node, each: &mut [Look]) {
     }
     if let Some(children) = node.children() {
         for child in children {
-            inline(child, each);
+            inline(child, each, broken);
         }
     }
 }
@@ -1247,13 +1276,24 @@ mod tests {
     use super::{Ink, from_shown, link_at, looks, to_shown};
 
     fn marked(text: &str) -> String {
-        looks(text, &[])
+        looks(text, &[], &|_| false)
             .into_iter()
             .map(|(range, look)| match look.ink {
                 Ink::Mark => format!("[{}]", &text[range]),
                 _ => text[range].to_string(),
             })
             .collect()
+    }
+
+    #[test]
+    fn a_broken_link_is_drawn_broken() {
+        let text = "[here](a.md) and [gone](b.md)";
+        let inks: Vec<Ink> = looks(text, &[], &|link| link == "b.md")
+            .into_iter()
+            .filter(|(range, _)| ["here", "gone"].contains(&&text[range.clone()]))
+            .map(|(_, look)| look.ink)
+            .collect();
+        assert_eq!(inks, [Ink::Link, Ink::Broken]);
     }
 
     #[test]
@@ -1285,19 +1325,19 @@ mod tests {
             marked("see `x` and [it](a.md)"),
             "see [`]x[`] and [[]it[](a.md)]"
         );
-        let runs = looks("a **b** c", &[]);
+        let runs = looks("a **b** c", &[], &|_| false);
         assert!(
             runs.iter()
                 .any(|(r, l)| l.bold && &"a **b** c"[r.clone()] == "b")
         );
-        let fence = looks("```rust\nlet x;\n```", &[]);
+        let fence = looks("```rust\nlet x;\n```", &[], &|_| false);
         assert!(fence.iter().all(|(_, l)| l.mono));
     }
 
     #[test]
     fn runs_cover_the_text_on_char_boundaries() {
         let text = "é **ü** `ß` ✓";
-        let runs = looks(text, &[]);
+        let runs = looks(text, &[], &|_| false);
         assert_eq!(runs.first().unwrap().0.start, 0);
         assert_eq!(runs.last().unwrap().0.end, text.len());
         assert!(runs.windows(2).all(|w| w[0].0.end == w[1].0.start));

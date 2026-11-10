@@ -38,7 +38,7 @@ pub struct Palette {
     pub acc: Hsla,
     /// The ink on the primary.
     pub on_acc: Hsla,
-    /// Links, and the open file in the tree.
+    /// Links, and the open file in the tree: the run blue here, Omarchy's accent there.
     pub link: Hsla,
     /// The composer's outer shell.
     pub shell: Hsla,
@@ -96,6 +96,7 @@ impl Palette {
     /// cards sit a step toward the ink (never white, which would be the page itself), the states
     /// are deepened until they read as text on every surface, and the primary is a near-black.
     pub fn light() -> Self {
+        let run = hex(0x2251c4);
         Self {
             body: hex(0xebebea),
             bg: hex(0xfbfbfa),
@@ -112,13 +113,13 @@ impl Palette {
             faint: hex(0x636362),
             acc: hex(0x1c1c1c),
             on_acc: hex(0xfafafa),
-            link: hex(0x2251c4),
+            link: run,
             shell: hex(0xf4f4f3),
             field: hex(0xfdfdfd),
             field_line: hex(0xdadad8),
             focus_line: hex(0xb8b8b6),
             focus_ring: hex(0xe9e9e7),
-            run: hex(0x2251c4),
+            run,
             run_bg: hex(0xe7edfb),
             wait: hex(0x8f5200),
             wait_bg: hex(0xfaefdc),
@@ -139,6 +140,7 @@ impl Palette {
 
     /// Flottille's own dark palette: neutral greys, an off-white primary.
     pub fn base() -> Self {
+        let run = hex(0x7aa7ff);
         Self {
             body: hex(0x0b0b0b),
             bg: hex(0x141414),
@@ -155,13 +157,13 @@ impl Palette {
             faint: hex(0x8a8a8a),
             acc: hex(0xececec),
             on_acc: hex(0x111111),
-            link: hex(0x7aa7ff),
+            link: run,
             shell: hex(0x1a1a1a),
             field: hex(0x121212),
             field_line: hex(0x2a2a2a),
             focus_line: hex(0x3a3a3a),
             focus_ring: hex(0x1f1f1f),
-            run: hex(0x7aa7ff),
+            run,
             run_bg: hex(0x18233a),
             wait: hex(0xf5a524),
             wait_bg: hex(0x2e2210),
@@ -187,7 +189,10 @@ impl Palette {
         self.mute = readable(self.mute, self.card, min);
         self.faint = readable(self.faint, self.card2, min);
         self.on_acc = readable(self.on_acc, self.acc, min);
-        self.link = readable(self.link, self.sel, min);
+        // Links lie on the page, the cards and inline code: all on the same side of the ink.
+        for surface in [self.bg, self.card, self.card2] {
+            self.link = readable(self.link, surface, min);
+        }
         self.run = readable(self.run, self.run_bg, min);
         self.wait = readable(self.wait, self.wait_bg, min);
         self.on_wait = readable(self.on_wait, self.wait, min);
@@ -394,6 +399,7 @@ mod tests {
             ("mute", light.mute),
             ("faint", light.faint),
             ("run", light.run),
+            ("link", light.link),
             ("wait", light.wait),
             ("ok", light.ok),
             ("fail", light.fail),
@@ -409,7 +415,6 @@ mod tests {
         }
         for (name, ink, fill) in [
             ("on_acc", light.on_acc, light.acc),
-            ("link", light.link, light.sel),
             ("run", light.run, light.run_bg),
             ("wait", light.wait, light.wait_bg),
             ("on_wait", light.on_wait, light.wait),

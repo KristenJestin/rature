@@ -1,9 +1,12 @@
 //! A Markdown list edited where it is read: its bullets, numbers and task boxes stay drawn, each
 //! line is edited in place beside its marker, and the list is written back as Markdown.
 
+use std::rc::Rc;
+
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::document::Links;
 use crate::live::{Caret, Edge, LiveBlock, LiveEvent};
 use crate::render;
 use crate::ui::{palette, space};
@@ -51,6 +54,7 @@ pub struct ListEdit {
     /// The line that takes the caret first, then the one that last had it.
     at: usize,
     closing: bool,
+    links: Rc<Links>,
     focus: FocusHandle,
     subscriptions: Vec<Subscription>,
 }
@@ -58,7 +62,13 @@ pub struct ListEdit {
 impl EventEmitter<LiveEvent> for ListEdit {}
 
 impl ListEdit {
-    pub fn new(source: String, caret: Caret, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        source: String,
+        caret: Caret,
+        links: Rc<Links>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus = cx.focus_handle();
         let blur = cx.on_focus_out(&focus, window, |this: &mut Self, _, _, cx| {
             if !this.closing {
@@ -72,6 +82,7 @@ impl ListEdit {
             changed: false,
             at: 0,
             closing: false,
+            links,
             focus,
             subscriptions: vec![blur],
         };
@@ -119,7 +130,8 @@ impl ListEdit {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<LiveBlock> {
-        let cell = cx.new(|cx| LiveBlock::new(text, caret, window, cx).single_line());
+        let links = self.links.clone();
+        let cell = cx.new(|cx| LiveBlock::new(text, caret, links, window, cx).single_line());
         self.subscriptions.push(cx.subscribe_in(
             &cell,
             window,

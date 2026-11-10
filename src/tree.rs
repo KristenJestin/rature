@@ -11,7 +11,7 @@ use gpui_kit::*;
 use std::f32::consts::FRAC_PI_2;
 
 use crate::formats::{self, is_markdown};
-use crate::ui::color::mix;
+use crate::ui::color::{TEXT_CONTRAST, mix, readable};
 use crate::ui::listing::{Item, Listing};
 use crate::ui::rows::turning;
 use crate::ui::{Icon, Type, icon, palette, selectable, space};
@@ -338,6 +338,8 @@ impl Tree {
         let p = palette(cx);
         let selected = focused && self.selected.as_ref() == Some(&entry.path);
         let current = self.current.as_ref() == Some(&entry.path);
+        // The open file in the link colour, made to read on the selection it sits on.
+        let open_ink = readable(p.link, p.sel, TEXT_CONTRAST);
         let changed = self.changed.contains(&entry.path);
         let open = entry.dir && self.open.contains(&entry.path);
         let name = entry
@@ -385,7 +387,7 @@ impl Tree {
                     .justify_center()
                     .children(chevron),
             )
-            .child(icon(glyph).text_color(if current { p.link } else { p.faint }))
+            .child(icon(glyph).text_color(if current { open_ink } else { p.faint }))
             .child(
                 div()
                     .flex_1()
@@ -394,7 +396,7 @@ impl Tree {
                     .whitespace_nowrap()
                     .text_ellipsis()
                     .text_color(if current {
-                        p.link
+                        open_ink
                     } else if entry.dir {
                         p.text
                     } else {

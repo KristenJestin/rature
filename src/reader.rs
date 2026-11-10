@@ -16,7 +16,7 @@ use gpui_kit::*;
 use crate::cache::{Cache, Slot};
 use crate::config::{Config, Side};
 use crate::diff::{self, Changes, Mark};
-use crate::document::{self, Block, Document, Picture};
+use crate::document::{self, Block, Document, Links, Picture};
 use crate::formats::{self, Content};
 use crate::highlight::Highlighter;
 use crate::highlight::{self, Lines};
@@ -910,13 +910,17 @@ impl Reader {
         cx: &mut Context<Self>,
     ) {
         self.finish_editing(window, cx);
-        let (Some(_), Content::Markdown(doc)) = (&self.path, &self.content) else {
+        let (Some(path), Content::Markdown(doc)) = (&self.path, &self.content) else {
             return self.say("Only Markdown is edited here: `e` opens nvim", cx);
         };
         if block >= doc.blocks.len() {
             return;
         }
         let original = doc.source_of(block).to_string();
+        let links = Rc::new(Links {
+            folder: path.parent().unwrap_or(Path::new(".")).to_path_buf(),
+            anchors: doc.anchors.keys().cloned().collect(),
+        });
         let on = move |this: &mut Self,
                        event: &LiveEvent,
                        window: &mut Window,
@@ -931,19 +935,19 @@ impl Reader {
             }
         };
         let (field, events) = if matches!(doc.blocks[block], Block::Table(_)) {
-            let table = cx.new(|cx| TableEdit::new(original.clone(), caret, window, cx));
+            let table = cx.new(|cx| TableEdit::new(original.clone(), caret, links, window, cx));
             let events = cx.subscribe_in(&table, window, move |this, _, event, window, cx| {
                 on(this, event, window, cx)
             });
             (Field::Table(table), events)
         } else if matches!(doc.blocks[block], Block::List { .. }) {
-            let list = cx.new(|cx| ListEdit::new(original.clone(), caret, window, cx));
+            let list = cx.new(|cx| ListEdit::new(original.clone(), caret, links, window, cx));
             let events = cx.subscribe_in(&list, window, move |this, _, event, window, cx| {
                 on(this, event, window, cx)
             });
             (Field::List(list), events)
         } else {
-            let text = cx.new(|cx| LiveBlock::new(original.clone(), caret, window, cx));
+            let text = cx.new(|cx| LiveBlock::new(original.clone(), caret, links, window, cx));
             let events = cx.subscribe_in(&text, window, move |this, _, event, window, cx| {
                 on(this, event, window, cx)
             });

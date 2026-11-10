@@ -1,9 +1,12 @@
 //! A Markdown table edited where it is read: its grid stays, each cell is a line edited in
 //! place, rows and columns are added and deleted, and the table is written back as Markdown.
 
+use std::rc::Rc;
+
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::document::Links;
 use crate::live::{Caret, Edge, LiveBlock, LiveEvent};
 use crate::render;
 use crate::ui::{Button, Icon, Type, enter, palette, space};
@@ -47,6 +50,7 @@ pub struct TableEdit {
     /// The cell that takes the caret first, then the one that last had it.
     at: (usize, usize),
     closing: bool,
+    links: Rc<Links>,
     focus: FocusHandle,
     subscriptions: Vec<Subscription>,
 }
@@ -54,7 +58,13 @@ pub struct TableEdit {
 impl EventEmitter<LiveEvent> for TableEdit {}
 
 impl TableEdit {
-    pub fn new(source: String, caret: Caret, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        source: String,
+        caret: Caret,
+        links: Rc<Links>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut lines = source.lines();
         let header = lines.next().map(cells).unwrap_or_default();
         let width = header.len().max(1);
@@ -84,6 +94,7 @@ impl TableEdit {
                 _ => (0, 0),
             },
             closing: false,
+            links,
             focus,
             subscriptions: vec![blur],
         };
@@ -118,7 +129,8 @@ impl TableEdit {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<LiveBlock> {
-        let cell = cx.new(|cx| LiveBlock::new(text, caret, window, cx).single_line());
+        let links = self.links.clone();
+        let cell = cx.new(|cx| LiveBlock::new(text, caret, links, window, cx).single_line());
         self.subscriptions.push(cx.subscribe_in(
             &cell,
             window,

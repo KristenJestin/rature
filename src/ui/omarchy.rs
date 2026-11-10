@@ -2,8 +2,8 @@
 //! follows it live.
 //!
 //! The theme is read from `$XDG_STATE_HOME/omarchy/current/theme/colors.toml`. Its backgrounds and
-//! foregrounds give the surfaces and text levels, its `accent` the primary, its blue, yellow,
-//! green and red the states. Missing keys are derived by mixing `background` and `foreground`;
+//! foregrounds give the surfaces and text levels, its `accent` the primary and the links (its
+//! blue when the accent is grey or near the text), its blue, yellow, green and red the states. Missing keys are derived by mixing `background` and `foreground`;
 //! every ink is then checked for contrast and moved until it reads. A theme missing a required
 //! key, or unreadable, leaves the base theme in place, with the reason logged.
 //!
@@ -139,7 +139,11 @@ pub fn palette_from_toml(text: &str) -> Result<Palette, String> {
         faint: dark_fg,
         acc: accent,
         on_acc: bg,
-        link: accent,
+        link: if accent.s < 0.2 || distance(accent, fg) < 0.2 {
+            blue
+        } else {
+            accent
+        },
         shell: lighter,
         field: dark,
         field_line: toward_fg(0.10),
@@ -163,6 +167,12 @@ pub fn palette_from_toml(text: &str) -> Result<Palette, String> {
         shadow: hex(0x000000),
     }
     .with_readable_inks())
+}
+
+/// How far apart two colours are, in RGB: 0 the same, about 1.7 black and white.
+fn distance(a: Hsla, b: Hsla) -> f32 {
+    let (a, b) = (a.to_rgb(), b.to_rgb());
+    ((a.r - b.r).powi(2) + (a.g - b.g).powi(2) + (a.b - b.b).powi(2)).sqrt()
 }
 
 /// The theme to use, and why the base theme was kept when Omarchy's could not be.
@@ -375,6 +385,36 @@ mod tests {
         assert_eq!(p.acc, hex(0x7aa2f7));
         assert!(p.card.l > p.bg.l && p.rail.l < p.bg.l && p.body.l < p.rail.l);
         assert!(contrast(p.text, p.card) >= TEXT_CONTRAST);
+    }
+
+    #[test]
+    fn links_take_the_accent_unless_it_is_grey_or_the_text() {
+        let theme = |accent: &str| {
+            palette_from_toml(&format!(
+                "background = \"#08090a\"\nforeground = \"#d0d6e0\"\naccent = \"{accent}\"\n\
+                 blue = \"#4ea7fc\"\n"
+            ))
+            .unwrap()
+        };
+        assert_eq!(theme("#ff8226").link, hex(0xff8226));
+        assert_eq!(theme("#8d8d8d").link, hex(0x4ea7fc), "a grey accent");
+        assert_eq!(
+            theme("#d0d6e0").link,
+            hex(0x4ea7fc),
+            "the accent of the text"
+        );
+    }
+
+    #[test]
+    fn links_read_on_the_page_even_under_a_light_selection() {
+        let p = palette_from_toml(
+            "background = \"#2e3440\"\nforeground = \"#d8dee9\"\naccent = \"#81a1c1\"\n\
+             selection_background = \"#d8dee9\"\n",
+        )
+        .unwrap();
+        for surface in [p.bg, p.card, p.card2] {
+            assert!(contrast(p.link, surface) >= TEXT_CONTRAST);
+        }
     }
 
     #[test]

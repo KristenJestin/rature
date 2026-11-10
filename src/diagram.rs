@@ -76,11 +76,7 @@ pub fn render(source: &str, colors: &Colors) -> Result<Picture, String> {
     let (width, height) = size(svg).ok_or("The diagram has no size")?;
     let scaled = svg.replacen(
         "width=\"100%\"",
-        &format!(
-            "width=\"{}\" height=\"{}\"",
-            width * SCALE,
-            height * SCALE
-        ),
+        &format!("width=\"{}\" height=\"{}\"", width * SCALE, height * SCALE),
         1,
     );
     Ok(picture(scaled, width, height))

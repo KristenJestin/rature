@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use markdown::mdast::Node;
@@ -407,6 +407,18 @@ fn check_links(block: &mut Block, folder: &Path, anchors: &[String]) {
             .flat_map(|item| item.blocks.iter_mut())
             .for_each(|b| check_links(b, folder, anchors)),
         _ => {}
+    }
+}
+
+/// What a document's links are checked against while it is edited.
+pub struct Links {
+    pub folder: PathBuf,
+    pub anchors: Vec<String>,
+}
+
+impl Links {
+    pub fn broken(&self, link: &str) -> bool {
+        is_broken(link, &self.folder, &self.anchors)
     }
 }
 
