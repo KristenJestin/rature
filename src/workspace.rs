@@ -13,7 +13,8 @@ use crate::start::{Start, StartEvent};
 use crate::state::State;
 use crate::tree::{Tree, TreeEvent};
 use crate::ui::ToastStack;
-use crate::ui::palette;
+use crate::ui::motion::PANEL;
+use crate::ui::{fade, palette};
 
 actions!(
     workspace,
@@ -144,7 +145,18 @@ impl Workspace {
                 self.open_file(path, Jump::Restore, window, cx)
             }
         }
+        self.tree_changed(cx);
         cx.notify();
+    }
+
+    /// Tells the reader, whose bar holds the button that shows and hides the tree.
+    fn tree_changed(&self, cx: &mut Context<Self>) {
+        let tree = self
+            .tree
+            .is_some()
+            .then(|| (cx.global::<Config>().tree, self.tree_shown));
+        self.reader
+            .update(cx, |reader, cx| reader.set_tree(tree, cx));
     }
 
     fn open_file(
@@ -293,6 +305,7 @@ impl Workspace {
             let focus = self.reader.read(cx).focus_handle().clone();
             window.focus(&focus, cx);
         }
+        self.tree_changed(cx);
         cx.notify();
     }
 
@@ -339,18 +352,29 @@ fn first_page(folder: &Path) -> Option<PathBuf> {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = palette(cx);
         let config = cx.global::<Config>().clone();
-        let panel = self.tree.as_ref().filter(|_| self.tree_shown).map(|tree| {
+        // The panel folds to nothing and back, its tree sliding under the reader's edge.
+        let shown = fade("tree-panel", self.tree_shown, PANEL, window, cx);
+        let panel = self.tree.as_ref().filter(|_| shown > 0.0).map(|tree| {
             div()
                 .flex_none()
-                .w(px(config.tree_width))
+                .w(px(config.tree_width * shown))
                 .h_full()
-                .when(config.tree == Side::Left, |d| d.border_r_1())
+                .overflow_hidden()
+                .flex()
+                .when(config.tree == Side::Left, |d| d.justify_end().border_r_1())
                 .when(config.tree == Side::Right, |d| d.border_l_1())
                 .border_color(t.line)
-                .child(tree.clone())
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(config.tree_width))
+                        .h_full()
+                        .opacity(shown)
+                        .child(tree.clone()),
+                )
         });
         let reader = div().flex_1().h_full().min_w_0().child(self.reader.clone());
         div()

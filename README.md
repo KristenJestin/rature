@@ -91,7 +91,7 @@ rename, as an agent does, it is read again where you are.
 | `Ctrl-s` | save and format |
 | `zM` `zR` | fold, unfold every JSON or YAML node |
 | `Ctrl-=` `Ctrl--` `Ctrl-0` | zoom |
-| `t` | show, hide the tree |
+| `t` | show, hide the tree (or the button at the corner of the bar) |
 | `Ctrl-h` `Ctrl-l` | to the tree, to the page |
 | tree: `j` `k` `l` `h`, `Enter` | move, open, close |
 | `e` | the file in nvim, in the desktop's terminal (`xdg-terminal-exec`) |

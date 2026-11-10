@@ -56,6 +56,9 @@ gpui_kit::assets::icon_assets!(
         ChevronLeft,
         ChevronRight,
         PanelRightOpen,
+        PanelRightClose,
+        PanelLeftOpen,
+        PanelLeftClose,
         FolderOpen,
         Image,
         Sheet,
@@ -160,6 +163,12 @@ pub enum Icon {
     Next,
     /// Opens the right panel: the session's details (its rail).
     PanelRight,
+    /// Closes the right panel.
+    PanelRightClose,
+    /// Opens the left panel.
+    PanelLeft,
+    /// Closes the left panel.
+    PanelLeftClose,
     /// An open folder: a folder of the tree, unfolded.
     FolderOpen,
     /// An image file.
@@ -175,7 +184,7 @@ pub enum Icon {
 }
 
 impl Icon {
-    pub const ALL: [Self; 47] = [
+    pub const ALL: [Self; 50] = [
         Self::Folder,
         Self::Branch,
         Self::Repository,
@@ -217,6 +226,9 @@ impl Icon {
         Self::Previous,
         Self::Next,
         Self::PanelRight,
+        Self::PanelRightClose,
+        Self::PanelLeft,
+        Self::PanelLeftClose,
         Self::FolderOpen,
         Self::Image,
         Self::Table,
@@ -271,6 +283,9 @@ impl Icon {
             Self::Previous => IconName::ChevronLeft,
             Self::Next => IconName::ChevronRight,
             Self::PanelRight => IconName::PanelRightOpen,
+            Self::PanelRightClose => IconName::PanelRightClose,
+            Self::PanelLeft => IconName::PanelLeftOpen,
+            Self::PanelLeftClose => IconName::PanelLeftClose,
             Self::FolderOpen => IconName::FolderOpen,
             Self::Image => IconName::Image,
             Self::Table => IconName::Sheet,

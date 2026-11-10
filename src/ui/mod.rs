@@ -27,7 +27,7 @@ use gpui_kit::App;
 
 pub use button::Button;
 pub use icons::{Icon, Icons, icon};
-pub use interact::selectable;
+pub use interact::{fade, selectable};
 pub use reveal::{enter, presence};
 pub use theme::{Palette, palette};
 

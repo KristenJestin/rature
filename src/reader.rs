@@ -11,7 +11,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::cache::{Cache, Slot};
-use crate::config::Config;
+use crate::config::{Config, Side};
 use crate::diff::{self, Changes, Mark};
 use crate::document::{self, Block, Document, Picture};
 use crate::formats::{self, Content};
@@ -21,6 +21,7 @@ use crate::state::{self, State};
 use crate::ui::field::{focus_frame, follow_theme, ring};
 use crate::ui::toast::Toast;
 use crate::ui::{Button, Icon, Type, enter, icon, palette, space, toast};
+use crate::workspace::ToggleTree;
 use crate::{diagram, format, watch};
 
 /// What `j` and `k` move.
@@ -159,6 +160,8 @@ pub struct Reader {
     drawings: Cache<String, Picture>,
     highlights: Cache<(String, String), Option<Lines>>,
     folded: HashSet<Vec<usize>>,
+    /// The folder's tree, if there is one: the side it stands on and whether it is shown.
+    tree: Option<(Side, bool)>,
     scroll: ScrollHandle,
     focus: FocusHandle,
     watch: Option<(notify::RecommendedWatcher, Task<()>)>,
@@ -218,6 +221,7 @@ impl Reader {
             back: Vec::new(),
             forward: Vec::new(),
             search_field,
+            tree: None,
             searching: false,
             query: String::new(),
             editing: None,
@@ -228,6 +232,11 @@ impl Reader {
 
     pub fn focus_handle(&self) -> &FocusHandle {
         &self.focus
+    }
+
+    pub fn set_tree(&mut self, tree: Option<(Side, bool)>, cx: &mut Context<Self>) {
+        self.tree = tree;
+        cx.notify();
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -1076,6 +1085,30 @@ impl Reader {
         } else {
             div().into_any_element()
         };
+        let panel = self.tree.map(|(side, shown)| {
+            let glyph = match (side, shown) {
+                (Side::Left, true) => Icon::PanelLeftClose,
+                (Side::Left, false) => Icon::PanelLeft,
+                (Side::Right, true) => Icon::PanelRightClose,
+                (Side::Right, false) => Icon::PanelRight,
+            };
+            let tip = if shown {
+                "Hide the tree  t"
+            } else {
+                "Show the tree  t"
+            };
+            (
+                side,
+                act("toggle-tree", glyph, tip, |_, window, cx| {
+                    window.dispatch_action(Box::new(ToggleTree), cx)
+                }),
+            )
+        });
+        let (left, right) = match panel {
+            Some((Side::Left, button)) => (Some(button), None),
+            Some((Side::Right, button)) => (None, Some(button)),
+            None => (None, None),
+        };
         div()
             .flex_none()
             .h(px(44.))
@@ -1087,6 +1120,7 @@ impl Reader {
             .border_color(p.line)
             .bg(p.bg)
             .ui_text()
+            .children(left)
             .children(crumbs)
             .child(div().flex_1())
             .child(status)
@@ -1106,6 +1140,7 @@ impl Reader {
                     |this, window, cx| this.open_in_nvim(&OpenInNvim, window, cx),
                 ))
             })
+            .children(right)
     }
 
     fn items(&self, ctx: &Ctx, cx: &Context<Self>) -> Vec<AnyElement> {
