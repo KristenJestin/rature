@@ -12,6 +12,7 @@ use nucleo_matcher::{Config as MatcherConfig, Matcher};
 
 use crate::config::home;
 use crate::formats;
+use crate::ui::field::{focus_frame, follow_theme};
 use crate::ui::listing::{Item, Listing};
 use crate::ui::modal::Modal;
 use crate::ui::page::EmptyLine;
@@ -96,7 +97,11 @@ impl Picker {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let field = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        let field = cx.new(|cx| {
+            let mut field = InputState::new(window, cx).placeholder(placeholder);
+            follow_theme(&mut field, cx);
+            field
+        });
         let events =
             cx.subscribe_in(
                 &field,
@@ -579,16 +584,16 @@ fn pieces(label: &str, query: &str, fuzzy: bool) -> Vec<(String, bool)> {
 }
 
 /// The field a search modal opens with.
-fn field_frame(field: &Entity<InputState>, cx: &App) -> impl IntoElement {
+fn field_frame(field: &Entity<InputState>, window: &mut Window, cx: &mut App) -> impl IntoElement {
     let p = palette(cx);
-    div()
+    let focused = field.read(cx).focus_handle(cx).is_focused(window);
+    let frame = div()
         .id("picker-input")
         .h(px(36.))
         .px(space::MD)
         .rounded(px(8.))
-        .bg(p.field)
-        .border_1()
-        .border_color(p.line2)
+        .bg(p.field);
+    focus_frame("picker-input", frame, focused, window, cx)
         .flex()
         .items_center()
         .gap(space::SM)
@@ -599,7 +604,7 @@ fn field_frame(field: &Entity<InputState>, cx: &App) -> impl IntoElement {
 }
 
 impl Render for Picker {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let now = cx.background_executor().now();
         let reduce = cx.reduce_motion();
@@ -681,7 +686,7 @@ impl Render for Picker {
                     .on_action(cx.listener(Self::previous))
                     .on_action(cx.listener(Self::dismiss))
                     .on_action(cx.listener(Self::complete))
-                    .child(field_frame(&self.field, cx)),
+                    .child(field_frame(&self.field, window, cx)),
             )
             .children(rows)
             .child(presence(

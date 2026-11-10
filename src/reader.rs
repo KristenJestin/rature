@@ -18,6 +18,7 @@ use crate::formats::{self, Content};
 use crate::highlight::{self, Lines};
 use crate::render::{self, Ctx};
 use crate::state::{self, State};
+use crate::ui::field::{focus_frame, follow_theme, ring};
 use crate::ui::toast::Toast;
 use crate::ui::{Button, Icon, Type, enter, icon, palette, space, toast};
 use crate::{diagram, format, watch};
@@ -173,7 +174,11 @@ pub struct Reader {
 
 impl Reader {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let search_field = cx.new(|cx| InputState::new(window, cx).placeholder("Search this file"));
+        let search_field = cx.new(|cx| {
+            let mut field = InputState::new(window, cx).placeholder("Search this file");
+            follow_theme(&mut field, cx);
+            field
+        });
         let subscriptions = vec![
             cx.subscribe_in(
                 &search_field,
@@ -818,6 +823,7 @@ impl Reader {
         let original = doc.source_of(block).to_string();
         let field = cx.new(|cx| {
             let mut field = TextareaState::new(window, cx).auto_grow(1, 60);
+            follow_theme(&mut field, cx);
             field.set_value(original.clone(), window, cx);
             field
         });
@@ -931,7 +937,7 @@ impl Reader {
     }
 
     /// The bar over the page: where the file is, what changed, and the search.
-    fn bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let changes = self.changes().map_or(0, Changes::count);
         let this = cx.entity().downgrade();
@@ -977,21 +983,21 @@ impl Reader {
         });
         let hits = (!self.query.is_empty()).then(|| self.hits().len());
         let status: AnyElement = if self.searching || hits.is_some() {
-            div()
-                .flex()
-                .items_center()
-                .gap(space::SM)
+            let focused = self
+                .search_field
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window);
+            let frame = div()
                 .h(px(28.))
                 .w(px(300.))
                 .px(space::SM)
                 .rounded(px(7.))
-                .border_1()
-                .border_color(if self.searching {
-                    p.focus_line
-                } else {
-                    p.field_line
-                })
-                .bg(p.field)
+                .bg(p.field);
+            focus_frame("search-field", frame, focused, window, cx)
+                .flex()
+                .items_center()
+                .gap(space::SM)
                 .child(icon(Icon::Search).text_color(p.faint))
                 .child(
                     div()
@@ -1140,10 +1146,8 @@ impl Reader {
                                     .flex_col()
                                     .gap(space::XS)
                                     .child(
-                                        div()
-                                            .rounded(px(8.))
-                                            .border_1()
-                                            .border_color(t.focus_line)
+                                        // It is only shown focused: leaving it ends the edit.
+                                        ring(div().rounded(px(8.)), 1.0, &t)
                                             .bg(t.field)
                                             .px(px(15.))
                                             .py(space::SM)
@@ -1281,7 +1285,7 @@ fn git_head(path: &Path) -> Option<String> {
 }
 
 impl Render for Reader {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = palette(cx);
         let config = cx.global::<Config>().clone();
         let folder = self
@@ -1304,7 +1308,7 @@ impl Render for Reader {
             );
             self.items(&ctx, cx)
         };
-        let bar = self.bar(cx);
+        let bar = self.bar(window, cx);
         div()
             .size_full()
             .flex()

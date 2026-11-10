@@ -9,15 +9,20 @@
 use std::sync::Arc;
 
 use gpui_kit::base::input::{InputBaseState, InputEditorStyle, InputModeKind};
-use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     AnyElement, App, Context, ElementId, FontWeight, InteractiveElement, IntoElement,
     ParentElement, RenderOnce, SharedString, StatefulInteractiveElement, Styled, TestSupportExt,
     Window, div, px,
 };
+use gpui_kit::{BoxShadow, point};
+
+use crate::ui::color::mix;
+use crate::ui::interact::fade;
+use crate::ui::motion::HOVER;
 
 use crate::ui::reveal::presence_of;
-use crate::ui::theme::{Theme, palette};
+use crate::ui::theme::{Palette, Theme, palette};
 
 /// The style of a text field in the palette of now: its ink and placeholder, its selection and
 /// its caret, the accent as the focus ring is.
@@ -50,6 +55,35 @@ pub fn follow_theme<T: StyledField + 'static>(field: &mut T, cx: &mut Context<T>
     field.set_field_style(field_style(cx));
     cx.observe_global::<Theme>(|field, cx| field.set_field_style(field_style(cx)))
         .detach();
+}
+
+/// The frame of a text field, its line and its focus ring: the line darkens to the focus line and
+/// the ring spreads around it as the field takes the focus, and fade back as it leaves.
+pub fn focus_frame<E: Styled + FluentBuilder>(
+    id: impl Into<ElementId>,
+    frame: E,
+    focused: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> E {
+    let at = fade(id, focused, HOVER, window, cx);
+    ring(frame, at, &palette(cx))
+}
+
+/// The frame of a text field `at` of the way to focused: [`focus_frame`] without the fade.
+pub fn ring<E: Styled + FluentBuilder>(frame: E, at: f32, p: &Palette) -> E {
+    frame
+        .border_1()
+        .border_color(mix(p.field_line, p.focus_line, at))
+        .when(at > 0.0, |d| {
+            d.shadow(vec![BoxShadow {
+                color: p.focus_ring.opacity(at),
+                offset: point(px(0.), px(0.)),
+                blur_radius: px(0.),
+                spread_radius: px(3.),
+                inset: false,
+            }])
+        })
 }
 
 #[derive(IntoElement)]
