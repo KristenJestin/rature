@@ -406,6 +406,8 @@ fn word(ctx: &Ctx, text: &str, marks: &Marks, change: Change) -> AnyElement {
             element
                 .id(ctx.id("link"))
                 .on_click(ctx.cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    // Followed, not edited.
+                    cx.stop_propagation();
                     this.follow(&link, window, cx)
                 }))
                 .into_any_element()
@@ -459,6 +461,7 @@ pub fn code(ctx: &Ctx, lang: &str, text: &str) -> Div {
                 .group_hover(group, |s| s.opacity(1.))
                 .child("Copy")
                 .on_click(ctx.cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
                     this.copy(copied.clone(), "Code copied", cx)
                 })),
         )

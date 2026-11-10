@@ -9,7 +9,6 @@ use std::time::Duration;
 use futures::StreamExt as _;
 use gpui_kit::base::input::{
     Editor, EditorState, Input, InputEditorStyle, InputEvent, InputHighlighter, InputState,
-    Textarea, TextareaState,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -21,10 +20,11 @@ use crate::document::{self, Block, Document, Picture};
 use crate::formats::{self, Content};
 use crate::highlight::Highlighter;
 use crate::highlight::{self, Lines};
+use crate::live::{Caret, Edge, LiveBlock, LiveEvent};
 use crate::render::{self, Ctx};
 use crate::start::key_hint;
 use crate::state::{self, State};
-use crate::ui::field::{field_style, focus_frame, follow_theme, ring};
+use crate::ui::field::{field_style, focus_frame, follow_theme};
 use crate::ui::toast::Toast;
 use crate::ui::{Button, Icon, Palette, Type, enter, icon, palette, space, toast};
 use crate::workspace::ToggleTree;
@@ -155,7 +155,7 @@ struct Editing {
     block: usize,
     /// The block's source as last written: what is looked for in the file to replace it.
     original: String,
-    field: Entity<TextareaState>,
+    field: Entity<LiveBlock>,
     autosave: Option<Task<()>>,
     _events: Subscription,
 }
@@ -598,16 +598,6 @@ impl Reader {
         self.say(what.to_string(), cx);
     }
 
-    fn copy_anchor(&mut self, slug: String, cx: &mut Context<Self>) {
-        let name = self
-            .path
-            .as_deref()
-            .and_then(Path::file_name)
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        self.copy(format!("{name}#{slug}"), "Link copied", cx);
-    }
-
     /// The result of what was asked, in a toast that leaves by itself.
     pub fn say(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
         toast(Toast::success(message), cx);
@@ -840,10 +830,17 @@ impl Reader {
         let (top, within) = self.scroll.logical_scroll_top();
         // A block more than half gone above is not the one being read.
         let block = if within < px(-40.) { top + 1 } else { top };
-        self.edit_block(block, window, cx);
+        self.edit_block(block, Caret::Start, window, cx);
     }
 
-    pub fn edit_block(&mut self, block: usize, window: &mut Window, cx: &mut Context<Self>) {
+    /// Edits the block `block` where it is read, the caret where `caret` says.
+    pub fn edit_block(
+        &mut self,
+        block: usize,
+        caret: Caret,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.finish_editing(window, cx);
         let (Some(_), Content::Markdown(doc)) = (&self.path, &self.content) else {
             return self.say("Only Markdown is edited here: `e` opens nvim", cx);
@@ -852,23 +849,17 @@ impl Reader {
             return;
         }
         let original = doc.source_of(block).to_string();
-        let field = cx.new(|cx| {
-            let mut field = TextareaState::new(window, cx).auto_grow(1, 60);
-            follow_theme(&mut field, cx);
-            field.set_value(original.clone(), window, cx);
-            field
-        });
-        let events =
-            cx.subscribe_in(
-                &field,
-                window,
-                |this, _, event: &InputEvent, window, cx| match event {
-                    InputEvent::Change => this.autosave_later(cx),
-                    InputEvent::Blur => this.finish_editing(window, cx),
-                    _ => {}
-                },
-            );
-        let focus = field.read(cx).focus_handle(cx);
+        let field = cx.new(|cx| LiveBlock::new(original.clone(), caret, window, cx));
+        let events = cx.subscribe_in(
+            &field,
+            window,
+            move |this, _, event: &LiveEvent, window, cx| match event {
+                LiveEvent::Change => this.autosave_later(cx),
+                LiveEvent::Blur => this.finish_editing(window, cx),
+                LiveEvent::Leave(edge) => this.leave(block, *edge, window, cx),
+            },
+        );
+        let focus = field.read(cx).focus_handle().clone();
         window.focus(&focus, cx);
         self.editing = Some(Editing {
             block,
@@ -928,6 +919,18 @@ impl Reader {
         self.editing = None;
         window.focus(&self.focus, cx);
         cx.notify();
+    }
+
+    /// The caret was moved out of the block `block`: the one beyond is edited, the caret on
+    /// the side it came from.
+    fn leave(&mut self, block: usize, edge: Edge, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.document().map_or(0, |doc| doc.blocks.len());
+        let (next, caret) = match edge {
+            Edge::Above if block > 0 => (block - 1, Caret::End),
+            Edge::Below if block + 1 < count => (block + 1, Caret::Start),
+            _ => return,
+        };
+        self.edit_block(next, caret, window, cx);
     }
 
     fn stop_editing(&mut self, _: &StopEditing, window: &mut Window, cx: &mut Context<Self>) {
@@ -1009,7 +1012,7 @@ impl Reader {
     }
 
     /// Writes the edit, then formats the whole file as its kind says.
-    fn save(&mut self, _: &Save, window: &mut Window, cx: &mut Context<Self>) {
+    fn save(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
         self.write_edit(cx);
         self.write_code(cx);
         let Some(path) = self.path.clone() else {
@@ -1038,7 +1041,7 @@ impl Reader {
         if let Some(editing) = &self.editing {
             let original = editing.original.clone();
             let field = editing.field.clone();
-            field.update(cx, |field, cx| field.set_value(original, window, cx));
+            field.update(cx, |field, cx| field.set_value(original, cx));
         }
     }
 
@@ -1258,34 +1261,28 @@ impl Reader {
                     }
                     let mark = changes.map(|(_, c)| &c.marks[ix]);
                     let editing = self.editing.as_ref().filter(|e| e.block == ix);
-                    let shown =
-                        match editing {
-                            Some(editing) => {
-                                div()
-                                    .key_context("Editing")
-                                    .on_action(cx.listener(Self::stop_editing))
-                                    .on_action(cx.listener(Self::save))
-                                    .mx(px(-16.))
-                                    .flex()
-                                    .flex_col()
-                                    .gap(space::XS)
-                                    .child(
-                                        // It is only shown focused: leaving it ends the edit.
-                                        ring(div().rounded(px(8.)), 1.0, &t)
-                                            .bg(t.field)
-                                            .px(px(15.))
-                                            .py(space::SM)
-                                            .font_family(cx.global::<Config>().code_font.clone())
-                                            .text_size(ctx.size(0.9))
-                                            .child(Textarea::new(&editing.field)),
-                                    )
-                                    .child(div().px(px(16.)).mono(11.).text_color(t.faint).child(
-                                        "Saved as you type · Esc done · Ctrl-S save and format",
-                                    ))
-                                    .into_any_element()
-                            }
-                            None => self.block_element(ctx, doc, ix, block, mark, cx),
-                        };
+                    let shown = match editing {
+                        Some(editing) => {
+                            // In the type the block is read in: only its marks show.
+                            let frame = div()
+                                .key_context("Editing")
+                                .on_action(cx.listener(Self::stop_editing))
+                                .on_action(cx.listener(Self::save));
+                            let frame = match block {
+                                Block::Heading(level, _) => render::heading(ctx, *level, frame),
+                                Block::Code { .. }
+                                | Block::Diagram(_)
+                                | Block::Broken { .. }
+                                | Block::Table(_)
+                                | Block::FrontMatter(_) => frame
+                                    .font_family(cx.global::<Config>().code_font.clone())
+                                    .text_size(ctx.size(0.9)),
+                                _ => frame,
+                            };
+                            frame.child(editing.field.clone()).into_any_element()
+                        }
+                        None => self.block_element(ctx, doc, ix, block, mark, cx),
+                    };
                     item = item.child(shown);
                     items.push(wrap(item.into_any_element()));
                 }
@@ -1361,11 +1358,6 @@ impl Reader {
             }
             _ => render::block(ctx, block),
         };
-        let slug = doc
-            .headings
-            .iter()
-            .find(|h| h.block == ix)
-            .map(|h| h.slug.clone());
         let inner = match mark {
             Some(Mark::Added) => render::marked(ctx, t.ok, t.ok_bg, inner),
             Some(Mark::Changed(_)) => render::marked(ctx, t.wait, t.wait_bg, inner),
@@ -1381,11 +1373,7 @@ impl Reader {
             .id(("block", ix))
             .child(arrived)
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                if event.click_count() >= 2 {
-                    this.edit_block(ix, window, cx);
-                } else if let Some(slug) = &slug {
-                    this.copy_anchor(slug.clone(), cx);
-                }
+                this.edit_block(ix, Caret::At(event.position()), window, cx);
             }))
             .into_any_element()
     }

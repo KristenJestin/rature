@@ -92,7 +92,6 @@ pub struct Marks {
 pub struct Heading {
     pub level: u8,
     pub text: String,
-    pub slug: String,
     pub block: usize,
 }
 
@@ -151,11 +150,10 @@ pub fn parse(source: &str, ink: &str, folder: Option<&Path>) -> Document {
         if let Block::Heading(level, inlines) = &block {
             let text = plain_inlines(inlines);
             let slug = slugs.next(&text);
-            doc.anchors.insert(slug.clone(), index);
+            doc.anchors.insert(slug, index);
             doc.headings.push(Heading {
                 level: *level,
                 text,
-                slug,
                 block: index,
             });
         }
@@ -602,8 +600,8 @@ mod tests {
     #[test]
     fn headings_get_github_anchors_and_each_block_its_source() {
         let doc = parse("# One two!\n\ntext\n\n# One two!\n", INK, None);
-        let slugs: Vec<&str> = doc.headings.iter().map(|h| h.slug.as_str()).collect();
-        assert_eq!(slugs, ["one-two", "one-two-1"]);
+        assert_eq!(doc.anchors["one-two"], 0);
+        assert_eq!(doc.anchors["one-two-1"], 2);
         assert_eq!(doc.source_of(1), "text");
         assert_eq!(doc.lines, [1, 3, 5]);
         assert_eq!(doc.block_at_line(4), 1);

@@ -7,6 +7,7 @@ mod format;
 mod formats;
 mod highlight;
 mod instance;
+mod live;
 mod math;
 mod picker;
 mod reader;
@@ -83,6 +84,7 @@ fn main() {
             cx.set_global(config::Config::load());
             cx.set_global(state::State::load());
             reader::bind_keys(cx);
+            live::bind_keys(cx);
             tree::bind_keys(cx);
             picker::bind_keys(cx);
             start::bind_keys(cx);

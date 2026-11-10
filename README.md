@@ -30,8 +30,9 @@ writes. Native, keyboard first, no webview.
 - **What changed**: since the last read (or against git `HEAD`), block by block: new blocks green,
   changed ones yellow with their changed words, removed ones struck in red. The first opening
   takes the snapshot; `m` marks the current state read.
-- **Edit in place**: double-click a block, or `i` for the block at the top, and its Markdown opens
-  where it was. Saved 800 ms after you stop typing, code too; `Ctrl-s` saves and formats (Markdown by
+- **Edit in place**: click a block, or `i` for the block at the top, and you write in it where it
+  is read: its marks (`##`, `**`, backticks, a link's address) show faint, and what they mark keeps
+  its look, the heading its size, the strong text bold. The arrows go on to the next block. Saved 800 ms after you stop typing, code too; `Ctrl-s` saves and formats (Markdown by
   dprint, JSON pretty-printed).
 - **Theme**: Flottille's own colours, or the current Omarchy theme, followed live: a theme
   change cross-fades the open window, formulas and diagrams drawn again in its colours.
@@ -88,7 +89,7 @@ rename, as an agent does, it is read again where you are.
 | `]c` `[c` | next, previous change |
 | `m` | mark read |
 | `D` | compare with the last read or with git `HEAD` |
-| `i`, double-click | edit a block; `Esc` or `Ctrl-Enter` to stop |
+| `i`, click | edit a block; `Esc` or `Ctrl-Enter` to stop |
 | `Ctrl-s` | save and format |
 | `zM` `zR` | fold, unfold every JSON or YAML node |
 | `Ctrl-=` `Ctrl--` `Ctrl-0` | zoom |
@@ -109,6 +110,7 @@ First frame: about 170 ms for a file, 175 to 230 ms for a folder (release build,
 
 ## Limits
 
-- Editing is per block: the block's Markdown opens in place, not a live preview around the cursor.
+- Editing is per block: a heading or a list shows its marks, so its text moves by their width.
+  Enter splits a block only once it is saved.
 - "What changed" covers Markdown files. A paragraph holding math is shown old and new, not word
   by word. Your own edits count as changes until `m`.
