@@ -60,13 +60,16 @@ pub struct Tree {
     scroll: ScrollHandle,
     /// The rows as drawn: a folder's rows rise in as it opens and fold away as it closes.
     list: Listing<(Entry, usize)>,
-    _watch: Option<(notify::RecommendedWatcher, Task<()>)>,
+    /// The folders shown open, each watched alone: the events, and the worker that adds and
+    /// removes the watches off the main thread.
+    watch: Option<(watch::Folders, Task<()>, Task<()>)>,
 }
 
 impl Tree {
     pub fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
-        let watch = match watch::folder(&root) {
-            Ok((watcher, mut events)) => {
+        let watch = match watch::Folders::new() {
+            Ok((folders, mut events, work)) => {
+                let worker = cx.background_executor().spawn(work);
                 let task = cx.spawn(async move |this, cx| {
                     while let Some(mut paths) = events.next().await {
                         while let Ok(more) = events.try_recv() {
@@ -77,7 +80,7 @@ impl Tree {
                         }
                     }
                 });
-                Some((watcher, task))
+                Some((folders, task, worker))
             }
             Err(error) => {
                 eprintln!("rature: {}: not followed: {error}", root.display());
@@ -94,10 +97,19 @@ impl Tree {
             focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
             list: Listing::default(),
-            _watch: watch,
+            watch,
         };
         tree.load(&root, cx);
+        tree.follow_open();
         tree
+    }
+
+    /// Watches the folders shown open, and those alone.
+    fn follow_open(&mut self) {
+        let wanted = shown_folders(&self.root, &self.open, &self.children);
+        if let Some((folders, ..)) = &mut self.watch {
+            folders.set(wanted);
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -170,6 +182,8 @@ impl Tree {
             self.load(&folder, cx);
         }
         self.check(files, cx);
+        // An open folder removed is watched no more.
+        self.follow_open();
         cx.notify();
     }
 
@@ -192,12 +206,15 @@ impl Tree {
             }
             folder = f.parent();
         }
+        let shown = shown_folders(&self.root, &self.open, &self.children);
         for f in folders.into_iter().rev() {
-            if !self.children.contains_key(&f) {
+            // Not watched while it was closed: listed again.
+            if !shown.contains(&f) {
                 self.load(&f, cx);
             }
             self.open.insert(f);
         }
+        self.follow_open();
         self.current = Some(path.to_path_buf());
         self.selected = Some(path.to_path_buf());
         self.show_selected();
@@ -271,11 +288,11 @@ impl Tree {
         self.selected = Some(path.clone());
         if path.is_dir() {
             if !self.open.remove(&path) {
-                if !self.children.contains_key(&path) {
-                    self.load(&path, cx);
-                }
+                // Listed again: it was not watched while it was closed.
+                self.load(&path, cx);
                 self.open.insert(path);
             }
+            self.follow_open();
         } else {
             cx.emit(TreeEvent::Open(path));
         }
@@ -296,8 +313,27 @@ impl Tree {
             self.selected = Some(parent.to_path_buf());
             self.show_selected();
         }
+        self.follow_open();
         cx.notify();
     }
+}
+
+/// The folders a tree shows open: its root, and each open folder whose folders above are open.
+fn shown_folders(
+    root: &Path,
+    open: &HashSet<PathBuf>,
+    children: &HashMap<PathBuf, Vec<Entry>>,
+) -> HashSet<PathBuf> {
+    let mut shown = HashSet::from([root.to_path_buf()]);
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(folder) = stack.pop() {
+        for entry in children.get(&folder).into_iter().flatten() {
+            if entry.dir && open.contains(&entry.path) && shown.insert(entry.path.clone()) {
+                stack.push(entry.path.clone());
+            }
+        }
+    }
+    shown
 }
 
 /// A folder's entries, folders first, as `.gitignore` and hidden files leave them.
@@ -360,7 +396,7 @@ impl Tree {
         let glyph = match (entry.dir, open) {
             (true, true) => icons::FOLDER_OPEN,
             (true, false) => Icon::Folder,
-            (false, _) => formats::icon(&entry.path),
+            (false, _) => formats::file_icon(&entry.path),
         };
         let path = entry.path.clone();
         let element = div()
@@ -513,7 +549,30 @@ impl Render for Tree {
 
 #[cfg(test)]
 mod tests {
-    use super::list;
+    use super::{Entry, list, shown_folders};
+    use std::collections::{HashMap, HashSet};
+    use std::path::PathBuf;
+
+    #[test]
+    fn only_the_folders_shown_open_are_watched() {
+        let p = |s: &str| PathBuf::from(s);
+        let dir = |s: &str| Entry {
+            path: p(s),
+            dir: true,
+        };
+        let children = HashMap::from([
+            (p("/r"), vec![dir("/r/a"), dir("/r/b"), dir("/r/target")]),
+            (p("/r/a"), vec![dir("/r/a/deep")]),
+            (p("/r/b"), vec![dir("/r/b/inner")]),
+        ]);
+        // `b` is closed with `inner` left open under it; `target` is ignored, never listed open.
+        let open = HashSet::from([p("/r"), p("/r/a"), p("/r/a/deep"), p("/r/b/inner")]);
+        let mut shown: Vec<PathBuf> = shown_folders(&p("/r"), &open, &children)
+            .into_iter()
+            .collect();
+        shown.sort();
+        assert_eq!(shown, [p("/r"), p("/r/a"), p("/r/a/deep")]);
+    }
 
     #[test]
     fn a_folder_lists_its_folders_first_without_what_git_ignores() {

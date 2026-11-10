@@ -22,8 +22,9 @@ Linux only: one window per user through a Unix socket, `e` opening nvim through
   alone. Snapshots are kept for the 500 most recent files and 90 days at most, positions for
   1000 files.
 - **Markdown**: tables, task lists, footnotes, highlighted code (copy button), Mermaid diagrams,
-  math (inline and display), YAML front matter, GitHub alerts. Diagrams and code highlighting are
-  drawn in the background.
+  math (inline and display), YAML front matter, GitHub alerts. Reading and parsing the file, its
+  formulas, its link checks and "what changed" are worked out in the background, as diagrams and
+  code highlighting are; only the blocks, rows and lines in sight are built.
 - **Other formats**: JSON and YAML as foldable trees, CSV as a table, images, read only. Code
   opens in an editor, highlighted by extension: click in it or `i`, `Esc` to leave. Binary files
   and text files over 10 MB are refused (`e` opens them in nvim); images are shown whatever
@@ -125,7 +126,7 @@ rename, as an agent does, it is read again where you are.
 `tools/capture.sh <file-or-folder> <out.png>` captures the window in a nested headless Weston,
 never the user's session, with its own `HOME` and XDG folders, and prints the start-up timing.
 `KEYS` types keys into it first, `THEN` runs a command afterwards (to change the file, say),
-`OMARCHY=1` uses a copy of the current Omarchy theme. `examples/specs/` covers every view.
+`OMARCHY=1` uses a copy of the current Omarchy theme. `examples/weather-station/` covers every view; `tools/screenshots.sh` makes the images above from it.
 
 First frame: about 170 ms for a file, 175 to 230 ms for a folder (release build, headless Weston).
 
@@ -135,6 +136,8 @@ First frame: about 170 ms for a file, 175 to 230 ms for a folder (release build,
   Enter splits a block only once it is saved.
 - "What changed" covers Markdown files. A paragraph holding math is shown old and new, not word
   by word. Your own edits count as changes until `m`.
+- CSV cells and JSON or YAML values show on one line each: a cell is cut to its column, a long
+  value scrolls sideways.
 - Linux only (see the top).
 
 ## License

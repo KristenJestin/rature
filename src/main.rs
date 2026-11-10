@@ -12,6 +12,7 @@ mod instance;
 mod kit;
 mod list;
 mod live;
+mod load;
 mod math;
 mod picker;
 mod reader;
@@ -99,6 +100,9 @@ fn main() {
             );
             cx.set_global(config::Config::load());
             cx.set_global(state::State::load());
+            if timing {
+                cx.set_global(reader::Started(started));
+            }
             cx.background_executor()
                 .spawn(async { highlight::warm() })
                 .detach();

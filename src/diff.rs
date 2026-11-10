@@ -161,8 +161,8 @@ mod tests {
     #[test]
     fn a_section_added_is_added_and_the_rest_the_same() {
         let c = changes(
-            "# Tomatoes\n\nBase rate.\n",
-            "# Tomatoes\n\nBase rate.\n\n## Watering\n\nTwice a week.\n",
+            "# Tomatoes\n\nSow in spring.\n",
+            "# Tomatoes\n\nSow in spring.\n\n## Watering\n\nTwice a week.\n",
         );
         let added: Vec<bool> = c.marks.iter().map(|m| matches!(m, Mark::Added)).collect();
         assert_eq!(added, [false, false, true, true]);
@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn a_word_changed_in_a_paragraph_shows_as_words() {
-        let c = changes("The rate is high.\n", "The rate is low.\n");
+        let c = changes("The oven is high.\n", "The oven is low.\n");
         let Mark::Changed(Some(words)) = &c.marks[0] else {
             panic!("not a word change")
         };

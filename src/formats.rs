@@ -2,6 +2,7 @@
 //! image, or code.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::document::{self, Document};
 use crate::{fsio, icons};
@@ -11,7 +12,8 @@ use gpui_design_system::Icon;
 const LARGEST: u64 = 10 * 1024 * 1024;
 
 pub enum Content {
-    Markdown(Document),
+    /// Shared with the work done off the main thread: "what changed" compares it there.
+    Markdown(Arc<Document>),
     Code {
         lang: String,
         text: String,
@@ -53,11 +55,17 @@ pub fn is_markdown(path: &Path) -> bool {
     )
 }
 
-/// The icon a file or a folder is listed with.
+/// The icon a file or a folder is listed with. It looks at the disk: drawing a file known to be
+/// one takes `file_icon`.
 pub fn icon(path: &Path) -> Icon {
     if path.is_dir() {
         return Icon::Folder;
     }
+    file_icon(path)
+}
+
+/// The icon a file is listed with, by its name alone.
+pub fn file_icon(path: &Path) -> Icon {
     let ext = extension(path);
     match ext.as_str() {
         _ if is_markdown(path) => Icon::Text,
@@ -93,7 +101,8 @@ impl Loaded {
 }
 
 /// Reads the file at `path`, as its kind says. Formulas are drawn in `ink`. Only a regular file
-/// is read: a pipe or a device would hold the window waiting.
+/// is read: a pipe or a device would hold the window waiting. It reads, parses and draws: call it
+/// off the main thread.
 pub fn load(path: &Path, ink: &str) -> std::io::Result<Loaded> {
     use std::io::Read as _;
     if let Some(what) = fsio::not_a_file(&std::fs::metadata(path)?) {
@@ -147,7 +156,7 @@ fn not_read(what: &str) -> Content {
 fn read(path: &Path, ext: &str, text: String, ink: &str) -> Content {
     match ext {
         "md" | "markdown" | "mdx" | "mdown" => {
-            Content::Markdown(document::parse(&text, ink, path.parent()))
+            Content::Markdown(Arc::new(document::parse(&text, ink, path.parent())))
         }
         "json" => match serde_json::from_str::<serde_json::Value>(&text) {
             Ok(value) => Content::Data(vec![from_json(None, value)]),
@@ -257,10 +266,10 @@ mod tests {
         assert!(matches!(kind("a.json", "{broken"), Content::Code { .. }));
         assert!(matches!(kind("a.yaml", "a:\n  b: 1\n"), Content::Data(_)));
         assert!(matches!(kind("a.rs", "fn main() {}"), Content::Code { lang, .. } if lang == "rs"));
-        let Content::Table(rows) = kind("a.csv", "plant,seeds\nBasil,120\n") else {
+        let Content::Table(rows) = kind("a.csv", "herb,grams\nbasil,120\n") else {
             panic!("not a table")
         };
-        assert_eq!(rows[1], ["Basil", "120"]);
+        assert_eq!(rows[1], ["basil", "120"]);
     }
 
     fn folder(name: &str) -> PathBuf {

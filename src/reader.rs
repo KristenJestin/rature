@@ -4,7 +4,8 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt as _;
 use gpui_kit::base::input::{
@@ -15,9 +16,9 @@ use gpui_kit::*;
 
 use crate::cache::{Cache, Slot};
 use crate::config::{Config, Side};
-use crate::diff::{self, Changes, Mark};
+use crate::diff::{Changes, Mark};
 use crate::document::{self, Block, Document, Links, Picture};
-use crate::formats::{self, Content};
+use crate::formats::{self, Content, Loaded};
 use crate::fsio::{self, Update};
 use crate::highlight::Highlighter;
 use crate::highlight::{self, Lines};
@@ -25,19 +26,24 @@ use crate::icons;
 use crate::kit::focus_frame;
 use crate::list::{self, ListEdit};
 use crate::live::{Caret, Edge, LiveBlock, LiveEvent};
-use crate::render::{self, Ctx};
+use crate::load::{self, Against, Baseline, Done, Entrances, Generation, Old, fingerprint};
+use crate::render::{self, Ctx, DataRow};
 use crate::start::key_hint;
 use crate::state::{self, State};
 use crate::table::TableEdit;
 use crate::workspace::ToggleTree;
 use crate::{diagram, format, watch};
 use gpui_design_system::field::{field_style, follow_theme};
-use gpui_design_system::motion::MODAL;
+use gpui_design_system::motion::{ENTER, MODAL};
 use gpui_design_system::toast::Toast;
 use gpui_design_system::{Button, Icon, Palette, Type, enter, icon, palette, space, toast};
 
 /// What `j` and `k` move.
 const LINE: f32 = 64.;
+/// The room left above a block scrolled to.
+const ROOM: f32 = 24.;
+/// How far beyond the window the page lays out its blocks, so that a scroll finds them ready.
+const OVERDRAW: f32 = 800.;
 /// How long typing rests before the block being edited is written.
 const AUTOSAVE: Duration = Duration::from_millis(800);
 /// Why a file that is not UTF-8 is not edited.
@@ -143,12 +149,10 @@ pub enum Jump {
     Line(usize),
 }
 
-/// What "what changed" compares the file to.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Baseline {
-    LastRead,
-    Head,
-}
+/// When Rature started, set when `RATURE_TIMING` asks for the timings.
+pub struct Started(pub Instant);
+
+impl Global for Started {}
 
 /// A file of code, shown in an editor: it is changed where it is read.
 struct CodeFile {
@@ -228,19 +232,42 @@ pub struct Reader {
     /// The ink formulas were drawn in: a theme with another draws them again.
     ink: String,
     content: Content,
+    /// A file opened and not read yet: nothing is shown of the one before.
+    loading: bool,
     /// The file is UTF-8 text, which may be edited and written back.
     editable: bool,
     baseline: Baseline,
     /// The file as the baseline has it, and how the file now differs from it.
-    before: Option<(Document, Changes)>,
+    before: Option<(Arc<Document>, Changes)>,
+    /// The version compared to, parsed: the next change of the file does not parse it again.
+    old: Option<Old>,
+    /// The reads of the file asked for, and the comparisons: only the latest result is shown.
+    loads: Generation,
+    compares: Generation,
+    /// `D` asked for git's version: said once its comparison is known.
+    switching: bool,
+    /// Where to go once the file being read is shown.
+    pending_jump: Option<Jump>,
+    /// A block to edit again once the file being read is shown: a paragraph become a list.
+    pending_edit: Option<usize>,
+    /// The window, which the work done off the main thread comes back to.
+    window: AnyWindowHandle,
+    /// The fingerprint of each top-level block, and which of them rise into place.
+    prints: Vec<u64>,
+    entrances: Entrances,
     drawings: Cache<String, Picture>,
     /// The link under the last click, followed if Ctrl was held.
     pub clicked_link: Option<String>,
     highlights: Cache<(String, String), Option<Lines>>,
     folded: HashSet<Vec<usize>>,
+    /// The lines a JSON or YAML tree shows, its folds left out.
+    data_lines: Rc<Vec<DataRow>>,
     /// The folder's tree, if there is one: the side it stands on and whether it is shown.
     tree: Option<(Side, bool)>,
-    scroll: ScrollHandle,
+    /// The page's blocks, of which only those in sight are built.
+    list: ListState,
+    /// The rows of a CSV file or of a JSON or YAML tree, all as high.
+    rows: UniformListScrollHandle,
     focus: FocusHandle,
     watch: Option<(notify::RecommendedWatcher, Task<()>)>,
     back: Vec<(PathBuf, usize, f32)>,
@@ -255,6 +282,8 @@ pub struct Reader {
     /// Blocks read again after an edit: they are back in place, they do not rise into it.
     settled: HashSet<u64>,
     zoom: f32,
+    /// The zoom the blocks were last laid out at.
+    zoomed: f32,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -289,18 +318,31 @@ impl Reader {
                 }
             }),
         ];
+        let now = cx.background_executor().now();
         Self {
             path: None,
             ink: render::ink(cx),
             content: Content::Empty,
+            loading: false,
             editable: false,
             baseline: Baseline::LastRead,
             before: None,
+            old: None,
+            loads: Generation::default(),
+            compares: Generation::default(),
+            switching: false,
+            pending_jump: None,
+            pending_edit: None,
+            window: window.window_handle(),
+            prints: Vec::new(),
+            entrances: Entrances::new(now, ENTER),
             drawings: Cache::new(),
             clicked_link: None,
             highlights: Cache::new(),
             folded: HashSet::new(),
-            scroll: ScrollHandle::new(),
+            data_lines: Rc::default(),
+            list: ListState::new(0, ListAlignment::Top, px(OVERDRAW)),
+            rows: UniformListScrollHandle::new(),
             focus: cx.focus_handle(),
             watch: None,
             back: Vec::new(),
@@ -314,6 +356,7 @@ impl Reader {
             closing: None,
             settled: HashSet::new(),
             zoom: 1.,
+            zoomed: 1.,
             _subscriptions: subscriptions,
         }
     }
@@ -344,7 +387,13 @@ impl Reader {
         self.path = None;
         self.watch = None;
         self.before = None;
-        self.set_content(Content::Empty, cx);
+        self.old = None;
+        self.loading = false;
+        // What was being read is not shown when it comes.
+        self.loads.next();
+        self.compares.next();
+        self.pending_jump = None;
+        self.set_content(Content::Empty, Vec::new(), cx);
     }
 
     /// Shows the file at `path`, follows its changes, and puts the reading position where
@@ -377,7 +426,16 @@ impl Reader {
         self.path = Some(path.clone());
         self.code = None;
         self.folded.clear();
-        self.scroll.set_offset(point(px(0.), px(0.)));
+        // Nothing of the file before is shown while this one is read.
+        self.loading = true;
+        self.editable = false;
+        self.before = None;
+        self.old = None;
+        self.prints.clear();
+        self.set_content(Content::Empty, Vec::new(), cx);
+        self.list.reset(0);
+        self.rows = UniformListScrollHandle::new();
+        self.entrances.opened(cx.background_executor().now());
         self.reload(cx);
         // Kept at once: a window killed rather than closed still lists it.
         cx.global_mut::<State>().opened(&path);
@@ -386,17 +444,48 @@ impl Reader {
         self.jump(jump, window, cx);
     }
 
-    /// Reads the file again. The scroll offset is kept: what is above the reading position
-    /// rarely moves while a document grows below it.
+    /// Reads the file again, off the main thread: read, parsed, its formulas drawn, its links
+    /// checked and compared to its baseline there, put in place here once done, unless the file
+    /// was asked for again meanwhile. The reading position is kept: what is above it rarely moves
+    /// while a document grows below it.
     fn reload(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.path.clone() else {
             return;
         };
-        let ink = render::ink(cx);
-        let (content, editable) = match formats::load(&path, &ink) {
-            Ok(loaded) => (loaded.content, loaded.editable),
+        let (load, compare) = (self.loads.next(), self.compares.next());
+        let (ink, baseline, cached) = (render::ink(cx), self.baseline, self.old.clone());
+        let work = cx
+            .background_executor()
+            .spawn(async move { load::load(path, ink, baseline, cached) });
+        let window = self.window;
+        cx.spawn(async move |this, cx| {
+            let done = work.await;
+            cx.update_window(window, |_, window, cx| {
+                this.update(cx, |this, cx| this.loaded(load, compare, done, window, cx))
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// A file read off the main thread: shown, if it is still the one asked for.
+    fn loaded(
+        &mut self,
+        load: u64,
+        compare: u64,
+        done: Done,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.loads.is_current(load) || self.path.as_deref() != Some(done.path.as_path()) {
+            return;
+        }
+        let started = Instant::now();
+        let (content, editable) = match done.loaded {
+            Ok(Loaded { content, editable }) => (content, editable),
             // Between the removal and the rename of an atomic write: the next event brings it.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            // A file just opened is said not to be there.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !self.loading => return,
             Err(error) => (
                 Content::Message(format!("It cannot be read: {error}.")),
                 false,
@@ -404,8 +493,34 @@ impl Reader {
         };
         self.keep_typed_code(&content, cx);
         self.editable = editable;
-        self.set_content(content, cx);
-        self.compare(cx);
+        let opened = std::mem::take(&mut self.loading);
+        if !opened {
+            let now = cx.background_executor().now();
+            self.entrances.changed(&self.prints, &done.prints, now);
+        }
+        self.set_content(content, done.prints, cx);
+        if self.compares.is_current(compare) {
+            self.compared(done.against, cx);
+        } else {
+            // A comparison asked for meanwhile compared the file before this one.
+            self.before = None;
+            self.compare(cx);
+        }
+        if let Some(jump) = self.pending_jump.take() {
+            self.jump(jump, window, cx);
+        }
+        if let Some(block) = self.pending_edit.take() {
+            self.edit_block(block, Caret::Start, window, cx);
+        }
+        if cx.has_global::<Started>() {
+            eprintln!(
+                "rature: {} read in {:?} off the main thread, put in place in {:?} on it, shown at {:?}",
+                done.path.display(),
+                done.took,
+                started.elapsed(),
+                cx.global::<Started>().0.elapsed(),
+            );
+        }
     }
 
     /// The file changed on disk while code typed into it was not yet written: the editor takes
@@ -443,21 +558,16 @@ impl Reader {
         self.code = None;
         self.drawings.clear();
         self.highlights.clear();
-        match self.path {
-            Some(_) => self.reload(cx),
-            None => {
-                if let Content::Markdown(doc) = &self.content {
-                    let source = doc.source.clone();
-                    let ink = render::ink(cx);
-                    self.set_content(Content::Markdown(document::parse(&source, &ink, None)), cx);
-                }
-            }
-        }
+        // Only a file read is shown: read again, its formulas in the new ink.
+        self.reload(cx);
     }
 
-    fn set_content(&mut self, content: Content, cx: &mut Context<Self>) {
+    fn set_content(&mut self, content: Content, prints: Vec<u64>, cx: &mut Context<Self>) {
         let dark = render::is_dark(cx);
-        let colors = diagram::Colors::of(&gpui_design_system::theme::target_palette(cx));
+        let colors = diagram::Colors {
+            font: cx.global::<Config>().font.clone(),
+            ..diagram::Colors::of(&gpui_design_system::theme::target_palette(cx))
+        };
         // Diagrams: each new one is drawn in the background, the one that stood at its place
         // shown meanwhile so the page does not jump.
         let (mut sources, mut before) = (Vec::new(), Vec::new());
@@ -527,34 +637,103 @@ impl Reader {
             })
             .detach();
         }
+        self.data_lines = match &content {
+            Content::Data(nodes) => Rc::new(render::data_lines(nodes, &self.folded)),
+            _ => Rc::default(),
+        };
         self.content = content;
+        self.prints = prints;
+        self.relist(cx);
         cx.notify();
     }
 
-    /// What changed since the baseline. The first time a file is read, it is read: nothing
-    /// changed yet.
+    /// The page's blocks changed in number or in height: laid out again, the reading position
+    /// kept, the block being edited kept built.
+    fn relist(&mut self, cx: &App) {
+        let top = self.list.logical_scroll_top();
+        let count = self.items_count();
+        self.list.reset(count);
+        self.list.scroll_to(top);
+        if let Some(editing) = &self.editing {
+            let (block, focus) = (editing.block, editing.field.focus_handle(cx));
+            self.keep_built(block, Some(focus));
+        }
+    }
+
+    /// How many items the page's list has: a Markdown file's blocks and, after them, the blocks
+    /// removed from its end; one for anything else.
+    fn items_count(&self) -> usize {
+        match (&self.content, self.loading) {
+            (_, true) => 0,
+            (Content::Markdown(doc), _) => {
+                let end = doc.blocks.len();
+                let trailing = self
+                    .changes()
+                    .is_some_and(|c| c.removed.iter().any(|(before, _)| *before == end));
+                end + usize::from(trailing)
+            }
+            _ => 1,
+        }
+    }
+
+    /// What changed since the baseline, worked out off the main thread.
     fn compare(&mut self, cx: &mut Context<Self>) {
-        self.before = None;
-        let (Some(path), Content::Markdown(doc)) = (&self.path, &self.content) else {
+        let generation = self.compares.next();
+        let (Some(path), Content::Markdown(doc)) = (self.path.clone(), &self.content) else {
             return;
         };
-        let source = match self.baseline {
-            Baseline::LastRead => match state::last_read(path) {
-                Some(source) => source,
-                None => {
-                    state::mark_read(path, &doc.source);
-                    return;
+        let doc = doc.clone();
+        let (ink, baseline, cached) = (render::ink(cx), self.baseline, self.old.clone());
+        let work = cx.background_executor().spawn({
+            let doc = doc.clone();
+            async move { load::compare(&path, &doc, &ink, baseline, cached) }
+        });
+        cx.spawn(async move |this, cx| {
+            let against = work.await;
+            this.update(cx, |this, cx| {
+                let same =
+                    matches!(&this.content, Content::Markdown(now) if Arc::ptr_eq(now, &doc));
+                if this.compares.is_current(generation) && same {
+                    this.compared(against, cx);
                 }
-            },
-            Baseline::Head => match git_head(path) {
-                Some(source) => source,
-                None => return,
-            },
-        };
-        let ink = render::ink(cx);
-        let old = document::parse(&source, &ink, None);
-        let changes = diff::compare(&old, doc);
-        self.before = Some((old, changes));
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// How the file shown differs from its baseline, now known. The first time a file is read,
+    /// it is read: nothing changed yet.
+    fn compared(&mut self, against: Against, cx: &mut Context<Self>) {
+        self.before = None;
+        let switching = std::mem::take(&mut self.switching);
+        match against {
+            Against::Nothing => {}
+            Against::FirstRead => {
+                if let (Some(path), Content::Markdown(doc)) = (&self.path, &self.content) {
+                    state::mark_read(path, &doc.source);
+                }
+            }
+            Against::NoHead => {
+                if self.baseline == Baseline::Head {
+                    self.baseline = Baseline::LastRead;
+                    if switching {
+                        self.say("Not in a git repository, or not committed", cx);
+                    }
+                    // Compared to what was read instead.
+                    self.compare(cx);
+                }
+            }
+            Against::Old(old, changes) => {
+                if switching {
+                    self.say("Changes since the last commit", cx);
+                }
+                self.before = Some((old.doc.clone(), changes));
+                self.old = Some(old);
+            }
+        }
+        self.relist(cx);
+        cx.notify();
     }
 
     fn changes(&self) -> Option<&Changes> {
@@ -569,9 +748,11 @@ impl Reader {
         };
         self.write_edit(cx);
         self.write_code(cx);
-        let (block, within) = self.scroll.logical_scroll_top();
-        cx.global_mut::<State>()
-            .set_position(&path, (block, -f32::from(within)));
+        // Not read yet: where it was read up to stays as it was.
+        if !self.loading {
+            let position = self.position();
+            cx.global_mut::<State>().set_position(&path, position);
+        }
         if let (Content::Markdown(doc), Some(_)) = (&self.content, &self.before) {
             state::mark_read(&path, &doc.source);
             cx.emit(ReaderEvent::MarkedRead(path));
@@ -579,6 +760,11 @@ impl Reader {
     }
 
     pub fn jump(&mut self, jump: Jump, window: &mut Window, cx: &mut Context<Self>) {
+        // Once the file is read: its blocks, and its anchors, are not known before.
+        if self.loading {
+            self.pending_jump = Some(jump);
+            return;
+        }
         let target = match jump {
             Jump::Top => Some((0, 0.)),
             Jump::Block(block, within) => Some((block, within)),
@@ -599,40 +785,75 @@ impl Reader {
             }
             Jump::Line(line) => Some((self.document().map_or(0, |d| d.block_at_line(line)), 0.)),
         };
-        if let Some((block, within)) = target {
-            // The blocks are laid out in the next frame: their places are known after it.
-            cx.on_next_frame(window, move |this, window, cx| {
-                this.scroll_to_block(block, within, 3, window, cx)
+        let Some((block, within)) = target else {
+            return;
+        };
+        if self.in_rows() {
+            // One item, scrolled by its offset once it is laid out.
+            let rows = self.rows.0.borrow().base_handle.clone();
+            cx.on_next_frame(window, move |_, _, cx| {
+                let y = px(-within).min(px(0.)).max(-rows.max_offset().y);
+                rows.set_offset(point(rows.offset().x, y));
+                cx.notify();
             });
+            return;
         }
+        // The first block shows with the page's own margin above it; another, with a little
+        // room, which needs the block above it laid out: done in the next frames.
+        let block = block.min(self.list.item_count().saturating_sub(1));
+        if block == 0 {
+            self.list.scroll_to(ListOffset {
+                item_ix: 0,
+                offset_in_item: px(within.max(0.)),
+            });
+        } else {
+            self.list.scroll_to(ListOffset {
+                item_ix: block,
+                offset_in_item: px(0.),
+            });
+            let shift = px(within - ROOM);
+            self.after_layout(block, shift, 3, window, cx);
+        }
+        cx.notify();
     }
 
-    fn scroll_to_block(
+    /// Scrolls by `shift` from the block `block`, once it and the one above it are laid out.
+    fn after_layout(
         &mut self,
         block: usize,
-        within: f32,
+        shift: Pixels,
         tries: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self.scroll.bounds_for_item(block) {
-            Some(bounds) => {
-                let offset = self.scroll.offset();
-                let top = bounds.top() - self.scroll.bounds().top() - offset.y;
-                // The first block shows with the page's own margin above it; another, with a
-                // little room.
-                let room = if block == 0 { top } else { px(24.) };
-                let y = (-(top + px(within) - room))
-                    .min(px(0.))
-                    .max(-self.scroll.max_offset().y);
-                self.scroll.set_offset(point(offset.x, y));
-                cx.notify();
+        cx.on_next_frame(window, move |this, window, cx| {
+            let top = this.list.logical_scroll_top();
+            if top.item_ix != block || top.offset_in_item != px(0.) {
+                // Scrolled meanwhile, or put back by a reload: left where it is.
+                return;
             }
-            None if tries > 0 => cx.on_next_frame(window, move |this, window, cx| {
-                this.scroll_to_block(block, within, tries - 1, window, cx)
-            }),
-            None => {}
+            if this.list.bounds_for_item(block).is_some() {
+                this.list.scroll_by(shift);
+                cx.notify();
+            } else if tries > 0 {
+                this.after_layout(block, shift, tries - 1, window, cx);
+            }
+        });
+    }
+
+    /// Whether the page shows rows all as high (a CSV file, a JSON or YAML tree), not blocks.
+    fn in_rows(&self) -> bool {
+        matches!(self.content, Content::Data(_) | Content::Table(_)) && !self.loading
+    }
+
+    /// Where the page is read up to: the top-level block at its top, and how far into it.
+    fn position(&self) -> (usize, f32) {
+        if self.in_rows() {
+            let offset = self.rows.0.borrow().base_handle.offset();
+            return (0, -f32::from(offset.y));
         }
+        let top = self.list.logical_scroll_top();
+        (top.item_ix, f32::from(top.offset_in_item))
     }
 
     /// Follows a link: a page on the web, an anchor of this file, or another file (and its
@@ -683,8 +904,8 @@ impl Reader {
     }
 
     fn here(&self) -> Option<(PathBuf, usize, f32)> {
-        let (block, within) = self.scroll.logical_scroll_top();
-        self.path.clone().map(|p| (p, block, -f32::from(within)))
+        let (block, within) = self.position();
+        self.path.clone().map(|p| (p, block, within))
     }
 
     fn remember(&mut self, _: &mut Context<Self>) {
@@ -730,6 +951,14 @@ impl Reader {
         if !self.folded.remove(&path) {
             self.folded.insert(path);
         }
+        self.refold(cx);
+    }
+
+    /// The folds changed: the lines the tree shows are found again.
+    fn refold(&mut self, cx: &mut Context<Self>) {
+        if let Content::Data(nodes) = &self.content {
+            self.data_lines = Rc::new(render::data_lines(nodes, &self.folded));
+        }
         cx.notify();
     }
 
@@ -751,26 +980,32 @@ impl Reader {
             let mut folded = HashSet::new();
             walk(nodes, Vec::new(), &mut folded);
             self.folded = folded;
-            cx.notify();
+            self.refold(cx);
         }
     }
 
     fn unfold_all(&mut self, _: &UnfoldAll, _: &mut Window, cx: &mut Context<Self>) {
         self.folded.clear();
-        cx.notify();
+        self.refold(cx);
     }
 
     fn scroll_by(&mut self, delta: Pixels, cx: &mut Context<Self>) {
-        let offset = self.scroll.offset();
-        let y = (offset.y - delta)
-            .min(px(0.))
-            .max(-self.scroll.max_offset().y);
-        self.scroll.set_offset(point(offset.x, y));
+        if self.in_rows() {
+            let rows = self.rows.0.borrow().base_handle.clone();
+            let offset = rows.offset();
+            let y = (offset.y - delta).min(px(0.)).max(-rows.max_offset().y);
+            rows.set_offset(point(offset.x, y));
+        } else {
+            self.list.scroll_by(delta);
+        }
         cx.notify();
     }
 
     fn page(&self) -> Pixels {
-        self.scroll.bounds().size.height
+        if self.in_rows() {
+            return self.rows.0.borrow().base_handle.bounds().size.height;
+        }
+        self.list.viewport_bounds().size.height
     }
 
     fn line_down(&mut self, _: &LineDown, _: &mut Window, cx: &mut Context<Self>) {
@@ -792,10 +1027,25 @@ impl Reader {
         self.scroll_by(-(self.page() - px(LINE)), cx);
     }
     fn top(&mut self, _: &Top, _: &mut Window, cx: &mut Context<Self>) {
-        self.scroll_by(self.scroll.offset().y, cx);
+        if self.in_rows() {
+            let rows = self.rows.0.borrow().base_handle.clone();
+            rows.set_offset(point(rows.offset().x, px(0.)));
+        } else {
+            self.list.scroll_to(ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.),
+            });
+        }
+        cx.notify();
     }
     fn bottom(&mut self, _: &Bottom, _: &mut Window, cx: &mut Context<Self>) {
-        self.scroll_by(self.scroll.max_offset().y + self.scroll.offset().y, cx);
+        if self.in_rows() {
+            let rows = self.rows.0.borrow().base_handle.clone();
+            rows.set_offset(point(rows.offset().x, -rows.max_offset().y));
+        } else {
+            self.list.scroll_to_end();
+        }
+        cx.notify();
     }
     fn quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
         self.finish_editing(window, cx);
@@ -807,7 +1057,7 @@ impl Reader {
     /// Opens the file in nvim, in the desktop's terminal.
     fn open_in_nvim(&mut self, _: &OpenInNvim, _: &mut Window, cx: &mut Context<Self>) {
         let Some(path) = &self.path else { return };
-        let (block, _) = self.scroll.logical_scroll_top();
+        let (block, _) = self.position();
         let line = self
             .document()
             .and_then(|d| d.lines.get(block).copied())
@@ -870,11 +1120,11 @@ impl Reader {
         if stops.is_empty() {
             return self.say(none.to_string(), cx);
         }
-        let (top, within) = self.scroll.logical_scroll_top();
+        let (top, within) = self.position();
         let next = if forward {
             stops
                 .iter()
-                .find(|&&s| s > top || (s == top && within < px(-4.)))
+                .find(|&&s| s > top || (s == top && within > 4.))
                 .or(stops.first())
         } else {
             stops.iter().rev().find(|&&s| s < top).or(stops.last())
@@ -900,29 +1150,34 @@ impl Reader {
         };
         state::mark_read(path, &doc.source);
         let path = path.clone();
+        // Nothing changed since: the file now is what it is compared to, parsed already.
+        let (source, doc) = (doc.source.clone(), doc.clone());
         self.baseline = Baseline::LastRead;
-        self.compare(cx);
+        self.switching = false;
+        self.compares.next();
+        self.old = Some(Old {
+            source,
+            ink: self.ink.clone(),
+            doc,
+        });
+        self.before = None;
+        self.relist(cx);
         self.say("Marked read", cx);
         cx.emit(ReaderEvent::MarkedRead(path));
     }
 
+    /// Compares to git's version, or back to what was read. Git is asked off the main thread:
+    /// the answer is said once it is known.
     fn switch_baseline(&mut self, _: &SwitchBaseline, _: &mut Window, cx: &mut Context<Self>) {
         self.baseline = match self.baseline {
             Baseline::LastRead => Baseline::Head,
             Baseline::Head => Baseline::LastRead,
         };
-        if self.baseline == Baseline::Head && self.path.as_deref().and_then(git_head).is_none() {
-            self.baseline = Baseline::LastRead;
-            return self.say("Not in a git repository, or not committed", cx);
-        }
+        self.switching = self.baseline == Baseline::Head;
         self.compare(cx);
-        self.say(
-            match self.baseline {
-                Baseline::LastRead => "Changes since last read",
-                Baseline::Head => "Changes since the last commit",
-            },
-            cx,
-        );
+        if self.baseline == Baseline::LastRead {
+            self.say("Changes since last read", cx);
+        }
     }
 
     fn zoom_by(&mut self, factor: Option<f32>, cx: &mut Context<Self>) {
@@ -945,9 +1200,9 @@ impl Reader {
             let focus = code.field.read(cx).focus_handle(cx);
             return window.focus(&focus, cx);
         }
-        let (top, within) = self.scroll.logical_scroll_top();
+        let (top, within) = self.position();
         // A block more than half gone above is not the one being read.
-        let block = if within < px(-40.) { top + 1 } else { top };
+        let block = if within > 40. { top + 1 } else { top };
         self.edit_block(block, Caret::Start, window, cx);
     }
 
@@ -970,10 +1225,10 @@ impl Reader {
             return;
         }
         let original = doc.source_of(block).to_string();
-        let links = Rc::new(Links {
-            folder: path.parent().unwrap_or(Path::new(".")).to_path_buf(),
-            anchors: doc.anchors.keys().cloned().collect(),
-        });
+        let links = Rc::new(Links::new(
+            path.parent().unwrap_or(Path::new(".")).to_path_buf(),
+            doc.anchors.keys().cloned().collect(),
+        ));
         let on = move |this: &mut Self,
                        event: &LiveEvent,
                        window: &mut Window,
@@ -1015,7 +1270,19 @@ impl Reader {
             autosave: None,
             _events: events,
         });
+        self.keep_built(block, Some(focus));
         cx.notify();
+    }
+
+    /// Keeps the block `block` built while it is scrolled out of sight (`focus`, the field it
+    /// is edited in, holds the keys), or lets it go again (`None`). The reading position stays.
+    fn keep_built(&mut self, block: usize, focus: Option<FocusHandle>) {
+        if block >= self.list.item_count() {
+            return;
+        }
+        let top = self.list.logical_scroll_top();
+        self.list.splice_focusable(block..block + 1, [focus]);
+        self.list.scroll_to(top);
     }
 
     /// The block being edited changed. A paragraph given a bullet is a list: written, it is
@@ -1033,9 +1300,10 @@ impl Reader {
             .document()
             .is_some_and(|doc| matches!(doc.blocks.get(block), Some(Block::Paragraph(_))));
         if paragraph && list::is_item(text.read(cx).value()) {
-            self.write_edit(cx);
+            self.finish_editing(window, cx);
+            // Edited again once the file is read again, as the list it is now.
+            self.pending_edit = Some(block);
             self.reload(cx);
-            self.edit_block(block, Caret::Start, window, cx);
         }
     }
 
@@ -1076,6 +1344,8 @@ impl Reader {
                     state::mark_read(&path, &read.replacen(original.as_str(), &text, 1));
                     cx.emit(ReaderEvent::MarkedRead(path));
                 }
+                // Read again as written, it is back in place: it does not rise into it.
+                self.settled.insert(fingerprint(&text));
                 editing.original = text;
                 // Shown at once as written, rather than when the watch tells of it: the page
                 // left now is marked read with the change in it.
@@ -1109,6 +1379,7 @@ impl Reader {
         };
         let (block, field) = (editing.block, editing.field);
         field.close(cx);
+        self.keep_built(block, None);
         let done = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(MODAL).await;
             this.update(cx, |this, cx| {
@@ -1268,8 +1539,7 @@ impl Reader {
                 }
                 if let Some(editing) = &mut self.editing {
                     // The block moved under the formatting: its text is the formatted one now.
-                    let doc = document::parse(&after, "#000000", None);
-                    if let Some(span) = doc.spans.get(editing.block) {
+                    if let Some(span) = document::block_spans(&after).get(editing.block) {
                         editing.original = after[span.clone()].to_string();
                     }
                 }
@@ -1311,7 +1581,8 @@ impl Reader {
                 .gap(space::SM)
                 .min_w_0()
                 .overflow_hidden()
-                .child(icon(formats::icon(path)).text_color(p.mute))
+                // The file read is a file: its icon by its name, no disk looked at per frame.
+                .child(icon(formats::file_icon(path)).text_color(p.mute))
                 .children(folder.map(|folder| {
                     div()
                         .flex()
@@ -1459,7 +1730,47 @@ impl Reader {
             .children(right)
     }
 
-    fn items(&self, ctx: &Ctx, cx: &Context<Self>) -> Vec<AnyElement> {
+    /// The item `ix` of the page's list, built only while it is in sight: a block of a Markdown
+    /// file with the blocks removed before it, the blocks removed from its end, or what else the
+    /// file shows.
+    fn item(&mut self, ix: usize, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let t = palette(cx);
+        let config = cx.global::<Config>().clone();
+        let query = (!self.query.is_empty()).then(|| self.query.clone());
+        let now = cx.background_executor().now();
+        let rises = match (&self.content, self.prints.get(ix)) {
+            (Content::Markdown(_), Some(&print)) => {
+                !self.settled.contains(&print) && self.entrances.rises(print, now)
+            }
+            _ => false,
+        };
+        // Not the list's own count: it is being laid out, its state borrowed.
+        let count = self.items_count();
+        let element = {
+            let ctx = Ctx::new(
+                &t,
+                &config,
+                self.zoom,
+                &self.drawings,
+                &self.highlights,
+                query.as_deref(),
+                cx,
+            );
+            self.item_element(&ctx, ix, rises, cx)
+        };
+        // The page's own margins: above its first item, below its last.
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .when(ix == 0, |d| d.pt(space::XXXL))
+            .when(ix + 1 == count, |d| d.pb(px(160.)))
+            .child(element)
+            .into_any_element()
+    }
+
+    fn item_element(&self, ctx: &Ctx, ix: usize, rises: bool, cx: &Context<Self>) -> AnyElement {
         let t = palette(cx);
         let column = cx.global::<Config>().column;
         let wrap = |element: AnyElement| -> AnyElement {
@@ -1474,16 +1785,41 @@ impl Reader {
         match &self.content {
             Content::Markdown(doc) => {
                 let changes = self.before.as_ref();
-                let mut items = Vec::with_capacity(doc.blocks.len() + 1);
-                for (ix, block) in doc.blocks.iter().enumerate() {
+                let Some(block) = doc.blocks.get(ix) else {
+                    // After the last block: those removed from the end.
+                    let trailing: Vec<AnyElement> = changes
+                        .into_iter()
+                        .flat_map(|(old, changes)| {
+                            changes
+                                .removed
+                                .iter()
+                                .filter(move |(before, _)| *before == ix)
+                                .filter_map(|(_, gone)| old.blocks.get(*gone))
+                        })
+                        .map(|gone| render::ghost(ctx, gone))
+                        .collect();
+                    return wrap(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .children(trailing)
+                            .into_any_element(),
+                    );
+                };
+                {
                     let mut item = div().flex().flex_col().gap_2();
                     if let Some((old, changes)) = changes {
                         for (_, gone) in changes.removed.iter().filter(|(before, _)| *before == ix)
                         {
-                            item = item.child(render::ghost(ctx, &old.blocks[*gone]));
+                            if let Some(gone) = old.blocks.get(*gone) {
+                                item = item.child(render::ghost(ctx, gone));
+                            }
                         }
                     }
-                    let mark = changes.map(|(_, c)| &c.marks[ix]);
+                    // A comparison with another version of the file has as many marks as it
+                    // has blocks; one not yet replaced has none for this block.
+                    let mark = changes.and_then(|(_, c)| c.marks.get(ix));
                     let live = self
                         .editing
                         .as_ref()
@@ -1514,64 +1850,137 @@ impl Reader {
                             };
                             frame.child(field.element()).into_any_element()
                         }
-                        None => self.block_element(ctx, doc, ix, block, mark, cx),
+                        None => self.block_element(ctx, doc, ix, block, mark, rises, cx),
                     };
                     item = item.child(shown);
-                    items.push(wrap(item.into_any_element()));
+                    wrap(item.into_any_element())
                 }
-                if let Some((old, changes)) = changes {
-                    let end = doc.blocks.len();
-                    let trailing: Vec<AnyElement> = changes
-                        .removed
-                        .iter()
-                        .filter(|(before, _)| *before == end)
-                        .map(|(_, gone)| render::ghost(ctx, &old.blocks[*gone]))
-                        .collect();
-                    if !trailing.is_empty() {
-                        items.push(wrap(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .children(trailing)
-                                .into_any_element(),
-                        ));
-                    }
-                }
-                items
             }
-            Content::Code { lang, text } => {
-                vec![wrap(render::code(ctx, lang, text).into_any_element())]
-            }
-            Content::Data(nodes) => vec![wrap(render::data(ctx, nodes, &self.folded))],
-            Content::Table(rows) => vec![
-                div()
-                    .w_full()
-                    .px_8()
-                    .pb_4()
-                    .child(render::table(ctx, rows))
-                    .into_any_element(),
-            ],
-            Content::Image(path) => vec![wrap(render::image_file(path))],
-            Content::Empty => vec![notice(
+            Content::Code { lang, text } => wrap(render::code(ctx, lang, text).into_any_element()),
+            // Shown as rows, by `rows_view`.
+            Content::Data(_) | Content::Table(_) => div().into_any_element(),
+            Content::Image(path) => wrap(render::image_file(path)),
+            Content::Empty => notice(
                 "no-file",
                 Icon::Text,
                 "No file open",
                 "Pick one in the tree.",
                 &[("f", "find a file"), ("s", "search the folder")],
                 &t,
-            )],
-            Content::Message(message) => vec![notice(
+            ),
+            Content::Message(message) => notice(
                 "not-shown",
                 Icon::Warning,
                 "This file is not shown",
                 message.clone(),
                 &[],
                 &t,
-            )],
+            ),
         }
     }
 
+    /// A CSV file or a JSON or YAML tree: rows all as high, only those in sight built, scrolled
+    /// sideways when wider than the window.
+    fn rows_view(&self, config: &Config, cx: &mut Context<Self>) -> AnyElement {
+        let page = |list: UniformList| {
+            list.size_full()
+                .pt(space::XXXL)
+                .pb(px(160.))
+                .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+                .track_scroll(&self.rows)
+        };
+        match &self.content {
+            Content::Table(rows) => {
+                let count = rows.len();
+                let view = cx.processor(|this: &mut Self, range: std::ops::Range<usize>, _, cx| {
+                    this.table_rows(range, cx)
+                });
+                page(uniform_list("csv", count, view))
+                    .px_8()
+                    .into_any_element()
+            }
+            Content::Data(_) => {
+                let count = self.data_lines.len();
+                let view = cx.processor(|this: &mut Self, range: std::ops::Range<usize>, _, cx| {
+                    this.data_rows(range, cx)
+                });
+                // In the reading column, as the text is.
+                div()
+                    .size_full()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .h_full()
+                            .w_full()
+                            .max_w(px(config.column))
+                            .font_family(config.code_font.clone())
+                            .text_size(px(config.font_size * 0.875 * self.zoom))
+                            .line_height(rems(1.5))
+                            .child(page(uniform_list("data", count, view)).px_8()),
+                    )
+                    .into_any_element()
+            }
+            _ => div().into_any_element(),
+        }
+    }
+
+    fn table_rows(
+        &mut self,
+        range: std::ops::Range<usize>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let Content::Table(rows) = &self.content else {
+            return Vec::new();
+        };
+        let (t, config) = (palette(cx), cx.global::<Config>().clone());
+        let query = (!self.query.is_empty()).then(|| self.query.clone());
+        let ctx = Ctx::new(
+            &t,
+            &config,
+            self.zoom,
+            &self.drawings,
+            &self.highlights,
+            query.as_deref(),
+            cx,
+        );
+        let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+        range
+            .filter_map(|ix| {
+                let row = rows.get(ix)?;
+                Some(render::table_row(&ctx, row, ix, rows.len(), columns))
+            })
+            .collect()
+    }
+
+    fn data_rows(
+        &mut self,
+        range: std::ops::Range<usize>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let Content::Data(nodes) = &self.content else {
+            return Vec::new();
+        };
+        let (t, config) = (palette(cx), cx.global::<Config>().clone());
+        let query = (!self.query.is_empty()).then(|| self.query.clone());
+        let ctx = Ctx::new(
+            &t,
+            &config,
+            self.zoom,
+            &self.drawings,
+            &self.highlights,
+            query.as_deref(),
+            cx,
+        );
+        range
+            .filter_map(|ix| {
+                let row = self.data_lines.get(ix)?;
+                Some(render::data_row(&ctx, nodes, row, &self.folded))
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn block_element(
         &self,
         ctx: &Ctx,
@@ -1579,6 +1988,7 @@ impl Reader {
         ix: usize,
         block: &Block,
         mark: Option<&Mark>,
+        rises: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
         let t = palette(cx);
@@ -1597,11 +2007,15 @@ impl Reader {
             _ => inner,
         };
         // A block that arrives while the page is read rises into place.
-        let print = fingerprint(doc.source_of(ix));
-        let arrived = if self.settled.contains(&print) {
-            inner
-        } else {
+        let arrived = if rises {
+            let print = self
+                .prints
+                .get(ix)
+                .copied()
+                .unwrap_or_else(|| fingerprint(doc.source_of(ix)));
             enter(ElementId::Name(format!("block-{print}").into()), 0, inner).into_any_element()
+        } else {
+            inner
         };
         div()
             .id(("block", ix))
@@ -1616,32 +2030,6 @@ impl Reader {
             }))
             .into_any_element()
     }
-}
-
-/// A short name for a block's source: the same text keeps its entrance played.
-fn fingerprint(source: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    source.hash(&mut hasher);
-    hasher.finish()
-}
-
-/// The file as the last commit has it.
-fn git_head(path: &Path) -> Option<String> {
-    let folder = path.parent()?;
-    let name = path.file_name()?.to_string_lossy();
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(folder)
-        .arg("show")
-        .arg(format!("HEAD:./{name}"))
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// What the page says when it has no file to show: a sign, a title, a sentence and the keys
@@ -1709,30 +2097,26 @@ impl Render for Reader {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = palette(cx);
         let config = cx.global::<Config>().clone();
-        let folder = self
-            .path
-            .as_deref()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf);
-        let query = (!self.query.is_empty()).then(|| self.query.clone());
         self.sync_code(window, cx);
         let code = self.code.as_ref().map(|code| code.field.clone());
         let editing = self.editing.is_some()
             || code
                 .as_ref()
                 .is_some_and(|field| field.read(cx).focus_handle(cx).contains_focused(window, cx));
-        let items = {
-            let ctx = Ctx::new(
-                &t,
-                &config,
-                self.zoom,
-                folder.as_deref(),
-                &self.drawings,
-                &self.highlights,
-                query.as_deref(),
-                cx,
-            );
-            self.items(&ctx, cx)
+        // A zoom changes every block's height.
+        if self.zoomed != self.zoom {
+            self.zoomed = self.zoom;
+            self.list.remeasure();
+        }
+        let page: AnyElement = if self.in_rows() {
+            self.rows_view(&config, cx)
+        } else {
+            list(
+                self.list.clone(),
+                cx.processor(|this, ix, window, cx| this.item(ix, window, cx)),
+            )
+            .size_full()
+            .into_any_element()
         };
         let bar = self.bar(window, cx);
         div()
@@ -1799,15 +2183,8 @@ impl Render for Reader {
                                 .line_height(rems(1.5))
                                 .child(Editor::new(&field)),
                         ),
-                        None => d
-                            .track_scroll(&self.scroll)
-                            .overflow_y_scroll()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .pt(space::XXXL)
-                            .pb(px(160.))
-                            .children(items),
+                        // The page scrolls its list, or its rows, itself.
+                        None => d.child(page),
                     }),
             )
     }

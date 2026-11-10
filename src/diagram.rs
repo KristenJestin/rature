@@ -24,6 +24,8 @@ pub const SCALE: f32 = 2.0;
 #[derive(Clone)]
 pub struct Colors {
     pub dark: bool,
+    /// The font family its labels ask for: the text's own (`config.font`).
+    pub font: String,
     pub background: String,
     pub fill: String,
     pub border: String,
@@ -35,6 +37,7 @@ impl Colors {
     pub fn of(p: &Palette) -> Self {
         Self {
             dark: p.bg.l < 0.5,
+            font: gpui_design_system::typography::UI.into(),
             background: hex(p.bg),
             fill: hex(p.card),
             border: hex(p.line2),
@@ -65,7 +68,7 @@ pub fn render(source: &str, colors: &Colors) -> Result<Picture, String> {
 fn draw(source: &str, colors: &Colors) -> Result<Picture, String> {
     let site = SourcePresentationConfig::from_value(serde_json::json!({
         "theme": "base",
-        "fontFamily": "Geist, sans-serif",
+        "fontFamily": format!("{}, sans-serif", colors.font),
         "themeVariables": {
             "darkMode": colors.dark,
             "background": colors.background,
@@ -200,6 +203,7 @@ mod tests {
     fn a_huge_diagram_is_refused_before_drawing() {
         let colors = Colors {
             dark: false,
+            font: "Geist".into(),
             background: "#ffffff".into(),
             fill: "#eeeeee".into(),
             border: "#888888".into(),

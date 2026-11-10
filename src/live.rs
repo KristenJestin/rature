@@ -145,8 +145,9 @@ pub struct LiveBlock {
     /// The marks left out of the layout: those away from the caret, so the block reads as it
     /// does when it is not edited.
     hidden: Vec<Range<usize>>,
-    /// The colours of its fenced code, for the text and theme they were found for.
-    colours: Option<(String, bool, Colours)>,
+    /// How its text is drawn (marks, fenced code's colours, broken links), for the text and theme
+    /// it was found for: found again when the text changes, not on each frame.
+    looks: Option<(String, bool, Runs)>,
     /// A caret placed from the window's coordinates once the text is laid out.
     pending: Option<Caret>,
     selecting: bool,
@@ -188,7 +189,7 @@ impl LiveBlock {
             focus,
             layout: None,
             hidden: Vec::new(),
-            colours: None,
+            looks: None,
             pending: Some(caret),
             selecting: false,
             undo: Vec::new(),
@@ -834,18 +835,20 @@ impl Render for LiveBlock {
         let code_font: SharedString = cx.global::<Config>().code_font.clone().into();
         let dark = crate::render::is_dark(cx);
         if self
-            .colours
+            .looks
             .as_ref()
             .is_none_or(|(text, was_dark, _)| *text != self.text || *was_dark != dark)
         {
             let colours = code_colours(&self.text, dark);
-            self.colours = Some((self.text.clone(), dark, colours));
+            let links = self.links.clone();
+            let found = looks(&self.text, &colours, &|link| links.broken(link));
+            self.looks = Some((self.text.clone(), dark, found));
         }
-        let looks = looks(
-            &self.text,
-            self.colours.as_ref().map_or(&[], |(_, _, colours)| colours),
-            &|link| self.links.broken(link),
-        );
+        let looks = self
+            .looks
+            .as_ref()
+            .map(|(_, _, looks)| looks.clone())
+            .unwrap_or_default();
         // Marks show around the caret only. Closing, they go at once but for a line's leading
         // ones, which slide away; a block not yet given its caret is laid out as it is read,
         // so the click that opened it lands where it was aimed.
@@ -1114,6 +1117,9 @@ fn looks(
 
 /// Pieces of code and their colours.
 type Colours = Vec<(Range<usize>, Rgba)>;
+
+/// The text in runs, each with how it is drawn.
+type Runs = Vec<(Range<usize>, Look)>;
 
 /// The colours of the code fenced in `text`, read in the language its fence names.
 fn code_colours(text: &str, dark: bool) -> Colours {

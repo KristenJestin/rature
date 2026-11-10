@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -52,6 +53,8 @@ pub enum Block {
     Image {
         url: String,
         alt: String,
+        /// The file it shows, found when the document was read: drawing it looks at no disk.
+        path: Option<PathBuf>,
     },
     Rule,
 }
@@ -123,13 +126,49 @@ impl Document {
     }
 }
 
-/// Reads `source`; formulas are drawn in `ink`. Relative links are checked against `folder`.
-pub fn parse(source: &str, ink: &str, folder: Option<&Path>) -> Document {
+fn options() -> markdown::ParseOptions {
     let mut options = markdown::ParseOptions::gfm();
     options.constructs.math_flow = true;
     options.constructs.math_text = true;
     options.constructs.frontmatter = true;
-    let root = markdown::to_mdast(source, &options).expect("Markdown without MDX never fails");
+    options
+}
+
+/// Whether a top-level node is shown as a block: what `Reader::block` reads.
+fn makes_block(node: &Node) -> bool {
+    matches!(
+        node,
+        Node::Heading(_)
+            | Node::Paragraph(_)
+            | Node::Code(_)
+            | Node::Math(_)
+            | Node::List(_)
+            | Node::Blockquote(_)
+            | Node::Table(_)
+            | Node::Yaml(_)
+            | Node::FootnoteDefinition(_)
+            | Node::Html(_)
+            | Node::ThematicBreak(_)
+    )
+}
+
+/// Where each top-level block of `source` is, as `Document::spans` has it, without drawing its
+/// formulas nor checking its links: what finding a block again after a format needs.
+pub fn block_spans(source: &str) -> Vec<Range<usize>> {
+    let root = markdown::to_mdast(source, &options()).expect("Markdown without MDX never fails");
+    root.children()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|node| makes_block(node))
+        .filter_map(|node| node.position().map(|p| p.start.offset..p.end.offset))
+        .collect()
+}
+
+/// Reads `source`; formulas are drawn in `ink`. Relative links are checked against `folder`, and
+/// images found there. It is slow on a long file (formulas, disk): call it off the main thread.
+pub fn parse(source: &str, ink: &str, folder: Option<&Path>) -> Document {
+    let root = markdown::to_mdast(source, &options()).expect("Markdown without MDX never fails");
     let nodes = root.children().map(Vec::as_slice).unwrap_or_default();
     let reader = Reader { ink };
     let mut doc = Document {
@@ -167,9 +206,9 @@ pub fn parse(source: &str, ink: &str, folder: Option<&Path>) -> Document {
         doc.blocks.push(block);
     }
     if let Some(folder) = folder {
-        let anchors: Vec<String> = doc.anchors.keys().cloned().collect();
+        let links = Links::new(folder.to_path_buf(), doc.anchors.keys().cloned().collect());
         for block in &mut doc.blocks {
-            check_links(block, folder, &anchors);
+            check_links(block, &links);
         }
     }
     doc
@@ -193,6 +232,7 @@ impl Reader<'_> {
                 [Node::Image(image)] => Block::Image {
                     url: image.url.clone(),
                     alt: image.alt.clone(),
+                    path: None,
                 },
                 children => Block::Paragraph(self.inlines(children, &Marks::default())),
             },
@@ -385,40 +425,75 @@ fn front_matter(yaml: &str) -> Vec<(String, String)> {
 }
 
 /// Marks the relative links that lead nowhere: a file that is not there, or an anchor of this
-/// file that no heading or footnote has.
-fn check_links(block: &mut Block, folder: &Path, anchors: &[String]) {
+/// file that no heading or footnote has. Finds the file each image shows.
+fn check_links(block: &mut Block, links: &Links) {
     let check = |inlines: &mut Vec<Inline>| {
         for inline in inlines {
             if let Inline::Text(_, marks) = inline
                 && let Some(link) = &marks.link
             {
-                marks.broken = is_broken(link, folder, anchors);
+                marks.broken = links.broken(link);
             }
         }
     };
     match block {
         Block::Heading(_, inlines) | Block::Paragraph(inlines) => check(inlines),
         Block::Table(rows) => rows.iter_mut().flatten().for_each(check),
-        Block::Quote(blocks) | Block::Alert(_, blocks) | Block::Footnote { blocks, .. } => blocks
-            .iter_mut()
-            .for_each(|b| check_links(b, folder, anchors)),
+        Block::Quote(blocks) | Block::Alert(_, blocks) | Block::Footnote { blocks, .. } => {
+            blocks.iter_mut().for_each(|b| check_links(b, links))
+        }
         Block::List { items, .. } => items
             .iter_mut()
             .flat_map(|item| item.blocks.iter_mut())
-            .for_each(|b| check_links(b, folder, anchors)),
+            .for_each(|b| check_links(b, links)),
+        Block::Image { url, path, .. } if !url.contains("://") => {
+            let file = links.folder.join(decode(url));
+            *path = links.exists(&file).then_some(file);
+        }
         _ => {}
     }
 }
 
-/// What a document's links are checked against while it is edited.
+/// What a document's links are checked against. Each file is looked for once: a document that
+/// links the same file a hundred times, or a block edited and drawn again, asks the disk once.
 pub struct Links {
     pub folder: PathBuf,
     pub anchors: Vec<String>,
+    found: RefCell<HashMap<PathBuf, bool>>,
 }
 
 impl Links {
+    pub fn new(folder: PathBuf, anchors: Vec<String>) -> Self {
+        Self {
+            folder,
+            anchors,
+            found: RefCell::default(),
+        }
+    }
+
     pub fn broken(&self, link: &str) -> bool {
-        is_broken(link, &self.folder, &self.anchors)
+        if target(link) != Target::Local {
+            return false;
+        }
+        let (file, anchor) = link.split_once('#').unwrap_or((link, ""));
+        if file.is_empty() {
+            return !anchor.is_empty() && !self.anchors.iter().any(|a| a == anchor);
+        }
+        !self.exists(&self.folder.join(decode(file)))
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        *self
+            .found
+            .borrow_mut()
+            .entry(path.to_path_buf())
+            .or_insert_with(|| path.exists())
+    }
+
+    /// How many files were looked for on disk.
+    #[cfg(test)]
+    fn looked_for(&self) -> usize {
+        self.found.borrow().len()
     }
 }
 
@@ -450,17 +525,6 @@ pub fn target(link: &str) -> Target {
         Some("http" | "https" | "mailto") => Target::Web,
         Some(_) => Target::Foreign,
     }
-}
-
-fn is_broken(link: &str, folder: &Path, anchors: &[String]) -> bool {
-    if target(link) != Target::Local {
-        return false;
-    }
-    let (file, anchor) = link.split_once('#').unwrap_or((link, ""));
-    if file.is_empty() {
-        return !anchor.is_empty() && !anchors.iter().any(|a| a == anchor);
-    }
-    !folder.join(decode(file)).exists()
 }
 
 /// `%20` and its kin, as a link to a file writes them.
@@ -661,15 +725,15 @@ mod tests {
     #[test]
     fn front_matter_reads_as_keys_and_values() {
         let doc = parse(
-            "---\ntitle: Tomatoes\ntags: [garden, summer]\n---\n\n# T\n",
+            "---\ntitle: Gardening\ntags: [seeds, soil]\n---\n\n# T\n",
             INK,
             None,
         );
         let Block::FrontMatter(pairs) = &doc.blocks[0] else {
             panic!("no front matter")
         };
-        assert_eq!(pairs[0], ("title".into(), "Tomatoes".into()));
-        assert_eq!(pairs[1], ("tags".into(), "garden, summer".into()));
+        assert_eq!(pairs[0], ("title".into(), "Gardening".into()));
+        assert_eq!(pairs[1], ("tags".into(), "seeds, soil".into()));
     }
 
     #[test]
@@ -725,5 +789,35 @@ mod tests {
             .collect();
         assert_eq!(broken, [false, true, false, true, false]);
         std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn each_file_is_looked_for_once_and_images_are_found_when_read() {
+        let folder = std::env::temp_dir().join(format!("rature-images-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("a.png"), b"png").unwrap();
+        let links = Links::new(folder.clone(), Vec::new());
+        for _ in 0..3 {
+            assert!(!links.broken("a.png"));
+            assert!(links.broken("gone.md"));
+        }
+        assert_eq!(links.looked_for(), 2);
+        let doc = parse("![a](a.png)\n\n![b](gone.png)\n", INK, Some(&folder));
+        let paths: Vec<Option<PathBuf>> = doc
+            .blocks
+            .iter()
+            .map(|b| match b {
+                Block::Image { path, .. } => path.clone(),
+                _ => panic!("not an image"),
+            })
+            .collect();
+        assert_eq!(paths, [Some(folder.join("a.png")), None]);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn block_spans_are_the_parsed_documents() {
+        let source = "---\na: 1\n---\n\n# T\n\n[x]: https://x.org\n\n$$\nx\n$$\n\n- a\n\n> q\n";
+        assert_eq!(block_spans(source), parse(source, INK, None).spans);
     }
 }

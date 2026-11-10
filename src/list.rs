@@ -421,6 +421,7 @@ impl Render for ListEdit {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.current(window, cx);
         let p = palette(cx);
+        let code_font = cx.global::<crate::config::Config>().code_font.clone();
         let size = window.text_style().font_size.to_pixels(window.rem_size());
         // A nested list sits under its item's text, past the marker column and its gap.
         let step = size * 1.4 + rems(0.5).to_pixels(window.rem_size());
@@ -462,8 +463,14 @@ impl Render for ListEdit {
                             number
                         }
                     };
-                    let marker =
-                        render::marker(size, &p, line.task, number.is_some(), number.unwrap_or(0));
+                    let marker = render::marker(
+                        size,
+                        &p,
+                        &code_font,
+                        line.task,
+                        number.is_some(),
+                        number.unwrap_or(0),
+                    );
                     div()
                         .id(("list-marker", ix))
                         .when(line.task.is_some(), |d| {

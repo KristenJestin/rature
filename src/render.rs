@@ -6,6 +6,9 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
+/// The narrowest a CSV column gets.
+const CELL: f32 = 90.;
+
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -22,8 +25,6 @@ pub struct Ctx<'a, 'b> {
     pub theme: &'a Palette,
     pub config: &'a Config,
     pub zoom: f32,
-    /// The folder of the file, against which images are found.
-    pub folder: Option<&'a Path>,
     pub drawings: &'a Cache<String, Picture>,
     pub highlights: &'a Cache<(String, String), Option<Lines>>,
     /// What the search looks for, lowercased.
@@ -35,12 +36,10 @@ pub struct Ctx<'a, 'b> {
 }
 
 impl<'a, 'b> Ctx<'a, 'b> {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         theme: &'a Palette,
         config: &'a Config,
         zoom: f32,
-        folder: Option<&'a Path>,
         drawings: &'a Cache<String, Picture>,
         highlights: &'a Cache<(String, String), Option<Lines>>,
         query: Option<&'a str>,
@@ -50,7 +49,6 @@ impl<'a, 'b> Ctx<'a, 'b> {
             theme,
             config,
             zoom,
-            folder,
             drawings,
             highlights,
             query,
@@ -222,12 +220,10 @@ pub fn block(ctx: &Ctx, block: &Block) -> AnyElement {
                     .children(blocks.iter().map(|b| self::block(ctx, b))),
             )
             .into_any_element(),
-        Block::Image { url, alt } => match ctx.folder.map(|f| f.join(crate::document::decode(url)))
-        {
-            Some(path) if !url.contains("://") && path.exists() => {
-                centered(img(path).max_w_full().into_any_element())
-            }
-            _ => div()
+        // Found on disk when the file was read, not while it is drawn.
+        Block::Image { url, alt, path } => match path {
+            Some(path) => centered(img(path.clone()).max_w_full().into_any_element()),
+            None => div()
                 .text_color(t.mute)
                 .child(format!("[{alt}] {url}"))
                 .into_any_element(),
@@ -269,7 +265,14 @@ fn item(ctx: &Ctx, ordered: bool, number: usize, item: &Item) -> impl IntoElemen
     let size = ctx.size(1.);
     bullet(
         size,
-        marker(size, ctx.theme, item.checked, ordered, number),
+        marker(
+            size,
+            ctx.theme,
+            &ctx.config.code_font,
+            item.checked,
+            ordered,
+            number,
+        ),
         div()
             .flex()
             .flex_col()
@@ -296,10 +299,11 @@ pub fn bullet(size: Pixels, marker: impl IntoElement, content: impl IntoElement)
         .child(div().flex_1().min_w_0().child(content))
 }
 
-/// A list item's bullet, number or task box, for text of `size`.
+/// A list item's bullet, number or task box, for text of `size`; a number in `code_font`.
 pub fn marker(
     size: Pixels,
     t: &Palette,
+    code_font: &str,
     checked: Option<bool>,
     ordered: bool,
     number: usize,
@@ -321,7 +325,7 @@ pub fn marker(
             .into_any_element(),
         (None, true) => div()
             .text_color(t.faint)
-            .font_family(gpui_design_system::typography::MONO)
+            .font_family(SharedString::from(code_font.to_string()))
             .text_size(size * 0.85)
             .child(format!("{number}."))
             .into_any_element(),
@@ -654,65 +658,101 @@ pub fn grid(id: ElementId, t: &Palette, rows: Vec<Vec<AnyElement>>) -> Stateful<
     )
 }
 
-/// A CSV file: its first row is its head. Long ones stop at `LIMIT` rows, said under it.
-pub fn table(ctx: &Ctx, rows: &[Vec<String>]) -> AnyElement {
-    const LIMIT: usize = 2000;
-    let shown = rows
-        .iter()
-        .take(LIMIT)
-        .map(|row| {
-            row.iter()
-                .map(|cell| {
-                    let hit = ctx
-                        .query
-                        .is_some_and(|q| !q.is_empty() && cell.to_lowercase().contains(q));
-                    div()
-                        .when(hit, |d| d.bg(ctx.theme.wait.opacity(0.35)))
-                        .child(cell.clone())
-                        .into_any_element()
-                })
-                .collect()
-        })
-        .collect();
+/// A row of a CSV file, `ix` of `count`, its first row the head: one line, its cells cut to
+/// their column, so that every row is as high and only those shown are built. `columns` the
+/// most cells a row has.
+pub fn table_row(ctx: &Ctx, row: &[String], ix: usize, count: usize, columns: usize) -> AnyElement {
+    let t = ctx.theme;
+    let cells = (0..columns).map(|column| {
+        let cell = row.get(column).map_or("", String::as_str);
+        let hit = ctx
+            .query
+            .is_some_and(|q| !q.is_empty() && cell.to_lowercase().contains(q));
+        div()
+            .flex_1()
+            .min_w(px(CELL))
+            .px_3()
+            .py_1()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_ellipsis()
+            .when(hit, |d| d.bg(t.wait.opacity(0.35)))
+            .child(cell.to_string())
+    });
     div()
         .flex()
-        .flex_col()
-        .gap_2()
-        .child(grid(ctx.id("table"), ctx.theme, shown))
-        .when(rows.len() > LIMIT, |d| {
-            d.child(
-                div()
-                    .text_color(ctx.theme.mute)
-                    .child(format!("The first {LIMIT} rows of {}.", rows.len())),
-            )
+        .w_full()
+        .min_w(px(CELL * columns as f32))
+        .border_x_1()
+        .border_b_1()
+        .border_color(t.line)
+        .when(ix == 0, |row| {
+            row.border_t_1()
+                .rounded_t_md()
+                .bg(t.card)
+                .font_weight(FontWeight::BOLD)
         })
+        .when(ix + 1 == count, |row| row.rounded_b_md())
+        .children(cells)
         .into_any_element()
 }
 
-/// JSON or YAML as a tree: a map or a list folds by a click on its row.
-pub fn data(ctx: &Ctx, nodes: &[Node], folded: &HashSet<Vec<usize>>) -> AnyElement {
+/// A line of a JSON or YAML tree as shown: the node at `path` (its index among the documents,
+/// then among its parents' children).
+pub struct DataRow {
+    pub path: Vec<usize>,
+}
+
+/// The lines a JSON or YAML tree shows, what is folded left out: worked out when the tree or
+/// its folds change, not on each frame.
+pub fn data_lines(nodes: &[Node], folded: &HashSet<Vec<usize>>) -> Vec<DataRow> {
+    fn walk(node: &Node, path: Vec<usize>, folded: &HashSet<Vec<usize>>, rows: &mut Vec<DataRow>) {
+        let open = match &node.value {
+            Value::List(children) | Value::Map(children) if !folded.contains(&path) => {
+                Some(children)
+            }
+            _ => None,
+        };
+        rows.push(DataRow { path: path.clone() });
+        for (ix, child) in open.into_iter().flatten().enumerate() {
+            let mut inner = path.clone();
+            inner.push(ix);
+            walk(child, inner, folded, rows);
+        }
+    }
     let mut rows = Vec::new();
     for (ix, node) in nodes.iter().enumerate() {
-        data_rows(ctx, node, vec![ix], 0, folded, &mut rows);
+        walk(node, vec![ix], folded, &mut rows);
     }
-    div()
-        .font_family(ctx.config.code_font.clone())
-        .text_size(ctx.size(0.875))
-        .line_height(rems(1.5))
-        .flex()
-        .flex_col()
-        .children(rows)
-        .into_any_element()
+    rows
 }
 
-fn data_rows(
+/// The node at `path`, as `DataRow` has it.
+fn node_at<'a>(nodes: &'a [Node], path: &[usize]) -> Option<&'a Node> {
+    let (first, rest) = path.split_first()?;
+    let mut node = nodes.get(*first)?;
+    for ix in rest {
+        node = match &node.value {
+            Value::List(children) | Value::Map(children) => children.get(*ix)?,
+            Value::Scalar(..) => return None,
+        };
+    }
+    Some(node)
+}
+
+/// A line of a JSON or YAML tree: a value, or a map or a list that folds by a click. One line
+/// each, in the code font, so that every line is as high.
+pub fn data_row(
     ctx: &Ctx,
-    node: &Node,
-    path: Vec<usize>,
-    depth: usize,
+    nodes: &[Node],
+    row: &DataRow,
     folded: &HashSet<Vec<usize>>,
-    rows: &mut Vec<AnyElement>,
-) {
+) -> AnyElement {
+    let Some(node) = node_at(nodes, &row.path) else {
+        return div().into_any_element();
+    };
+    let path = row.path.clone();
+    let depth = path.len() - 1;
     let t = ctx.theme;
     let key = node.key.as_ref().map(|k| {
         div()
@@ -737,16 +777,15 @@ fn data_rows(
                             .as_ref()
                             .is_some_and(|k| k.to_lowercase().contains(q)))
             });
-            rows.push(
-                div()
-                    .flex()
-                    .gap_2()
-                    .pl(indent + px(16.))
-                    .when(hit, |d| d.bg(t.wait.opacity(0.2)))
-                    .children(key)
-                    .child(div().text_color(color).child(text.clone()))
-                    .into_any_element(),
-            );
+            div()
+                .flex()
+                .gap_2()
+                .whitespace_nowrap()
+                .pl(indent + px(16.))
+                .when(hit, |d| d.bg(t.wait.opacity(0.2)))
+                .children(key)
+                .child(div().text_color(color).child(one_line(text)))
+                .into_any_element()
         }
         Value::List(children) | Value::Map(children) => {
             let is_map = matches!(node.value, Value::Map(_));
@@ -758,33 +797,34 @@ fn data_rows(
                 (false, false) => "[".to_string(),
             };
             let toggled = path.clone();
-            rows.push(
-                div()
-                    .id(ctx.id("fold"))
-                    .flex()
-                    .gap_2()
-                    .pl(indent)
-                    .cursor_pointer()
-                    .child(div().w(px(12.)).text_color(t.mute).child(if closed {
-                        "▸"
-                    } else {
-                        "▾"
-                    }))
-                    .children(key)
-                    .child(div().text_color(t.mute).child(summary))
-                    .on_click(ctx.cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.toggle_fold(toggled.clone(), cx)
-                    }))
-                    .into_any_element(),
-            );
-            if !closed {
-                for (ix, child) in children.iter().enumerate() {
-                    let mut inner = path.clone();
-                    inner.push(ix);
-                    data_rows(ctx, child, inner, depth + 1, folded, rows);
-                }
-            }
+            div()
+                .id(ElementId::Name(format!("fold-{path:?}").into()))
+                .flex()
+                .gap_2()
+                .whitespace_nowrap()
+                .pl(indent)
+                .cursor_pointer()
+                .child(div().w(px(12.)).text_color(t.mute).child(if closed {
+                    "▸"
+                } else {
+                    "▾"
+                }))
+                .children(key)
+                .child(div().text_color(t.mute).child(summary))
+                .on_click(ctx.cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.toggle_fold(toggled.clone(), cx)
+                }))
+                .into_any_element()
         }
+    }
+}
+
+/// A value on one line: its line breaks shown as `↵`, so that every line of a tree is as high.
+fn one_line(text: &str) -> String {
+    if text.contains('\n') {
+        text.replace("\r\n", "↵").replace('\n', "↵")
+    } else {
+        text.to_string()
     }
 }
 
@@ -838,4 +878,57 @@ pub fn marked(ctx: &Ctx, ink: Hsla, tint: Hsla, content: impl IntoElement) -> An
 
 pub fn image_file(path: &Path) -> AnyElement {
     centered(img(Arc::<Path>::from(path)).max_w_full().into_any_element())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{data_lines, node_at, one_line};
+    use crate::formats::{Kind, Node, Value};
+    use std::collections::HashSet;
+
+    fn scalar(key: Option<&str>, text: &str) -> Node {
+        Node {
+            key: key.map(str::to_string),
+            value: Value::Scalar(text.into(), Kind::Text),
+        }
+    }
+
+    #[test]
+    fn a_tree_shows_a_line_per_node_its_folds_left_out() {
+        // {a: [x, y], b: z}
+        let tree = vec![Node {
+            key: None,
+            value: Value::Map(vec![
+                Node {
+                    key: Some("a".into()),
+                    value: Value::List(vec![scalar(None, "x"), scalar(None, "y")]),
+                },
+                scalar(Some("b"), "z"),
+            ]),
+        }];
+        let paths = |folded: &HashSet<Vec<usize>>| -> Vec<Vec<usize>> {
+            data_lines(&tree, folded)
+                .into_iter()
+                .map(|r| r.path)
+                .collect()
+        };
+        assert_eq!(
+            paths(&HashSet::new()),
+            [
+                vec![0],
+                vec![0, 0],
+                vec![0, 0, 0],
+                vec![0, 0, 1],
+                vec![0, 1]
+            ]
+        );
+        assert_eq!(
+            paths(&HashSet::from([vec![0, 0]])),
+            [vec![0], vec![0, 0], vec![0, 1]]
+        );
+        let y = node_at(&tree, &[0, 0, 1]).unwrap();
+        assert!(matches!(&y.value, Value::Scalar(text, _) if text == "y"));
+        assert!(node_at(&tree, &[0, 1, 0]).is_none());
+        assert_eq!(one_line("a\nb"), "a↵b");
+    }
 }
