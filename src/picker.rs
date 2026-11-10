@@ -1,7 +1,10 @@
 //! The box that finds something to go to: a file by a few letters of its path, a line of the
 //! folder by ripgrep, a heading of the file being read, or any file or folder to open.
 
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
+use std::process::Child;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gpui_kit::base::input::{Input, InputEvent, InputState};
@@ -87,6 +90,10 @@ pub struct Picker {
     selected: usize,
     scroll: ScrollHandle,
     running: Option<Task<()>>,
+    /// The ripgrep run of the last query: replacing or dropping it stops it.
+    search: Option<Stopper>,
+    /// Said instead of the results when the search cannot run.
+    notice: Option<String>,
     _events: Subscription,
 }
 
@@ -127,6 +134,8 @@ impl Picker {
             selected: 0,
             scroll: ScrollHandle::new(),
             running: None,
+            search: None,
+            notice: None,
             _events: events,
         };
         picker.refresh(cx);
@@ -267,21 +276,35 @@ impl Picker {
             Source::Grep(root) => {
                 if query.trim().is_empty() {
                     self.shown.clear();
+                    self.notice = None;
                     self.running = None;
+                    self.search = None;
                     return cx.notify();
                 }
                 let root = root.clone();
-                // Typing replaces the search: only the last query runs, once typing rests.
+                // Typing replaces the search: only the last query runs, once typing rests, and
+                // the ripgrep of the one before is stopped.
+                let search = Search::default();
+                self.search = Some(Stopper(search.clone()));
                 self.running = Some(cx.spawn(async move |this, cx| {
                     cx.background_executor()
                         .timer(Duration::from_millis(150))
                         .await;
                     let found = cx
                         .background_executor()
-                        .spawn(async move { grep(&root, &query) })
+                        .spawn(async move { grep(&root, &query, &search) })
                         .await;
                     this.update(cx, |this, cx| {
-                        this.shown = found;
+                        match found {
+                            Ok(found) => {
+                                this.shown = found;
+                                this.notice = None;
+                            }
+                            Err(notice) => {
+                                this.shown.clear();
+                                this.notice = Some(notice);
+                            }
+                        }
                         this.selected = 0;
                         cx.notify();
                     })
@@ -469,54 +492,190 @@ pub fn list_files(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// A ripgrep run, shared by the search that reads it and the box that may stop it.
+#[derive(Clone, Default)]
+struct Search(Arc<Mutex<Run>>);
+
+#[derive(Default)]
+struct Run {
+    child: Option<Child>,
+    stopped: bool,
+}
+
+impl Search {
+    fn run(&self) -> std::sync::MutexGuard<'_, Run> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Kills ripgrep if it runs, and keeps it from starting. The reader waits for it, so this
+    /// never blocks.
+    fn stop(&self) {
+        let mut run = self.run();
+        run.stopped = true;
+        if let Some(child) = &mut run.child {
+            let _ = child.kill();
+        }
+    }
+}
+
+/// Stops its search when dropped: when a new query replaces it, or the box goes.
+struct Stopper(Search);
+
+impl Drop for Stopper {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
+}
+
+/// The longest line of ripgrep's read: a longer one, a match in a huge line, is skipped.
+const LONGEST: usize = 1024 * 1024;
+/// The most of a matched line shown.
+const LABEL: usize = 240;
+
 /// The lines under `root` holding `query`, by ripgrep: as it finds them, with case only when the
-/// query has some.
-fn grep(root: &Path, query: &str) -> Vec<Choice> {
-    let output = std::process::Command::new("rg")
+/// query has some, the first `SHOWN` of them. Stopping `search` stops it early.
+fn grep(root: &Path, query: &str, search: &Search) -> Result<Vec<Choice>, String> {
+    let mut run = search.run();
+    if run.stopped {
+        return Ok(Vec::new());
+    }
+    let child = std::process::Command::new("rg")
         .args([
-            "--line-number",
-            "--no-heading",
-            "--color=never",
+            "--json",
             "--smart-case",
             "--max-count=20",
-            "--max-columns=240",
-            "--max-columns-preview",
             "--fixed-strings",
             "--",
             query,
         ])
         .arg(root)
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output();
-    let Ok(output) = output else {
-        return vec![Choice {
-            label: "ripgrep (rg) is not installed".into(),
-            detail: String::new(),
-            indent: 0,
-            target: Target::Block(0),
-        }];
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(
+                "Searching the folder needs ripgrep: install the `ripgrep` package (`rg`).".into(),
+            );
+        }
+        Err(error) => return Err(format!("ripgrep (rg) cannot start: {error}")),
     };
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let (path, rest) = line.split_once(':')?;
-            let (number, text) = rest.split_once(':')?;
-            let path = PathBuf::from(path);
-            let relative = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
-            Some(Choice {
-                label: text.trim().to_string(),
-                detail: format!("{relative}:{number}"),
+    let Some(output) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(Vec::new());
+    };
+    run.child = Some(child);
+    drop(run);
+    let found = matches(root, std::io::BufReader::new(output));
+    // Enough found, or stopped: ripgrep need not go on.
+    let child = search.run().child.take();
+    if let Some(mut child) = child {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    Ok(found)
+}
+
+/// The first `SHOWN` matches in what `rg --json` prints.
+fn matches(root: &Path, mut output: impl BufRead) -> Vec<Choice> {
+    let mut found = Vec::new();
+    let mut line = Vec::new();
+    while found.len() < SHOWN && read_line(&mut output, &mut line, LONGEST) {
+        if line.len() >= LONGEST {
+            continue;
+        }
+        if let Some((path, number, text)) = parse_match(&line) {
+            let relative = path.strip_prefix(root).unwrap_or(&path).to_string_lossy();
+            let detail = format!("{relative}:{number}");
+            found.push(Choice {
+                label: text.trim().chars().take(LABEL).collect(),
+                detail,
                 indent: 0,
-                target: Target::Line(path, number.parse().ok()?),
-            })
-        })
-        .take(SHOWN)
-        .collect()
+                target: Target::Line(path, number),
+            });
+        }
+    }
+    found
+}
+
+/// Reads a line of `input` into `line`, keeping at most `most` bytes of it. False at the end.
+fn read_line(input: &mut impl BufRead, line: &mut Vec<u8>, most: usize) -> bool {
+    line.clear();
+    let mut any = false;
+    loop {
+        let buffer = match input.fill_buf() {
+            Ok(buffer) => buffer,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return any,
+        };
+        if buffer.is_empty() {
+            return any;
+        }
+        any = true;
+        let (used, whole) = match buffer.iter().position(|&b| b == b'\n') {
+            Some(at) => (at + 1, true),
+            None => (buffer.len(), false),
+        };
+        let room = most.saturating_sub(line.len());
+        line.extend_from_slice(&buffer[..used.min(room)]);
+        input.consume(used);
+        if whole {
+            return true;
+        }
+    }
+}
+
+/// The path, line number and line of a `match` message of `rg --json`.
+fn parse_match(line: &[u8]) -> Option<(PathBuf, usize, String)> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let message: serde_json::Value = serde_json::from_slice(line).ok()?;
+    if message["type"] != "match" {
+        return None;
+    }
+    let data = &message["data"];
+    let path = PathBuf::from(std::ffi::OsString::from_vec(rg_bytes(&data["path"])?));
+    let number = usize::try_from(data["line_number"].as_u64()?).ok()?;
+    let text = String::from_utf8_lossy(&rg_bytes(&data["lines"])?).into_owned();
+    Some((path, number, text))
+}
+
+/// The bytes of a piece of `rg --json`: `{"text": ...}` when they are UTF-8, else
+/// `{"bytes": base64}`.
+fn rg_bytes(piece: &serde_json::Value) -> Option<Vec<u8>> {
+    if let Some(text) = piece["text"].as_str() {
+        return Some(text.as_bytes().to_vec());
+    }
+    base64(piece["bytes"].as_str()?)
+}
+
+/// Standard base64, padded or not.
+fn base64(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let mut bits = 0u32;
+    let mut held = 0;
+    for c in text.bytes().filter(|&c| c != b'=') {
+        let value = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        bits = (bits << 6) | u32::from(value);
+        held += 6;
+        if held >= 8 {
+            held -= 8;
+            out.push((bits >> held) as u8);
+            bits &= (1 << held) - 1;
+        }
+    }
+    Some(out)
 }
 
 impl Choice {
@@ -697,7 +856,9 @@ impl Render for Picker {
                 EmptyLine::new(
                     "picker-none",
                     Icon::Search,
-                    "Nothing matches what is typed.",
+                    self.notice
+                        .clone()
+                        .unwrap_or_else(|| "Nothing matches what is typed.".into()),
                 ),
             ))
             .kept(
@@ -712,5 +873,123 @@ impl Render for Picker {
                     .text_color(p.faint)
                     .child(self.keys),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `super::*`: it brings gpui's own `test` attribute.
+    use super::{Choice, LONGEST, SHOWN, Search, Stopper, Target, base64, grep, matches};
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::path::{Path, PathBuf};
+
+    fn found(choices: &[Choice]) -> Vec<(PathBuf, usize, String, String)> {
+        choices
+            .iter()
+            .map(|c| match &c.target {
+                Target::Line(path, line) => {
+                    (path.clone(), *line, c.label.clone(), c.detail.clone())
+                }
+                _ => panic!("a search finds lines"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ripgrep_json_is_read_whatever_the_path_holds() {
+        let output = [
+            r#"{"type":"begin","data":{"path":{"text":"/w/a:b.md"}}}"#,
+            r#"{"type":"match","data":{"path":{"text":"/w/a:b.md"},"lines":{"text":"  x: 1:2  \n"},"line_number":7,"absolute_offset":0,"submatches":[]}}"#,
+            r#"{"type":"match","data":{"path":{"bytes":"L24vY2Fm6S5tZA=="},"lines":{"bytes":"Y2Fm6Q=="},"line_number":3,"absolute_offset":0,"submatches":[]}}"#,
+            "not json",
+            r#"{"type":"summary","data":{}}"#,
+            "",
+        ]
+        .join("\n");
+        let choices = matches(Path::new("/w"), output.as_bytes());
+        assert_eq!(
+            found(&choices),
+            vec![
+                (
+                    PathBuf::from("/w/a:b.md"),
+                    7,
+                    "x: 1:2".into(),
+                    "a:b.md:7".into()
+                ),
+                (
+                    PathBuf::from(OsStr::from_bytes(b"/n/caf\xe9.md")),
+                    3,
+                    "caf\u{fffd}".into(),
+                    "/n/caf\u{fffd}.md:3".into()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn ripgrep_output_stops_at_the_cap() {
+        let line = r#"{"type":"match","data":{"path":{"text":"/w/a.md"},"lines":{"text":"hit"},"line_number":1}}"#;
+        let output = format!("{line}\n").repeat(SHOWN + 50);
+        assert_eq!(matches(Path::new("/w"), output.as_bytes()).len(), SHOWN);
+    }
+
+    #[test]
+    fn an_overlong_line_is_skipped_not_kept() {
+        let long = format!(
+            r#"{{"type":"match","data":{{"path":{{"text":"/w/a.md"}},"lines":{{"text":"{}"}},"line_number":1}}}}"#,
+            "x".repeat(LONGEST)
+        );
+        let short = r#"{"type":"match","data":{"path":{"text":"/w/b.md"},"lines":{"text":"y"},"line_number":2}}"#;
+        let output = format!("{long}\n{short}\n");
+        let choices = matches(Path::new("/w"), output.as_bytes());
+        assert_eq!(found(&choices).len(), 1);
+        assert_eq!(choices[0].detail, "b.md:2");
+    }
+
+    #[test]
+    fn base64_reads_what_ripgrep_writes() {
+        assert_eq!(base64("L24vY2Fm6S5tZA==").unwrap(), b"/n/caf\xe9.md");
+        assert_eq!(base64("YWJj").unwrap(), b"abc");
+        assert_eq!(base64("YQ").unwrap(), b"a");
+        assert_eq!(base64("").unwrap(), b"");
+        assert!(base64("a*b").is_none());
+    }
+
+    /// With ripgrep there, a real search, in names that broke the old parsing.
+    #[test]
+    fn ripgrep_finds_lines_in_odd_names() {
+        let root = std::env::temp_dir().join(format!("rature-grep-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let colon = root.join("a:12:b.md");
+        let odd = root.join(OsStr::from_bytes(b"caf\xe9.md"));
+        std::fs::write(&colon, "one\nneedle here\n").unwrap();
+        std::fs::write(&odd, "needle\n").unwrap();
+        let result = grep(&root, "needle", &Search::default());
+        std::fs::remove_dir_all(&root).unwrap();
+        let Ok(choices) = result else {
+            eprintln!("ripgrep is not installed: skipped");
+            return;
+        };
+        let mut found = found(&choices);
+        found.sort();
+        let mut expected = vec![
+            (
+                colon,
+                2,
+                "needle here".to_string(),
+                "a:12:b.md:2".to_string(),
+            ),
+            (odd, 1, "needle".into(), "caf\u{fffd}.md:1".into()),
+        ];
+        expected.sort();
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn a_stopped_search_does_not_start() {
+        let search = Search::default();
+        drop(Stopper(search.clone()));
+        assert!(grep(Path::new("/"), "x", &search).unwrap().is_empty());
     }
 }

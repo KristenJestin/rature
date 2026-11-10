@@ -2,7 +2,7 @@ use ratex_layout::{LayoutOptions, layout, to_display_list, validate_layout};
 use ratex_svg::{SvgOptions, render_to_svg};
 use ratex_types::{color::Color, math_style::MathStyle};
 
-use crate::diagram::{SCALE, picture};
+use crate::diagram::{SCALE, guard, picture};
 use crate::document::Picture;
 
 /// Pixels per em: a little above the text so a formula reads at the same weight.
@@ -11,6 +11,10 @@ const DISPLAY_EM: f64 = 22.0;
 
 /// Draws `source` in the colour `ink` (`#rrggbb`).
 pub fn render(source: &str, display: bool, ink: &str) -> Result<Picture, String> {
+    guard("formula", source, || draw(source, display, ink))
+}
+
+fn draw(source: &str, display: bool, ink: &str) -> Result<Picture, String> {
     let ast = ratex_parser::parse(source).map_err(|e| e.to_string())?;
     let style = if display {
         MathStyle::Display
