@@ -137,6 +137,9 @@ pub struct LiveBlock {
     goal: Option<Point<Pixels>>,
     focus: FocusHandle,
     layout: Option<TextLayout>,
+    /// The marks left out of the layout: those away from the caret, so the block reads as it
+    /// does when it is not edited.
+    hidden: Vec<Range<usize>>,
     /// A caret placed from the window's coordinates once the text is laid out.
     pending: Option<Caret>,
     selecting: bool,
@@ -169,6 +172,7 @@ impl LiveBlock {
             goal: None,
             focus,
             layout: None,
+            hidden: Vec::new(),
             pending: Some(caret),
             selecting: false,
             undo: Vec::new(),
@@ -299,7 +303,7 @@ impl LiveBlock {
         let bounds = layout.bounds();
         let here = match self.goal {
             Some(goal) => point(goal.x, bounds.top() + goal.y),
-            None => layout.position_for_index(at)?,
+            None => layout.position_for_index(to_shown(&self.hidden, at))?,
         };
         let top = if down {
             here.y + height
@@ -311,11 +315,10 @@ impl LiveBlock {
             return None;
         }
         self.goal = Some(point(here.x, top - bounds.top()));
-        Some(
-            layout
-                .index_for_position(point(here.x, y))
-                .unwrap_or_else(|ix| ix),
-        )
+        let shown = layout
+            .index_for_position(point(here.x, y))
+            .unwrap_or_else(|ix| ix);
+        Some(from_shown(&self.hidden, shown))
     }
 
     fn step(&mut self, down: bool, select: bool, cx: &mut Context<Self>) {
@@ -531,7 +534,10 @@ impl LiveBlock {
         self.layout
             .as_ref()
             .map_or(0, |layout| {
-                layout.index_for_position(position).unwrap_or_else(|ix| ix)
+                from_shown(
+                    &self.hidden,
+                    layout.index_for_position(position).unwrap_or_else(|ix| ix),
+                )
             })
             .min(self.text.len())
     }
@@ -710,8 +716,8 @@ impl EntityInputHandler for LiveBlock {
     ) -> Option<Bounds<Pixels>> {
         let layout = self.layout.as_ref()?;
         let range = self.range_offsets(&range);
-        let start = layout.position_for_index(range.start)?;
-        let end = layout.position_for_index(range.end)?;
+        let start = layout.position_for_index(to_shown(&self.hidden, range.start))?;
+        let end = layout.position_for_index(to_shown(&self.hidden, range.end))?;
         Some(Bounds::from_corners(
             start,
             point(end.x.max(start.x), end.y + layout.line_height()),
@@ -726,6 +732,25 @@ impl EntityInputHandler for LiveBlock {
     ) -> Option<usize> {
         Some(self.utf16(self.index_at(point)))
     }
+}
+
+/// Where the offset `at` of the text falls in what is drawn of it, `hidden` left out.
+fn to_shown(hidden: &[Range<usize>], at: usize) -> usize {
+    hidden.iter().fold(at, |shown, range| {
+        shown - range.end.min(at).saturating_sub(range.start)
+    })
+}
+
+/// The offset of the text at the offset `at` of what is drawn: past the marks hidden there.
+fn from_shown(hidden: &[Range<usize>], at: usize) -> usize {
+    let mut out = at;
+    for range in hidden {
+        if range.start > out {
+            break;
+        }
+        out += range.len();
+    }
+    out
 }
 
 /// The rectangles a selection covers, line by line of the layout.
@@ -770,6 +795,36 @@ impl Render for LiveBlock {
         let base = window.text_style();
         let code_font: SharedString = cx.global::<Config>().code_font.clone().into();
         let looks = looks(&self.text);
+        // Marks show around the caret only. Closing, they go at once but for a line's leading
+        // ones, which slide away; a block not yet given its caret is laid out as it is read,
+        // so the click that opened it lands where it was aimed.
+        let first = looks.first().map(|(range, _)| range.clone());
+        let near = |zone: Option<(usize, usize)>| {
+            let (start, end) = (self.selected.start, self.selected.end);
+            self.focus.is_focused(window)
+                && self.pending.is_none()
+                && !closing
+                && zone.is_some_and(|(from, to)| start <= to && end >= from)
+        };
+        let before = std::mem::take(&mut self.hidden);
+        self.hidden = looks
+            .iter()
+            .filter(|(range, look)| {
+                look.ink == Ink::Mark
+                    && look.zone.is_some()
+                    && !near(look.zone)
+                    && !(closing && first.as_ref() == Some(range) && !before.contains(range))
+            })
+            .map(|(range, _)| range.clone())
+            .collect();
+        let looks: Vec<_> = looks
+            .into_iter()
+            .filter(|(range, _)| !self.hidden.contains(range))
+            .collect();
+        let shown_text: String = looks
+            .iter()
+            .map(|(range, _)| &self.text[range.clone()])
+            .collect();
         let runs: Vec<TextRun> = looks
             .iter()
             .map(|(range, look)| {
@@ -792,7 +847,11 @@ impl Render for LiveBlock {
                         Ink::Link => p.run,
                     },
                     background_color: look.shade.then_some(p.card2),
-                    underline: None,
+                    underline: (look.ink == Ink::Link).then_some(UnderlineStyle {
+                        thickness: px(1.),
+                        color: None,
+                        wavy: false,
+                    }),
                     strikethrough: look.strike.then_some(StrikethroughStyle {
                         thickness: px(1.),
                         color: None,
@@ -822,12 +881,16 @@ impl Render for LiveBlock {
                     )
                     .width
             });
-        let text = StyledText::new(self.text.clone()).with_runs(runs);
+        let text = StyledText::new(shown_text).with_runs(runs);
         let layout = text.layout().clone();
         self.layout = Some(layout.clone());
         let entity = cx.entity();
         let focus = self.focus.clone();
-        let (selected, caret) = (self.selected.clone(), self.caret());
+        let drawn = |at| to_shown(&self.hidden, at);
+        let (selected, caret) = (
+            drawn(self.selected.start)..drawn(self.selected.end),
+            drawn(self.caret()),
+        );
         let (caret_ink, selection_ink) = (p.acc, p.run.opacity(0.28));
         let line_top = self.goal.map(|goal| goal.y);
         let placing = self.pending.is_some();
@@ -933,6 +996,8 @@ struct Look {
     /// Inline code's tinted ground.
     shade: bool,
     ink: Ink,
+    /// Where the caret shows a mark: its line, or what it marks. A fence's show always.
+    zone: Option<(usize, usize)>,
 }
 
 /// The looks of `text`, in runs that cover it whole: its marks faint, what they mark drawn as it
@@ -961,7 +1026,11 @@ fn looks(text: &str) -> Vec<(Range<usize>, Look)> {
         }
         let marker = line_marker(trimmed);
         let start = range.start + indent;
-        paint(&mut each, start..start + marker, |l| l.ink = Ink::Mark);
+        let zone = Some((range.start, range.start + line.trim_end_matches('\n').len()));
+        paint(&mut each, start..start + marker, |l| {
+            l.ink = Ink::Mark;
+            l.zone = zone;
+        });
     }
     if let Ok(tree) = markdown::to_mdast(text, &markdown::ParseOptions::gfm()) {
         inline(&tree, &mut each);
@@ -1034,8 +1103,12 @@ fn inner(node: &Node) -> Option<Range<usize>> {
 
 fn marks(each: &mut [Look], node: &Node) {
     if let (Some(outer), Some(inner)) = (span(node), inner(node)) {
-        paint(each, outer.start..inner.start, |l| l.ink = Ink::Mark);
-        paint(each, inner.end..outer.end, |l| l.ink = Ink::Mark);
+        let mark = |l: &mut Look| {
+            l.ink = Ink::Mark;
+            l.zone = Some((outer.start, outer.end));
+        };
+        paint(each, outer.start..inner.start, mark);
+        paint(each, inner.end..outer.end, mark);
     }
 }
 
@@ -1072,10 +1145,12 @@ fn inline(node: &Node, each: &mut [Look]) {
                     l.mono = true;
                     l.shade = true;
                 });
-                paint(each, range.start..range.start + ticks, |l| {
-                    l.ink = Ink::Mark
-                });
-                paint(each, range.end - ticks..range.end, |l| l.ink = Ink::Mark);
+                let mark = |l: &mut Look| {
+                    l.ink = Ink::Mark;
+                    l.zone = Some((range.start, range.end));
+                };
+                paint(each, range.start..range.start + ticks, mark);
+                paint(each, range.end - ticks..range.end, mark);
             }
         }
         // Fenced code is drawn line by line.
@@ -1092,7 +1167,7 @@ fn inline(node: &Node, each: &mut [Look]) {
 #[cfg(test)]
 mod tests {
     // Not the glob: GPUI's own `test` attribute would come with it.
-    use super::{Ink, looks};
+    use super::{Ink, from_shown, looks, to_shown};
 
     fn marked(text: &str) -> String {
         looks(text)
@@ -1102,6 +1177,19 @@ mod tests {
                 _ => text[range].to_string(),
             })
             .collect()
+    }
+
+    #[test]
+    fn offsets_skip_the_hidden_marks() {
+        // `a **b** c`, its marks hidden: `a b c`.
+        let hidden = [2..4, 5..7];
+        assert_eq!(to_shown(&hidden, 2), 2);
+        assert_eq!(to_shown(&hidden, 3), 2);
+        assert_eq!(to_shown(&hidden, 4), 2);
+        assert_eq!(to_shown(&hidden, 9), 5);
+        assert_eq!(from_shown(&hidden, 2), 4);
+        assert_eq!(from_shown(&hidden, 3), 7);
+        assert_eq!(from_shown(&hidden, 1), 1);
     }
 
     #[test]

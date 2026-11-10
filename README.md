@@ -31,8 +31,8 @@ writes. Native, keyboard first, no webview.
   changed ones yellow with their changed words, removed ones struck in red. The first opening
   takes the snapshot; `m` marks the current state read.
 - **Edit in place**: click a block, or `i` for the block at the top, and you write in it where it
-  is read: its marks (`##`, `**`, backticks, a link's address) show faint, and what they mark keeps
-  its look, the heading its size, the strong text bold. The arrows go on to the next block. A table keeps its grid: each cell is edited
+  is read, and it looks as it is read: a mark (`##`, `**`, backticks, a link's address) shows,
+  faint, only where the caret touches what it marks. The arrows go on to the next block. A table keeps its grid: each cell is edited
   where it is, `Tab` to the next one, rows and columns added and deleted from the tools over it
   (`Alt-Shift` and an arrow, `Backspace` or `Delete`), and the table is written back as Markdown. A list keeps its bullets, numbers and task boxes:
   each line is edited beside its marker, `Enter` starts the next item, or on an empty one leaves the list,
