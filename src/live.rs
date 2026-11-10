@@ -6,10 +6,12 @@
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use markdown::mdast::Node;
 
 use crate::config::Config;
+use crate::ui::motion::{ENTER, MODAL, Motion};
 use crate::ui::palette;
 
 actions!(
@@ -126,6 +128,8 @@ pub struct LiveBlock {
     undo: Vec<(String, Range<usize>)>,
     redo: Vec<(String, Range<usize>)>,
     last_edit: Option<Instant>,
+    /// How far the marks are shown: they fade in as the block opens, out as it closes.
+    shown: Motion,
     _blur: Subscription,
 }
 
@@ -133,6 +137,13 @@ impl LiveBlock {
     pub fn new(text: String, caret: Caret, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         let blur = cx.on_blur(&focus, window, |_, _, cx| cx.emit(LiveEvent::Blur));
+        let mut shown = Motion::settled(0.);
+        shown.animate(
+            1.,
+            ENTER,
+            cx.background_executor().now(),
+            cx.reduce_motion(),
+        );
         Self {
             text,
             selected: 0..0,
@@ -146,8 +157,21 @@ impl LiveBlock {
             undo: Vec::new(),
             redo: Vec::new(),
             last_edit: None,
+            shown,
             _blur: blur,
         }
+    }
+
+    /// Fades the marks out, the way they came: the block is read again once they are gone.
+    pub fn close(&mut self, cx: &mut Context<Self>) {
+        self.selected = self.caret()..self.caret();
+        self.shown.animate(
+            0.,
+            MODAL,
+            cx.background_executor().now(),
+            cx.reduce_motion(),
+        );
+        cx.notify();
     }
 
     pub fn value(&self) -> &str {
@@ -683,10 +707,17 @@ fn selection(layout: &TextLayout, range: &Range<usize>) -> Vec<Bounds<Pixels>> {
 impl Render for LiveBlock {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
+        let now = cx.background_executor().now();
+        if self.shown.is_running(now) {
+            window.request_animation_frame();
+        }
+        let shown = self.shown.value(now);
+        let closing = self.shown.target() == 0.;
         let base = window.text_style();
         let code_font: SharedString = cx.global::<Config>().code_font.clone().into();
-        let runs = looks(&self.text)
-            .into_iter()
+        let looks = looks(&self.text);
+        let runs: Vec<TextRun> = looks
+            .iter()
             .map(|(range, look)| {
                 let mut font = base.font();
                 if look.mono {
@@ -703,7 +734,7 @@ impl Render for LiveBlock {
                     font,
                     color: match look.ink {
                         Ink::Text => base.color,
-                        Ink::Mark => p.faint,
+                        Ink::Mark => p.faint.opacity(shown),
                         Ink::Link => p.run,
                     },
                     background_color: look.shade.then_some(p.hover),
@@ -715,6 +746,28 @@ impl Render for LiveBlock {
                 }
             })
             .collect();
+        // The marks a first line starts with (`# `, `- `) push its text aside: it slides there
+        // as they appear, rather than jumping.
+        let prefix = looks
+            .first()
+            .filter(|(range, look)| {
+                look.ink == Ink::Mark
+                    && !self.text[range.clone()].contains('\n')
+                    && range.end < self.text.len()
+                    && !self.text.starts_with(['`', '~'])
+            })
+            .map_or(px(0.), |(range, _)| {
+                let font_size = base.font_size.to_pixels(window.rem_size());
+                window
+                    .text_system()
+                    .shape_line(
+                        self.text[range.clone()].to_string().into(),
+                        font_size,
+                        &runs[..1],
+                        None,
+                    )
+                    .width
+            });
         let text = StyledText::new(self.text.clone()).with_runs(runs);
         let layout = text.layout().clone();
         self.layout = Some(layout.clone());
@@ -724,7 +777,7 @@ impl Render for LiveBlock {
         let (caret_ink, selection_ink) = (p.acc, p.run.opacity(0.28));
         let placing = self.pending.is_some();
         div()
-            .key_context("LiveBlock")
+            .when(!closing, |d| d.key_context("LiveBlock"))
             .track_focus(&self.focus)
             .cursor_text()
             .on_action(cx.listener(Self::left))
@@ -759,6 +812,7 @@ impl Render for LiveBlock {
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .relative()
+            .left(-prefix * (1. - shown))
             .child(text)
             .child(
                 canvas(
@@ -766,6 +820,9 @@ impl Render for LiveBlock {
                     move |bounds, _, window, cx| {
                         if placing {
                             entity.update(cx, |this, cx| this.place(cx));
+                            return;
+                        }
+                        if closing {
                             return;
                         }
                         window.handle_input(

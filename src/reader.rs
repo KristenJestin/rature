@@ -25,6 +25,7 @@ use crate::render::{self, Ctx};
 use crate::start::key_hint;
 use crate::state::{self, State};
 use crate::ui::field::{field_style, focus_frame, follow_theme};
+use crate::ui::motion::MODAL;
 use crate::ui::toast::Toast;
 use crate::ui::{Button, Icon, Palette, Type, enter, icon, palette, space, toast};
 use crate::workspace::ToggleTree;
@@ -186,6 +187,10 @@ pub struct Reader {
     query: String,
     editing: Option<Editing>,
     code: Option<CodeFile>,
+    /// A block just edited, its marks fading out before it is read again.
+    closing: Option<(usize, Entity<LiveBlock>, Task<()>)>,
+    /// Blocks read again after an edit: they are back in place, they do not rise into it.
+    settled: HashSet<u64>,
     zoom: f32,
     _subscriptions: Vec<Subscription>,
 }
@@ -241,6 +246,8 @@ impl Reader {
             query: String::new(),
             editing: None,
             code: None,
+            closing: None,
+            settled: HashSet::new(),
             zoom: 1.,
             _subscriptions: subscriptions,
         }
@@ -916,7 +923,25 @@ impl Reader {
             return;
         }
         self.write_edit(cx);
-        self.editing = None;
+        let Some(editing) = self.editing.take() else {
+            return;
+        };
+        let (block, field) = (editing.block, editing.field);
+        field.update(cx, |field, cx| field.close(cx));
+        let done = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(MODAL).await;
+            this.update(cx, |this, cx| {
+                if let Some(doc) = this.document()
+                    && block < doc.blocks.len()
+                {
+                    this.settled.insert(fingerprint(doc.source_of(block)));
+                }
+                this.closing = None;
+                cx.notify();
+            })
+            .ok();
+        });
+        self.closing = Some((block, field, done));
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -1250,9 +1275,19 @@ impl Reader {
                         }
                     }
                     let mark = changes.map(|(_, c)| &c.marks[ix]);
-                    let editing = self.editing.as_ref().filter(|e| e.block == ix);
-                    let shown = match editing {
-                        Some(editing) => {
+                    let live = self
+                        .editing
+                        .as_ref()
+                        .filter(|e| e.block == ix)
+                        .map(|e| e.field.clone())
+                        .or_else(|| {
+                            self.closing
+                                .as_ref()
+                                .filter(|(block, ..)| *block == ix)
+                                .map(|(_, field, _)| field.clone())
+                        });
+                    let shown = match live {
+                        Some(field) => {
                             // In the type the block is read in: only its marks show.
                             let frame = div()
                                 .key_context("Editing")
@@ -1269,7 +1304,7 @@ impl Reader {
                                     .text_size(ctx.size(0.9)),
                                 _ => frame,
                             };
-                            frame.child(editing.field.clone()).into_any_element()
+                            frame.child(field).into_any_element()
                         }
                         None => self.block_element(ctx, doc, ix, block, mark, cx),
                     };
@@ -1354,11 +1389,12 @@ impl Reader {
             _ => inner,
         };
         // A block that arrives while the page is read rises into place.
-        let arrived = enter(
-            ElementId::Name(format!("block-{}", fingerprint(doc.source_of(ix))).into()),
-            0,
-            inner,
-        );
+        let print = fingerprint(doc.source_of(ix));
+        let arrived = if self.settled.contains(&print) {
+            inner
+        } else {
+            enter(ElementId::Name(format!("block-{print}").into()), 0, inner).into_any_element()
+        };
         div()
             .id(("block", ix))
             .child(arrived)
