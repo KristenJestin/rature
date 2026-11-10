@@ -981,7 +981,16 @@ impl Reader {
             }
         });
         match written {
-            Ok(true) => editing.original = text,
+            Ok(true) => {
+                // Your own change is read already: what is shown as new stays what others wrote.
+                if let Some(read) = state::last_read(&path)
+                    && read.matches(editing.original.as_str()).count() == 1
+                {
+                    state::mark_read(&path, &read.replacen(&editing.original, &text, 1));
+                    cx.emit(ReaderEvent::MarkedRead(path));
+                }
+                editing.original = text;
+            }
             Ok(false) => self.copy(
                 text,
                 "The block changed on disk: your text is in the clipboard",
@@ -1122,6 +1131,9 @@ impl Reader {
                 return Ok(false);
             }
             std::fs::write(&path, &formatted)?;
+            if state::last_read(&path).as_deref() == Some(now.as_str()) {
+                state::mark_read(&path, &formatted);
+            }
             if let Some(editing) = &mut self.editing {
                 // The block moved under the formatting: its text is the formatted one now.
                 let doc = document::parse(&formatted, "#000000", None);
