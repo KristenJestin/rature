@@ -597,7 +597,7 @@ mod tests {
     fn a_diagram_is_drawn_larger_than_it_shows() {
         let picture = crate::diagram::render(
             "flowchart LR\n A --> B",
-            &crate::diagram::Colors::of(&crate::ui::Palette::base()),
+            &crate::diagram::Colors::of(&gpui_design_system::Palette::base()),
         )
         .unwrap();
         let svg = std::str::from_utf8(picture.image.bytes()).unwrap();

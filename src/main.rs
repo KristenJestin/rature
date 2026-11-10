@@ -6,7 +6,9 @@ mod document;
 mod format;
 mod formats;
 mod highlight;
+mod icons;
 mod instance;
+mod kit;
 mod list;
 mod live;
 mod math;
@@ -17,9 +19,6 @@ mod start;
 mod state;
 mod table;
 mod tree;
-// Flottille's components, copied whole: not every one of them is used here.
-#[allow(dead_code)]
-mod ui;
 mod watch;
 mod workspace;
 
@@ -80,9 +79,13 @@ fn main() {
     }
 
     gpui_kit::application()
-        .with_assets(ui::Icons)
+        .with_assets(icons::Assets)
         .run(move |cx| {
-            ui::init(cx);
+            gpui_design_system::init(
+                gpui_design_system::Identity::new("Rature")
+                    .desktop(gpui_design_system::omarchy::Omarchy::from_system()),
+                cx,
+            );
             cx.set_global(config::Config::load());
             cx.set_global(state::State::load());
             cx.background_executor()

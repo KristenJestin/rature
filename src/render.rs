@@ -16,7 +16,7 @@ use crate::document::{Alert, Block, Inline, Item, Marks, Picture};
 use crate::formats::{Kind, Node, Value};
 use crate::highlight::Lines;
 use crate::reader::Reader;
-use crate::ui::{Icon, Palette, icon};
+use gpui_design_system::{Icon, Palette, icon};
 
 pub struct Ctx<'a, 'b> {
     pub theme: &'a Palette,
@@ -29,6 +29,8 @@ pub struct Ctx<'a, 'b> {
     /// What the search looks for, lowercased.
     pub query: Option<&'a str>,
     pub cx: &'a Context<'b, Reader>,
+    /// The colour of links in this theme.
+    pub link: Hsla,
     ids: Cell<u64>,
 }
 
@@ -53,6 +55,7 @@ impl<'a, 'b> Ctx<'a, 'b> {
             highlights,
             query,
             cx,
+            link: crate::kit::link(theme),
             ids: Cell::new(0),
         }
     }
@@ -70,7 +73,7 @@ impl<'a, 'b> Ctx<'a, 'b> {
 
 /// The ink formulas are drawn in, as `#rrggbb`: the text colour of the theme being shown.
 pub fn ink(cx: &App) -> String {
-    hex(crate::ui::theme::target_palette(cx).text)
+    hex(gpui_design_system::theme::target_palette(cx).text)
 }
 
 /// `color` as `#rrggbb`, for what is drawn as SVG.
@@ -87,7 +90,7 @@ pub fn hex(color: Hsla) -> String {
 
 /// Whether the theme being shown is dark: diagrams and code take their dark colours.
 pub fn is_dark(cx: &App) -> bool {
-    crate::ui::theme::target_palette(cx).bg.l < 0.5
+    gpui_design_system::theme::target_palette(cx).bg.l < 0.5
 }
 
 /// A heading's size, against the text's.
@@ -210,7 +213,7 @@ pub fn block(ctx: &Ctx, block: &Block) -> AnyElement {
             .text_size(ctx.size(0.88))
             .flex()
             .gap_2()
-            .child(div().text_color(t.link).child(format!("{label}.")))
+            .child(div().text_color(ctx.link).child(format!("{label}.")))
             .child(
                 div()
                     .flex_1()
@@ -318,7 +321,7 @@ pub fn marker(
             .into_any_element(),
         (None, true) => div()
             .text_color(t.faint)
-            .font_family(crate::ui::typography::MONO)
+            .font_family(gpui_design_system::typography::MONO)
             .text_size(size * 0.85)
             .child(format!("{number}."))
             .into_any_element(),
@@ -373,7 +376,7 @@ fn text_flow(ctx: &Ctx, inlines: &[Inline]) -> AnyElement {
             color: marks
                 .link
                 .as_ref()
-                .map(|_| if marks.broken { t.fail } else { t.link }),
+                .map(|_| if marks.broken { t.fail } else { ctx.link }),
             underline: marks.link.as_ref().map(|_| UnderlineStyle {
                 thickness: px(1.),
                 color: None,
@@ -509,7 +512,7 @@ fn word(ctx: &Ctx, text: &str, marks: &Marks, change: Change) -> AnyElement {
                 .px_1()
         })
         .when(marks.link.is_some(), |d| {
-            d.text_color(if marks.broken { t.fail } else { t.link })
+            d.text_color(if marks.broken { t.fail } else { ctx.link })
                 .underline()
                 .cursor_pointer()
         })

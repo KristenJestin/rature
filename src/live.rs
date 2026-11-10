@@ -14,8 +14,8 @@ use markdown::mdast::Node;
 use crate::config::Config;
 use crate::document::Links;
 use crate::highlight;
-use crate::ui::motion::{ENTER, MODAL, Motion};
-use crate::ui::palette;
+use gpui_design_system::motion::{ENTER, MODAL, Motion};
+use gpui_design_system::palette;
 
 actions!(
     live,
@@ -808,6 +808,7 @@ fn selection(layout: &TextLayout, range: &Range<usize>) -> Vec<Bounds<Pixels>> {
 impl Render for LiveBlock {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
+        let link = crate::kit::link(&p);
         let now = cx.background_executor().now();
         if self.shown.is_running(now) {
             window.request_animation_frame();
@@ -879,7 +880,7 @@ impl Render for LiveBlock {
                     color: match look.ink {
                         Ink::Text => look.colour.map_or(base.color, Hsla::from),
                         Ink::Mark => p.faint.opacity(shown),
-                        Ink::Link => p.link,
+                        Ink::Link => link,
                         Ink::Broken => p.fail,
                     },
                     background_color: look.shade.then_some(p.card2),

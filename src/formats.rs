@@ -4,7 +4,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::document::{self, Document};
-use crate::ui::Icon;
+use crate::icons;
+use gpui_design_system::Icon;
 
 /// Larger than this, a file is not read: Rature is for reading, not for logs.
 const LARGEST: u64 = 10 * 1024 * 1024;
@@ -60,11 +61,11 @@ pub fn icon(path: &Path) -> Icon {
     let ext = extension(path);
     match ext.as_str() {
         _ if is_markdown(path) => Icon::Text,
-        "json" | "yaml" | "yml" | "toml" => Icon::Data,
-        "csv" | "tsv" => Icon::Table,
-        _ if IMAGES.contains(&ext.as_str()) => Icon::Image,
+        "json" | "yaml" | "yml" | "toml" => icons::DATA,
+        "csv" | "tsv" => icons::TABLE,
+        _ if IMAGES.contains(&ext.as_str()) => icons::IMAGE,
         "" | "txt" | "log" => Icon::File,
-        _ => Icon::Code,
+        _ => icons::CODE,
     }
 }
 

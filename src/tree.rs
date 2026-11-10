@@ -11,11 +11,12 @@ use gpui_kit::*;
 use std::f32::consts::FRAC_PI_2;
 
 use crate::formats::{self, is_markdown};
-use crate::ui::color::{TEXT_CONTRAST, mix, readable};
-use crate::ui::listing::{Item, Listing};
-use crate::ui::rows::turning;
-use crate::ui::{Icon, Type, icon, palette, selectable, space};
+use crate::icons;
 use crate::{state, watch};
+use gpui_design_system::color::{TEXT_CONTRAST, mix, readable};
+use gpui_design_system::listing::{Item, Listing};
+use gpui_design_system::rows::turning;
+use gpui_design_system::{Icon, Type, icon, palette, selectable, space};
 
 actions!(tree, [Down, Up, Open, Close, First, Last]);
 
@@ -339,7 +340,7 @@ impl Tree {
         let selected = focused && self.selected.as_ref() == Some(&entry.path);
         let current = self.current.as_ref() == Some(&entry.path);
         // The open file in the link colour, made to read on the selection it sits on.
-        let open_ink = readable(p.link, p.sel, TEXT_CONTRAST);
+        let open_ink = readable(crate::kit::link(&p), p.sel, TEXT_CONTRAST);
         let changed = self.changed.contains(&entry.path);
         let open = entry.dir && self.open.contains(&entry.path);
         let name = entry
@@ -357,7 +358,7 @@ impl Tree {
                 .with_transformation(Transformation::rotate(radians(-FRAC_PI_2 * folded)))
         });
         let glyph = match (entry.dir, open) {
-            (true, true) => Icon::FolderOpen,
+            (true, true) => icons::FOLDER_OPEN,
             (true, false) => Icon::Folder,
             (false, _) => formats::icon(&entry.path),
         };
@@ -436,7 +437,7 @@ impl Render for Tree {
             now,
             reduce,
         );
-        let shown: Vec<(String, Entry, usize, crate::ui::listing::Placement)> = self
+        let shown: Vec<(String, Entry, usize, gpui_design_system::listing::Placement)> = self
             .list
             .rows()
             .map(|row| {

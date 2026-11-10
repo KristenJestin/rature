@@ -2371,6 +2371,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpui-design-system"
+version = "0.1.0"
+source = "git+https://github.com/KristenJestin/gpui-design-system?tag=v0.1.0#3eab807c66db8f1e4074ad3186689631ef4f299b"
+dependencies = [
+ "gpui-kit",
+ "toml 1.1.8+spec-1.1.0",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "gpui-fast"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6127,6 +6137,7 @@ dependencies = [
  "csv",
  "dprint-plugin-markdown",
  "futures",
+ "gpui-design-system",
  "gpui-kit",
  "ignore",
  "markdown",
@@ -6141,10 +6152,8 @@ dependencies = [
  "serde_json",
  "similar 3.2.1",
  "syntect",
- "tempfile",
  "toml 0.8.23",
  "two-face",
- "unicode-normalization",
  "yaml-rust2",
 ]
 

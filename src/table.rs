@@ -7,9 +7,10 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::document::Links;
+use crate::icons;
 use crate::live::{Caret, Edge, LiveBlock, LiveEvent};
 use crate::render;
-use crate::ui::{Button, Icon, Type, enter, palette, space};
+use gpui_design_system::{Button, Icon, Type, enter, palette, space};
 
 actions!(
     table,
@@ -393,19 +394,19 @@ fn tools(cx: &mut Context<TableEdit>) -> impl IntoElement {
         .child(label("ROW"))
         .child(tool(
             "row-above",
-            Icon::RowAbove,
+            icons::ROW_ABOVE,
             "Row above  Alt-Shift-↑",
             Box::new(RowAbove),
         ))
         .child(tool(
             "row-below",
-            Icon::RowBelow,
+            icons::ROW_BELOW,
             "Row below  Alt-Shift-↓",
             Box::new(RowBelow),
         ))
         .child(tool(
             "delete-row",
-            Icon::Delete,
+            Icon::Trash,
             "Delete the row  Alt-Shift-Backspace",
             Box::new(DeleteRow),
         ))
@@ -413,19 +414,19 @@ fn tools(cx: &mut Context<TableEdit>) -> impl IntoElement {
         .child(label("COLUMN"))
         .child(tool(
             "column-left",
-            Icon::ColumnLeft,
+            icons::COLUMN_LEFT,
             "Column on the left  Alt-Shift-←",
             Box::new(ColumnLeft),
         ))
         .child(tool(
             "column-right",
-            Icon::ColumnRight,
+            icons::COLUMN_RIGHT,
             "Column on the right  Alt-Shift-→",
             Box::new(ColumnRight),
         ))
         .child(tool(
             "delete-column",
-            Icon::Delete,
+            Icon::Trash,
             "Delete the column  Alt-Shift-Delete",
             Box::new(DeleteColumn),
         ))

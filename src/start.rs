@@ -11,9 +11,9 @@ use crate::formats;
 use crate::picker::shown;
 use crate::render::hex;
 use crate::state::State;
-use crate::ui::color::mix;
-use crate::ui::theme::target_palette;
-use crate::ui::{Button, Icon, Palette, Type, enter, icon, palette, selectable, space};
+use gpui_design_system::color::mix;
+use gpui_design_system::theme::target_palette;
+use gpui_design_system::{Button, Icon, Palette, Type, enter, icon, palette, selectable, space};
 
 actions!(start, [Next, Previous, Open]);
 

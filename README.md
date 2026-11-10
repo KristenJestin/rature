@@ -39,7 +39,7 @@ writes. Native, keyboard first, no webview.
   each line is edited beside its marker, `Enter` starts the next item, or on an empty one leaves the list,
   `Backspace` at an item's start takes its bullet away, `Tab` and `Shift-Tab` nest and un-nest it, a click ticks a box. Saved 800 ms after you stop typing, code too; `Ctrl-s` saves and formats (Markdown by
   dprint, JSON pretty-printed).
-- **Theme**: Flottille's own colours, or the current Omarchy theme, followed live: a theme
+- **Theme**: the design system's own colours, or the current Omarchy theme, followed live: a theme
   change cross-fades the open window, formulas and diagrams drawn again in its colours.
 
 ## Config
@@ -57,9 +57,10 @@ font_size = 16
 
 ## Stack
 
-Rust and GPUI through gpui-kit, as Flottille. No webview. The window is built from Flottille's
-own components (`src/ui/`, copied from `flottille-ui`): its colours, Geist and Geist Mono
-(bundled, SIL OFL), Lucide icons, buttons, rows, the search modal, toasts, and its motion
+Rust and GPUI through gpui-kit, as Flottille. No webview. The window is built from the components
+Flottille shares, [gpui-design-system](https://github.com/KristenJestin/gpui-design-system): its
+colours, Geist and Geist Mono (bundled, SIL OFL), Lucide icons, buttons, rows, the search modal,
+toasts, and its motion
 (entrances that rise and fade in, hovers and choices that fade, rows that fold, a theme that
 cross-fades). Markdown parsed by `markdown` (mdast)
 and drawn by our own elements; Mermaid by Merman and math by RaTeX, both to SVG;

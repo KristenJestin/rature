@@ -12,9 +12,9 @@ use crate::reader::{Jump, Reader, ReaderEvent};
 use crate::start::{Start, StartEvent};
 use crate::state::State;
 use crate::tree::{Tree, TreeEvent};
-use crate::ui::ToastStack;
-use crate::ui::motion::PANEL;
-use crate::ui::{fade, palette};
+use gpui_design_system::ToastStack;
+use gpui_design_system::motion::PANEL;
+use gpui_design_system::{fade, palette};
 
 actions!(
     workspace,
@@ -221,7 +221,7 @@ impl Workspace {
                 let closing = this.picker.as_ref().map(|(p, _)| p.downgrade());
                 cx.spawn(async move |this, cx| {
                     cx.background_executor()
-                        .timer(crate::ui::motion::MODAL)
+                        .timer(gpui_design_system::motion::MODAL)
                         .await;
                     this.update(cx, |this, cx| {
                         if this.picker.as_ref().map(|(p, _)| p.downgrade()) == closing {

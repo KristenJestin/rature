@@ -9,7 +9,7 @@ use gpui_kit::*;
 use crate::document::Links;
 use crate::live::{Caret, Edge, LiveBlock, LiveEvent};
 use crate::render;
-use crate::ui::{palette, space};
+use gpui_design_system::{palette, space};
 
 actions!(list, [Indent, Outdent]);
 

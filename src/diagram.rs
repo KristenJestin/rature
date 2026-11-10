@@ -9,7 +9,7 @@ use merman::{
 
 use crate::document::Picture;
 use crate::render::hex;
-use crate::ui::Palette;
+use gpui_design_system::Palette;
 
 /// GPUI draws an SVG at its own size: drawn this many times larger and shown at its size, it
 /// stays sharp on a scaled screen.

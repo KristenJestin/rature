@@ -12,12 +12,14 @@ use nucleo_matcher::{Config as MatcherConfig, Matcher};
 
 use crate::config::home;
 use crate::formats;
-use crate::ui::field::{focus_frame, follow_theme};
-use crate::ui::listing::{Item, Listing};
-use crate::ui::modal::Modal;
-use crate::ui::page::EmptyLine;
-use crate::ui::rows::ListRow;
-use crate::ui::{Icon, Type, icon, palette, presence, space};
+use crate::icons;
+use crate::kit::focus_frame;
+use gpui_design_system::field::follow_theme;
+use gpui_design_system::listing::{Item, Listing};
+use gpui_design_system::modal::Modal;
+use gpui_design_system::page::EmptyLine;
+use gpui_design_system::rows::ListRow;
+use gpui_design_system::{Icon, Type, icon, palette, presence, space};
 
 /// How many results the box keeps.
 const SHOWN: usize = 200;
@@ -530,7 +532,7 @@ impl Choice {
     fn icon(&self) -> Icon {
         match &self.target {
             Target::File(path) | Target::Open(path) | Target::Line(path, _) => formats::icon(path),
-            Target::Block(_) => Icon::Outline,
+            Target::Block(_) => icons::OUTLINE,
         }
     }
 }

@@ -20,18 +20,20 @@ use crate::document::{self, Block, Document, Links, Picture};
 use crate::formats::{self, Content};
 use crate::highlight::Highlighter;
 use crate::highlight::{self, Lines};
+use crate::icons;
+use crate::kit::focus_frame;
 use crate::list::{self, ListEdit};
 use crate::live::{Caret, Edge, LiveBlock, LiveEvent};
 use crate::render::{self, Ctx};
 use crate::start::key_hint;
 use crate::state::{self, State};
 use crate::table::TableEdit;
-use crate::ui::field::{field_style, focus_frame, follow_theme};
-use crate::ui::motion::MODAL;
-use crate::ui::toast::Toast;
-use crate::ui::{Button, Icon, Palette, Type, enter, icon, palette, space, toast};
 use crate::workspace::ToggleTree;
 use crate::{diagram, format, watch};
+use gpui_design_system::field::{field_style, follow_theme};
+use gpui_design_system::motion::MODAL;
+use gpui_design_system::toast::Toast;
+use gpui_design_system::{Button, Icon, Palette, Type, enter, icon, palette, space, toast};
 
 /// What `j` and `k` move.
 const LINE: f32 = 64.;
@@ -274,7 +276,7 @@ impl Reader {
                 },
             ),
             // Each frame of a theme's cross-fade touches it: drawn again only for a new ink.
-            cx.observe_global::<crate::ui::theme::Theme>(|this, cx| {
+            cx.observe_global::<gpui_design_system::theme::Theme>(|this, cx| {
                 if this.ink != render::ink(cx) {
                     this.restyle(cx)
                 }
@@ -414,7 +416,7 @@ impl Reader {
 
     fn set_content(&mut self, content: Content, cx: &mut Context<Self>) {
         let dark = render::is_dark(cx);
-        let colors = diagram::Colors::of(&crate::ui::theme::target_palette(cx));
+        let colors = diagram::Colors::of(&gpui_design_system::theme::target_palette(cx));
         // Diagrams: each new one is drawn in the background, the one that stood at its place
         // shown meanwhile so the page does not jump.
         let (mut sources, mut before) = (Vec::new(), Vec::new());
@@ -1315,9 +1317,9 @@ impl Reader {
         };
         let panel = self.tree.map(|(side, shown)| {
             let glyph = match (side, shown) {
-                (Side::Left, true) => Icon::PanelLeftClose,
-                (Side::Left, false) => Icon::PanelLeft,
-                (Side::Right, true) => Icon::PanelRightClose,
+                (Side::Left, true) => icons::PANEL_LEFT_CLOSE,
+                (Side::Left, false) => icons::PANEL_LEFT,
+                (Side::Right, true) => icons::PANEL_RIGHT_CLOSE,
                 (Side::Right, false) => Icon::PanelRight,
             };
             let tip = if shown {
