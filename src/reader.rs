@@ -3,10 +3,14 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Duration;
 
 use futures::StreamExt as _;
-use gpui_kit::base::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::base::input::{
+    Editor, EditorState, Input, InputEditorStyle, InputEvent, InputHighlighter, InputState,
+    Textarea, TextareaState,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -15,10 +19,11 @@ use crate::config::{Config, Side};
 use crate::diff::{self, Changes, Mark};
 use crate::document::{self, Block, Document, Picture};
 use crate::formats::{self, Content};
+use crate::highlight::Highlighter;
 use crate::highlight::{self, Lines};
 use crate::render::{self, Ctx};
 use crate::state::{self, State};
-use crate::ui::field::{focus_frame, follow_theme, ring};
+use crate::ui::field::{field_style, focus_frame, follow_theme, ring};
 use crate::ui::toast::Toast;
 use crate::ui::{Button, Icon, Type, enter, icon, palette, space, toast};
 use crate::workspace::ToggleTree;
@@ -73,7 +78,6 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-d", HalfPageDown, at),
         KeyBinding::new("ctrl-u", HalfPageUp, at),
         KeyBinding::new("space", PageDown, at),
-        KeyBinding::new("ctrl-f", PageDown, at),
         KeyBinding::new("pagedown", PageDown, at),
         KeyBinding::new("shift-space", PageUp, at),
         KeyBinding::new("ctrl-b", PageUp, at),
@@ -137,6 +141,15 @@ enum Baseline {
     Head,
 }
 
+/// A file of code, shown in an editor: it is changed where it is read.
+struct CodeFile {
+    field: Entity<EditorState>,
+    /// The text as the file holds it: as read, or as last written.
+    on_disk: String,
+    autosave: Option<Task<()>>,
+    _events: Subscription,
+}
+
 struct Editing {
     block: usize,
     /// The block's source as last written: what is looked for in the file to replace it.
@@ -171,6 +184,7 @@ pub struct Reader {
     searching: bool,
     query: String,
     editing: Option<Editing>,
+    code: Option<CodeFile>,
     zoom: f32,
     _subscriptions: Vec<Subscription>,
 }
@@ -225,6 +239,7 @@ impl Reader {
             searching: false,
             query: String::new(),
             editing: None,
+            code: None,
             zoom: 1.,
             _subscriptions: subscriptions,
         }
@@ -288,6 +303,7 @@ impl Reader {
             }
         };
         self.path = Some(path.clone());
+        self.code = None;
         self.folded.clear();
         self.scroll.set_offset(point(px(0.), px(0.)));
         self.reload(cx);
@@ -318,6 +334,8 @@ impl Reader {
     /// The colours changed: what was drawn in the old ones is drawn again.
     fn restyle(&mut self, cx: &mut Context<Self>) {
         self.ink = render::ink(cx);
+        // Coloured again in the new theme's colours.
+        self.code = None;
         self.drawings.clear();
         self.highlights.clear();
         match self.path {
@@ -815,6 +833,10 @@ impl Reader {
 
     /// Edits the first block of the window, in place.
     fn edit_first_block(&mut self, _: &EditBlock, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(code) = &self.code {
+            let focus = code.field.read(cx).focus_handle(cx);
+            return window.focus(&focus, cx);
+        }
         let (top, within) = self.scroll.logical_scroll_top();
         // A block more than half gone above is not the one being read.
         let block = if within < px(-40.) { top + 1 } else { top };
@@ -909,12 +931,87 @@ impl Reader {
     }
 
     fn stop_editing(&mut self, _: &StopEditing, window: &mut Window, cx: &mut Context<Self>) {
+        if self.code.is_some() {
+            self.write_code(cx);
+            return window.focus(&self.focus, cx);
+        }
         self.finish_editing(window, cx);
+    }
+
+    /// The code editor of the file shown, made the first time it is drawn and given the file's
+    /// text again when something else changes it on disk.
+    fn sync_code(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Content::Code { lang, text } = &self.content else {
+            self.code = None;
+            return;
+        };
+        if let Some(code) = &mut self.code {
+            if code.on_disk != *text {
+                code.on_disk = text.clone();
+                code.autosave = None;
+                let text = text.clone();
+                code.field
+                    .update(cx, |field, cx| field.set_value(text, window, cx));
+            }
+            return;
+        }
+        let (lang, text) = (lang.clone(), text.clone());
+        let dark = render::is_dark(cx);
+        let style = InputEditorStyle {
+            background: palette(cx).bg,
+            ..field_style(cx)
+        };
+        let field = cx.new(|cx| {
+            let mut field = EditorState::new(window, cx)
+                .line_number(false)
+                .indent_guides(false)
+                .folding(false)
+                .language(lang);
+            field.set_highlighter_factory(
+                Rc::new(move |lang: &str| {
+                    Some(Box::new(Highlighter::new(lang, dark)) as Box<dyn InputHighlighter>)
+                }),
+                cx,
+            );
+            field.set_editor_style(style);
+            field.set_value(text.clone(), window, cx);
+            field
+        });
+        let events = cx.subscribe(&field, |this, _, event: &InputEvent, cx| {
+            if let (InputEvent::Change, Some(code)) = (event, &mut this.code) {
+                code.autosave = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(AUTOSAVE).await;
+                    this.update(cx, |this, cx| this.write_code(cx)).ok();
+                }));
+            }
+        });
+        self.code = Some(CodeFile {
+            field,
+            on_disk: text,
+            autosave: None,
+            _events: events,
+        });
+    }
+
+    /// Writes the code editor's text into the file, when it differs from it.
+    fn write_code(&mut self, cx: &mut Context<Self>) {
+        let (Some(path), Some(code)) = (self.path.clone(), &mut self.code) else {
+            return;
+        };
+        let text = code.field.read(cx).value().to_string();
+        if text == code.on_disk {
+            return;
+        }
+        match std::fs::write(&path, &text) {
+            Ok(()) => code.on_disk = text,
+            Err(error) => self.fail(format!("Cannot write: {error}"), cx),
+        }
     }
 
     /// Writes the edit, then formats the whole file as its kind says.
     fn save(&mut self, _: &Save, window: &mut Window, cx: &mut Context<Self>) {
         self.write_edit(cx);
+        self.write_code(cx);
         let Some(path) = self.path.clone() else {
             return;
         };
@@ -1321,7 +1418,12 @@ impl Render for Reader {
             .and_then(Path::parent)
             .map(Path::to_path_buf);
         let query = (!self.query.is_empty()).then(|| self.query.clone());
-        let editing = self.editing.is_some();
+        self.sync_code(window, cx);
+        let code = self.code.as_ref().map(|code| code.field.clone());
+        let editing = self.editing.is_some()
+            || code
+                .as_ref()
+                .is_some_and(|field| field.read(cx).focus_handle(cx).contains_focused(window, cx));
         let items = {
             let ctx = Ctx::new(
                 &t,
@@ -1381,19 +1483,35 @@ impl Render for Reader {
                     .on_action(cx.listener(Self::zoom_out))
                     .on_action(cx.listener(Self::zoom_reset))
                     .flex_1()
+                    .min_h_0()
                     .w_full()
                     .text_color(t.text)
                     .font_family(config.font.clone())
                     .text_size(px(config.font_size * self.zoom))
                     .line_height(rems(1.6))
-                    .track_scroll(&self.scroll)
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .pt(space::XXXL)
-                    .pb(px(160.))
-                    .children(items),
+                    .map(|d| match code {
+                        // The editor scrolls itself.
+                        Some(field) => d.pt(space::XL).px_8().child(
+                            div()
+                                .key_context("Editing")
+                                .on_action(cx.listener(Self::stop_editing))
+                                .on_action(cx.listener(Self::save))
+                                .size_full()
+                                .font_family(config.code_font.clone())
+                                .text_size(px(config.font_size * 0.9 * self.zoom))
+                                .line_height(rems(1.5))
+                                .child(Editor::new(&field)),
+                        ),
+                        None => d
+                            .track_scroll(&self.scroll)
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .pt(space::XXXL)
+                            .pb(px(160.))
+                            .children(items),
+                    }),
             )
     }
 }

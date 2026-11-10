@@ -19,8 +19,9 @@ writes. Native, keyboard first, no webview.
 - **Markdown**: tables, task lists, footnotes, highlighted code (copy button), Mermaid diagrams,
   math (inline and display), YAML front matter, GitHub alerts. Diagrams and code are drawn in the
   background.
-- **Other formats, read only**: JSON and YAML as foldable trees, CSV as a table, images, code
-  highlighted by extension. Binary files and files over 10 MB are refused.
+- **Other formats**: JSON and YAML as foldable trees, CSV as a table, images, read only. Code
+  opens in an editor, highlighted by extension: click in it or `i`, `Esc` to leave. Binary files
+  and files over 10 MB are refused.
 - **Links**: relative links to files and anchors, back and forward, an outline. Broken links are
   red. Clicking a heading copies its link (`file.md#slug`).
 - **Search**: in the file (`Ctrl-F`), across the folder through ripgrep (`s`), files by a few letters
@@ -30,7 +31,7 @@ writes. Native, keyboard first, no webview.
   changed ones yellow with their changed words, removed ones struck in red. The first opening
   takes the snapshot; `m` marks the current state read.
 - **Edit in place**: double-click a block, or `i` for the block at the top, and its Markdown opens
-  where it was. Saved 800 ms after you stop typing; `Ctrl-s` saves and formats (Markdown by
+  where it was. Saved 800 ms after you stop typing, code too; `Ctrl-s` saves and formats (Markdown by
   dprint, JSON pretty-printed).
 - **Theme**: Flottille's own colours, or the current Omarchy theme, followed live: a theme
   change cross-fades the open window, formulas and diagrams drawn again in its colours.
