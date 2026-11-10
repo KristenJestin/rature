@@ -62,7 +62,7 @@ own components (`src/ui/`, copied from `flottille-ui`): its colours, Geist and G
 (bundled, SIL OFL), Lucide icons, buttons, rows, the search modal, toasts, and its motion
 (entrances that rise and fade in, hovers and choices that fade, rows that fold, a theme that
 cross-fades). Markdown parsed by `markdown` (mdast)
-and drawn by our own elements; Mermaid by `mermaid-rs-renderer` and math by RaTeX, both to SVG;
+and drawn by our own elements; Mermaid by Merman and math by RaTeX, both to SVG;
 syntect with two-face for code; `similar` for the diff; `notify` to follow files; `nucleo` for
 the file finder; dprint for Markdown formatting.
 

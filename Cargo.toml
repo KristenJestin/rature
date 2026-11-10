@@ -10,7 +10,7 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 gpui-kit = { version = "=0.8.0", default-features = false, features = ["assets", "gpui-fast"] }
 ignore = "0.4.34"
 markdown = "1"
-mermaid-rs-renderer = { version = "0.3.1", default-features = false }
+merman = { version = "=0.10.0-alpha.2", default-features = false, features = ["all-diagrams", "complete-svg"] }
 notify = { version = "8", default-features = false }
 nucleo-matcher = "0.3.1"
 ratex-layout = "0.1.15"

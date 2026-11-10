@@ -1,7 +1,11 @@
 use std::sync::Arc;
 
 use gpui_kit::{Image, ImageFormat};
-use mermaid_rs_renderer::{RenderOptions, Theme};
+use merman::svg::SvgPipeline;
+use merman::{
+    MermaidEngine, OperationControl, RenderOutput, RenderRequest, Renderer,
+    SourcePresentationConfig, SvgRequest,
+};
 
 use crate::document::Picture;
 use crate::render::hex;
@@ -15,6 +19,7 @@ pub const SCALE: f32 = 2.0;
 #[derive(Clone)]
 pub struct Colors {
     pub dark: bool,
+    pub background: String,
     pub fill: String,
     pub border: String,
     pub text: String,
@@ -25,6 +30,7 @@ impl Colors {
     pub fn of(p: &Palette) -> Self {
         Self {
             dark: p.bg.l < 0.5,
+            background: hex(p.bg),
             fill: hex(p.card),
             border: hex(p.line2),
             text: hex(p.text),
@@ -35,23 +41,57 @@ impl Colors {
 
 /// Draws `source` in the colours of the theme.
 pub fn render(source: &str, colors: &Colors) -> Result<Picture, String> {
-    let options = RenderOptions {
-        theme: theme(colors),
-        ..RenderOptions::default()
+    let site = SourcePresentationConfig::from_value(serde_json::json!({
+        "theme": "base",
+        "fontFamily": "Geist, sans-serif",
+        "themeVariables": {
+            "darkMode": colors.dark,
+            "background": colors.background,
+            "primaryColor": colors.fill,
+            "secondaryColor": colors.fill,
+            "tertiaryColor": colors.fill,
+            "primaryBorderColor": colors.border,
+            "primaryTextColor": colors.text,
+            "textColor": colors.text,
+            "lineColor": colors.line,
+            "edgeLabelBackground": colors.background,
+            "clusterBkg": "transparent",
+            "clusterBorder": colors.border,
+        }
+    }));
+    let renderer =
+        Renderer::new().with_presentation_engine(MermaidEngine::new().with_site_config(site));
+    // GPUI draws SVG with resvg, which shows no HTML labels: this pipeline turns them into text.
+    let request = SvgRequest {
+        pipeline: Some(SvgPipeline::resvg_safe()),
+        ..SvgRequest::default()
     };
-    let size = mermaid_rs_renderer::measure(source, options.clone()).map_err(|e| e.to_string())?;
-    let svg =
-        mermaid_rs_renderer::render_with_options(source, options).map_err(|e| e.to_string())?;
+    let output = renderer
+        .render(RenderRequest::svg(source, OperationControl::new(), request))
+        .map_err(|e| e.to_string())?;
+    let RenderOutput::Svg(Some(svg)) = output else {
+        return Err("Not a Mermaid diagram".into());
+    };
+    let svg = svg.svg();
+    let (width, height) = size(svg).ok_or("The diagram has no size")?;
     let scaled = svg.replacen(
-        &format!("width=\"{}\" height=\"{}\"", size.width, size.height),
+        "width=\"100%\"",
         &format!(
             "width=\"{}\" height=\"{}\"",
-            size.width * SCALE,
-            size.height * SCALE
+            width * SCALE,
+            height * SCALE
         ),
         1,
     );
-    Ok(picture(scaled, size.width, size.height))
+    Ok(picture(scaled, width, height))
+}
+
+/// The width and height of the root `viewBox`.
+fn size(svg: &str) -> Option<(f32, f32)> {
+    let start = svg.find("viewBox=\"")? + "viewBox=\"".len();
+    let end = start + svg[start..].find('"')?;
+    let mut numbers = svg[start..end].split_whitespace().skip(2);
+    Some((numbers.next()?.parse().ok()?, numbers.next()?.parse().ok()?))
 }
 
 pub fn picture(svg: String, width: f32, height: f32) -> Picture {
@@ -61,30 +101,4 @@ pub fn picture(svg: String, width: f32, height: f32) -> Picture {
         height,
         depth: 0.,
     }
-}
-
-fn theme(colors: &Colors) -> Theme {
-    let mut theme = if colors.dark {
-        Theme::dark()
-    } else {
-        Theme::modern()
-    };
-    theme.background = "transparent".into();
-    theme.font_family = "Geist, sans-serif".into();
-    theme.primary_color = colors.fill.clone();
-    theme.secondary_color = colors.fill.clone();
-    theme.tertiary_color = colors.fill.clone();
-    theme.primary_border_color = colors.border.clone();
-    theme.primary_text_color = colors.text.clone();
-    theme.text_color = colors.text.clone();
-    theme.line_color = colors.line.clone();
-    theme.edge_label_background = "transparent".into();
-    theme.cluster_background = "transparent".into();
-    theme.cluster_border = colors.border.clone();
-    theme.sequence_actor_fill = colors.fill.clone();
-    theme.sequence_actor_border = colors.border.clone();
-    theme.sequence_actor_line = colors.line.clone();
-    theme.sequence_note_fill = colors.fill.clone();
-    theme.sequence_note_border = colors.border.clone();
-    theme
 }
