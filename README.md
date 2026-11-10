@@ -23,7 +23,7 @@ writes. Native, keyboard first, no webview.
   highlighted by extension. Binary files and files over 10 MB are refused.
 - **Links**: relative links to files and anchors, back and forward, an outline. Broken links are
   red. Clicking a heading copies its link (`file.md#slug`).
-- **Search**: in the file (`/`), across the folder through ripgrep (`s`), files by a few letters
+- **Search**: in the file (`Ctrl-F`), across the folder through ripgrep (`s`), files by a few letters
   (`f`, recent first).
 - **Live reload**: written in place or replaced by a rename, the file is read again where you are.
 - **What changed**: since the last read (or against git `HEAD`), block by block: new blocks green,
@@ -78,7 +78,7 @@ rename, as an agent does, it is read again where you are.
 | `Ctrl-d` `Ctrl-u` | half a page |
 | `Space` `Shift-Space`, `Ctrl-f` `Ctrl-b` | a page |
 | `gg` `G`, `Home` `End` | top, bottom |
-| `/`, `n` `N`, `Esc` | search the file, next and previous hit, clear |
+| `Ctrl-F`, `n` `N`, `Esc` | search the file, next and previous hit, clear |
 | `f`, `Ctrl-p` | find a file (with nothing open: open one) |
 | `O` | open a recent file or folder, or a path (`Tab` completes) |
 | `s`, `Ctrl-Shift-f` | search the folder (ripgrep) |

@@ -84,7 +84,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("end", Bottom, at),
         KeyBinding::new("e", OpenInNvim, at),
         KeyBinding::new("q", Quit, at),
-        KeyBinding::new("/", Search, at),
+        KeyBinding::new("ctrl-f", Search, at),
         KeyBinding::new("n", NextHit, at),
         KeyBinding::new("shift-n", PreviousHit, at),
         KeyBinding::new("escape", ClearSearch, at),
@@ -1128,16 +1128,8 @@ impl Reader {
                 d.child(act(
                     "search",
                     Icon::Search,
-                    "Search  /",
+                    "Search  Ctrl-F",
                     |this, window, cx| this.search(&Search, window, cx),
-                ))
-            })
-            .when(self.path.is_some(), |d| {
-                d.child(act(
-                    "open-in-nvim",
-                    Icon::OpenInEditor,
-                    "Open in nvim  e",
-                    |this, window, cx| this.open_in_nvim(&OpenInNvim, window, cx),
                 ))
             })
             .children(right)
