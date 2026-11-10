@@ -6,5 +6,6 @@ Comment=Read and edit Markdown, and see what changed
 Exec=rature %f
 Icon=rature
 Terminal=false
-Categories=Utility;TextEditor;Viewer;
+MimeType=text/markdown;
+Categories=Utility;TextEditor;
 StartupWMClass=rature

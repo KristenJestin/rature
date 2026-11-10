@@ -4,13 +4,14 @@
 //! tree = "left"        # or "right": where a folder's tree stands
 //! tree_width = 260
 //! column = 760         # the reading column's width
-//! font = "Noto Sans"
+//! font = "Geist"       # the text read; Geist and Geist Mono are bundled
 //! code_font = "Geist Mono"
 //! font_size = 16
 //! ```
 
 use std::path::PathBuf;
 
+use gpui_design_system::typography;
 use gpui_kit::Global;
 use serde::Deserialize;
 
@@ -38,8 +39,9 @@ impl Default for Config {
             tree: Side::Left,
             tree_width: 260.,
             column: 760.,
-            font: "Noto Sans".into(),
-            code_font: "Geist Mono".into(),
+            // Both registered with the text system by `gpui_design_system::init`.
+            font: typography::UI.into(),
+            code_font: typography::MONO.into(),
             font_size: 16.,
         }
     }
@@ -84,5 +86,13 @@ mod tests {
         assert!(config.tree == Side::Right);
         assert_eq!(config.font_size, 18.);
         assert_eq!(config.column, 760.);
+        assert_eq!(config.font, "Geist");
+    }
+
+    #[test]
+    fn the_fonts_can_be_overridden() {
+        let config: Config = toml::from_str("font = \"Noto Sans\"\n").unwrap();
+        assert_eq!(config.font, "Noto Sans");
+        assert_eq!(config.code_font, "Geist Mono");
     }
 }

@@ -3,6 +3,9 @@
 A minimal Markdown reader you can also edit in place, for proofreading what an agent (or anyone)
 writes. Native, keyboard first, no webview.
 
+Linux only: one window per user through a Unix socket, `e` opening nvim through
+`xdg-terminal-exec`, the XDG file chooser, and the theme followed through Omarchy's hook.
+
 ## What it does
 
 ![Started without a file](docs/images/start.png)
@@ -15,16 +18,21 @@ writes. Native, keyboard first, no webview.
   buttons to the desktop's file chooser (XDG portal). `f` there, or `O` at any time, opens one by
   its path, Tab completing it.
 - **No trace in the folder**: config in `~/.config/rature/config.toml`, reading positions, recent
-  files and read snapshots in `~/.local/state/rature`.
+  files and read snapshots in `$XDG_STATE_HOME/rature` (`~/.local/state/rature`), readable by you
+  alone. Snapshots are kept for the 500 most recent files and 90 days at most, positions for
+  1000 files.
 - **Markdown**: tables, task lists, footnotes, highlighted code (copy button), Mermaid diagrams,
-  math (inline and display), YAML front matter, GitHub alerts. Diagrams and code are drawn in the
-  background.
+  math (inline and display), YAML front matter, GitHub alerts. Diagrams and code highlighting are
+  drawn in the background.
 - **Other formats**: JSON and YAML as foldable trees, CSV as a table, images, read only. Code
   opens in an editor, highlighted by extension: click in it or `i`, `Esc` to leave. Binary files
-  and files over 10 MB are refused.
+  and text files over 10 MB are refused (`e` opens them in nvim); images are shown whatever
+  their size. Text that is not valid UTF-8 is shown read only. Only regular files are opened:
+  no pipes or devices.
 - **Links**: relative links to files and anchors, back and forward, an outline. `Ctrl`-click
-  follows a link, a plain click edits it like any text. Broken links are red. Clicking a heading copies its link (`file.md#slug`).
-- **Search**: in the file (`Ctrl-F`), across the folder through ripgrep (`s`), files by a few letters
+  follows a link (outside Rature: `http`, `https` and `mailto` only), a plain click edits it like
+  any text. Broken links are red. Clicking a heading copies its link (`file.md#slug`).
+- **Search**: in the file (`Ctrl-f`), across the folder through ripgrep (`s`), files by a few letters
   (`f`, recent first).
 - **Live reload**: written in place or replaced by a rename, the file is read again where you are.
 - **What changed**: since the last read (or against git `HEAD`), block by block: new blocks green,
@@ -37,10 +45,14 @@ writes. Native, keyboard first, no webview.
   where it is, `Tab` to the next one, rows and columns added and deleted from the tools over it
   (`Alt-Shift` and an arrow, `Backspace` or `Delete`), and the table is written back as Markdown. A list keeps its bullets, numbers and task boxes:
   each line is edited beside its marker, `Enter` starts the next item, or on an empty one leaves the list,
-  `Backspace` at an item's start takes its bullet away, `Tab` and `Shift-Tab` nest and un-nest it, a click ticks a box. Saved 800 ms after you stop typing, code too; `Ctrl-s` saves and formats (Markdown by
+  `Backspace` at an item's start takes its bullet away, `Tab` and `Shift-Tab` nest and un-nest it, a click ticks a box. Saved 800 ms after you stop typing, code too, whole or not at all (a new file renamed over the
+  old one, its permissions kept, a link followed to its file). Written meanwhile by another
+  program, the file is not overwritten: a Markdown block is merged into its new text, otherwise
+  what you typed goes to the clipboard. `Ctrl-s` saves and formats (Markdown by
   dprint, JSON pretty-printed).
-- **Theme**: the design system's own colours, or the current Omarchy theme, followed live: a theme
-  change cross-fades the open window, formulas and diagrams drawn again in its colours.
+- **Theme**: the design system's own colours, or, on [Omarchy](https://omarchy.org) (an Arch
+  Linux and Hyprland setup), its current theme, followed live: a theme change cross-fades the
+  open window, formulas and diagrams drawn again in its colours.
 
 ## Config
 
@@ -50,15 +62,15 @@ writes. Native, keyboard first, no webview.
 tree = "left"            # or "right"
 tree_width = 260
 column = 760             # reading width
-font = "Noto Sans"       # the text read
+font = "Geist"           # the text read, bundled
 code_font = "Geist Mono" # code, bundled
 font_size = 16
 ```
 
 ## Stack
 
-Rust and GPUI through gpui-kit, as Flottille. No webview. The window is built from the components
-Flottille shares, [gpui-design-system](https://github.com/KristenJestin/gpui-design-system): its
+Rust and GPUI through gpui-kit, as Flottille (the author's desktop app that runs coding agents).
+No webview. The window is built from the components Flottille shares, [gpui-design-system](https://github.com/KristenJestin/gpui-design-system): its
 colours, Geist and Geist Mono (bundled, SIL OFL), Lucide icons, buttons, rows, the search modal,
 toasts, and its motion
 (entrances that rise and fade in, hovers and choices that fade, rows that fold, a theme that
@@ -70,9 +82,10 @@ the file finder; dprint for Markdown formatting.
 ## Installing
 
 `./install.sh` builds this clone and installs `rature` into `~/.local/bin`, with `rt` a link to
-it, and adds Rature to the application launcher (entry and icon in `$XDG_DATA_HOME`). Run it
-again to update. Started from the launcher, without a file, it shows the recent files and
-folders.
+it, and adds Rature to the application launcher (entry and icon in `$XDG_DATA_HOME`). No root.
+An `rt` that is not already Rature's link is left alone and the install stops (`--no-rt` installs
+without the link). Run it again to update; `./install.sh --uninstall` removes what it installed. Started from the launcher, without
+a file, it shows the recent files and folders.
 
 ## Using
 
@@ -84,9 +97,10 @@ rename, as an agent does, it is read again where you are.
 |---|---|
 | `j` `k`, arrows | line down, up |
 | `Ctrl-d` `Ctrl-u` | half a page |
-| `Space` `Shift-Space`, `Ctrl-f` `Ctrl-b` | a page |
+| `Space` `PageDown` | a page down |
+| `Shift-Space` `PageUp` `Ctrl-b` | a page up |
 | `gg` `G`, `Home` `End` | top, bottom |
-| `Ctrl-F`, `n` `N`, `Esc` | search the file, next and previous hit, clear |
+| `Ctrl-f`, `n` `N`, `Esc` | search the file, next and previous hit, clear |
 | `f`, `Ctrl-p` | find a file (with nothing open: open one) |
 | `O` | open a recent file or folder, or a path (`Tab` completes) |
 | `s`, `Ctrl-Shift-f` | search the folder (ripgrep) |
@@ -96,12 +110,13 @@ rename, as an agent does, it is read again where you are.
 | `m` | mark read |
 | `D` | compare with the last read or with git `HEAD` |
 | `i`, click | edit a block; `Esc` or `Ctrl-Enter` to stop |
+| editing: `Ctrl-z`, `Ctrl-Shift-z` `Ctrl-y` | undo, redo |
 | `Ctrl-s` | save and format |
 | `zM` `zR` | fold, unfold every JSON or YAML node |
-| `Ctrl-=` `Ctrl--` `Ctrl-0` | zoom |
+| `Ctrl-=` (or `Ctrl-+`) `Ctrl--` `Ctrl-0` | zoom in, out, reset |
 | `t` | show, hide the tree (or the button at the corner of the bar) |
 | `Ctrl-h` `Ctrl-l` | to the tree, to the page |
-| tree: `j` `k` `l` `h`, `Enter` | move, open, close |
+| tree: `j` `k`, `l` `Enter`, `h`, `gg` `G` (arrows too) | move, open, close, first, last |
 | `e` | the file in nvim, in the desktop's terminal (`xdg-terminal-exec`) |
 | `q` | quit |
 
@@ -120,3 +135,14 @@ First frame: about 170 ms for a file, 175 to 230 ms for a folder (release build,
   Enter splits a block only once it is saved.
 - "What changed" covers Markdown files. A paragraph holding math is shown old and new, not word
   by word. Your own edits count as changes until `m`.
+- Linux only (see the top).
+
+## License
+
+Rature is free software under the GNU Affero General Public License, version 3 only
+(`AGPL-3.0-only`): see [LICENSE](LICENSE).
+
+Geist and Geist Mono are by Vercel ([The Geist Project Authors](https://github.com/vercel/geist-font)),
+under the SIL Open Font License 1.1
+([assets/fonts/OFL.txt](assets/fonts/OFL.txt)). They are bundled, through gpui-design-system,
+and are the default fonts.

@@ -37,10 +37,20 @@ const FOREGROUND: &str = "RATURE_FOREGROUND";
 const USAGE: &str = "usage: rature [file or folder]
 
 Reads Markdown (and JSON, YAML, CSV, images, code) and follows its changes.
-`rt` is the same. Keys: see the README, or `f` `s` `o` `t` `/` `]c` `m` `e` `q` in the window.";
+`rt` is the same. Keys: see the README, or `f` `s` `o` `t` `Ctrl-f` `]c` `m` `i` `e` `q` in the
+window.";
 
 fn main() {
     let started = Instant::now();
+    // Read once, then taken out of the environment, so that what Rature starts (nvim in a
+    // terminal, and what that starts) does not inherit it.
+    let foreground = std::env::var_os(FOREGROUND).is_some();
+    if foreground {
+        // SAFETY: edition 2024 makes this unsafe because the environment is process-global and
+        // not synchronised. This runs at the top of `main`, before any thread is started (GPUI's,
+        // the watcher's, the socket's), so nothing can read the environment concurrently.
+        unsafe { std::env::remove_var(FOREGROUND) };
+    }
     let arg = std::env::args_os().nth(1);
     let path = match arg.as_deref().and_then(|a| a.to_str()) {
         Some("-h" | "--help") => {
@@ -61,7 +71,7 @@ fn main() {
     }
     let timing = std::env::var_os("RATURE_TIMING").is_some();
     // From a terminal, the window runs on its own and the prompt comes back at once.
-    if std::io::stdin().is_terminal() && std::env::var_os(FOREGROUND).is_none() && !timing {
+    if std::io::stdin().is_terminal() && !foreground && !timing {
         let spawned = std::process::Command::new(
             std::env::current_exe().expect("a running binary has a path"),
         )

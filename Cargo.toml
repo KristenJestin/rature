@@ -2,6 +2,13 @@
 name = "rature"
 version = "0.1.0"
 edition = "2024"
+# The code needs 1.88 (let chains); merman 0.10.0-alpha.2 and its crates declare 1.95.
+rust-version = "1.95"
+description = "A keyboard-first Markdown reader for Linux that follows a file's changes and edits it in place"
+license = "AGPL-3.0-only"
+repository = "https://github.com/KristenJestin/rature"
+readme = "README.md"
+publish = false
 
 [dependencies]
 csv = "1.4.0"
