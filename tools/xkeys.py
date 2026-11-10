@@ -15,7 +15,7 @@ x11.XFlush.argtypes = [ctypes.c_void_p]
 display = x11.XOpenDisplay(None)
 if not display:
     sys.exit("xkeys: no display")
-NAMES = {"shift": "Shift_L", "ctrl": "Control_L", "space": "space"}
+NAMES = {"shift": "Shift_L", "ctrl": "Control_L", "alt": "Alt_L", "space": "space"}
 
 
 def code(name):

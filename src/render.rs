@@ -315,9 +315,12 @@ fn item(ctx: &Ctx, ordered: bool, number: usize, item: &Item) -> impl IntoElemen
         )
 }
 
-/// Text that wraps word by word, so a formula can sit inside a sentence.
+/// Text wrapped to the column: laid out whole, or word by word when a formula sits in it.
 pub fn flow(ctx: &Ctx, inlines: &[Inline]) -> Div {
-    if inlines.iter().all(|inline| matches!(inline, Inline::Text(..))) {
+    if inlines
+        .iter()
+        .all(|inline| matches!(inline, Inline::Text(..)))
+    {
         return div().child(text_flow(ctx, inlines));
     }
     word_flow(ctx, inlines)
@@ -365,7 +368,10 @@ fn text_flow(ctx: &Ctx, inlines: &[Inline]) -> AnyElement {
         };
         each[range.clone()].fill(style);
         if marks.code {
-            code.push((range.clone(), SharedString::from(ctx.config.code_font.clone())));
+            code.push((
+                range.clone(),
+                SharedString::from(ctx.config.code_font.clone()),
+            ));
         }
         if let Some(link) = &marks.link {
             links.push((range.clone(), link.clone()));

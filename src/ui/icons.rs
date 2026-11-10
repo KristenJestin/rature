@@ -64,7 +64,12 @@ gpui_kit::assets::icon_assets!(
         Sheet,
         Braces,
         FileCode,
-        ListTree
+        ListTree,
+        BetweenHorizontalStart,
+        BetweenHorizontalEnd,
+        BetweenVerticalStart,
+        BetweenVerticalEnd,
+        Trash
     ]
 );
 
@@ -181,10 +186,20 @@ pub enum Icon {
     Code,
     /// The headings of a page.
     Outline,
+    /// Adds a table's row above.
+    RowAbove,
+    /// Adds a table's row below.
+    RowBelow,
+    /// Adds a table's column on the left.
+    ColumnLeft,
+    /// Adds a table's column on the right.
+    ColumnRight,
+    /// Deletes.
+    Delete,
 }
 
 impl Icon {
-    pub const ALL: [Self; 50] = [
+    pub const ALL: [Self; 55] = [
         Self::Folder,
         Self::Branch,
         Self::Repository,
@@ -235,6 +250,11 @@ impl Icon {
         Self::Data,
         Self::Code,
         Self::Outline,
+        Self::RowAbove,
+        Self::RowBelow,
+        Self::ColumnLeft,
+        Self::ColumnRight,
+        Self::Delete,
     ];
 
     pub fn path(self) -> SharedString {
@@ -292,6 +312,11 @@ impl Icon {
             Self::Data => IconName::Braces,
             Self::Code => IconName::FileCode,
             Self::Outline => IconName::ListTree,
+            Self::RowAbove => IconName::BetweenHorizontalStart,
+            Self::RowBelow => IconName::BetweenHorizontalEnd,
+            Self::ColumnLeft => IconName::BetweenVerticalStart,
+            Self::ColumnRight => IconName::BetweenVerticalEnd,
+            Self::Delete => IconName::Trash,
         }
         .path()
     }
