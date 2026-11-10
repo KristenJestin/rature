@@ -45,6 +45,8 @@ pub struct ListEdit {
     lines: Vec<Line>,
     /// The list as last given: written back as it is while nothing changed.
     source: String,
+    /// The line breaks the list ends with: written back after it.
+    tail: String,
     changed: bool,
     /// The line that takes the caret first, then the one that last had it.
     at: usize,
@@ -66,6 +68,7 @@ impl ListEdit {
         let mut this = Self {
             lines: Vec::new(),
             source: String::new(),
+            tail: String::new(),
             changed: false,
             at: 0,
             closing: false,
@@ -103,6 +106,7 @@ impl ListEdit {
         if let Caret::End = caret {
             this.at = last;
         }
+        this.tail = source[source.trim_end_matches('\n').len()..].to_string();
         this.source = source;
         this
     }
@@ -124,7 +128,10 @@ impl ListEdit {
                     return;
                 };
                 match event {
-                    LiveEvent::Change => this.change(cx),
+                    LiveEvent::Change => {
+                        this.relist(ix, window, cx);
+                        this.change(cx)
+                    }
                     LiveEvent::Leave(edge) => this.go(ix, *edge, window, cx),
                     LiveEvent::Break(at) => this.break_line(ix, *at, window, cx),
                     LiveEvent::Join => this.join(ix, window, cx),
@@ -164,6 +171,7 @@ impl ListEdit {
             })
             .collect::<Vec<_>>()
             .join("\n")
+            + &self.tail
     }
 
     /// The list as the file now holds it: its lines are the same.
@@ -247,6 +255,34 @@ impl ListEdit {
         self.change(cx);
     }
 
+    /// A line out of the list that was given a bullet (`- `, `1. `): an item again.
+    fn relist(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let line = &mut self.lines[ix];
+        if line.bullet.is_some() {
+            return;
+        }
+        let (indent, bullet, task, text) = split(line.cell.read(cx).value());
+        if !indent.is_empty() || !bullet.as_ref().is_some_and(|b| b.ends_with(' ')) {
+            return;
+        }
+        line.bullet = bullet;
+        line.task = task;
+        // Back in the list, it no longer stands apart from the items around it.
+        if ix > 0 && self.lines[ix - 1].bullet.is_some() {
+            self.lines[ix].blank = 0;
+        }
+        if let Some(next) = self.lines.get_mut(ix + 1)
+            && next.bullet.is_some()
+        {
+            next.blank = 0;
+        }
+        let line = &self.lines[ix];
+        line.cell.update(cx, |cell, cx| {
+            cell.set_value(text, cx);
+            cell.enter_at(0, window, cx);
+        });
+    }
+
     /// The line with the caret, else the one that last had it.
     fn current(&mut self, window: &Window, cx: &App) -> usize {
         if let Some(ix) = self
@@ -322,6 +358,12 @@ impl ListEdit {
             self.change(cx);
         }
     }
+}
+
+/// Whether `text` starts as a list's item: a bullet or a number, and a space.
+pub fn is_item(text: &str) -> bool {
+    let (indent, bullet, ..) = split(text.lines().next().unwrap_or(""));
+    indent.is_empty() && bullet.is_some_and(|b| b.ends_with(' '))
 }
 
 /// A line cut into its indent, bullet, task box and text.

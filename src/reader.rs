@@ -20,7 +20,7 @@ use crate::document::{self, Block, Document, Picture};
 use crate::formats::{self, Content};
 use crate::highlight::Highlighter;
 use crate::highlight::{self, Lines};
-use crate::list::ListEdit;
+use crate::list::{self, ListEdit};
 use crate::live::{Caret, Edge, LiveBlock, LiveEvent};
 use crate::render::{self, Ctx};
 use crate::start::key_hint;
@@ -913,7 +913,7 @@ impl Reader {
                        window: &mut Window,
                        cx: &mut Context<Self>| {
             match event {
-                LiveEvent::Change => this.autosave_later(cx),
+                LiveEvent::Change => this.changed(block, window, cx),
                 LiveEvent::Blur => this.finish_editing(window, cx),
                 LiveEvent::Leave(edge) => this.leave(block, *edge, window, cx),
                 // A paragraph breaks its own lines; tables and lists take these themselves.
@@ -949,6 +949,27 @@ impl Reader {
             _events: events,
         });
         cx.notify();
+    }
+
+    /// The block being edited changed. A paragraph given a bullet is a list: written, it is
+    /// edited again as one.
+    fn changed(&mut self, block: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.autosave_later(cx);
+        let Some(Editing {
+            field: Field::Text(text),
+            ..
+        }) = &self.editing
+        else {
+            return;
+        };
+        let paragraph = self
+            .document()
+            .is_some_and(|doc| matches!(doc.blocks.get(block), Some(Block::Paragraph(_))));
+        if paragraph && list::is_item(text.read(cx).value()) {
+            self.write_edit(cx);
+            self.reload(cx);
+            self.edit_block(block, Caret::Start, window, cx);
+        }
     }
 
     fn autosave_later(&mut self, cx: &mut Context<Self>) {
