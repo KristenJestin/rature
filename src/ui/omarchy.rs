@@ -130,7 +130,7 @@ pub fn palette_from_toml(text: &str) -> Result<Palette, String> {
         side: dark,
         card: lighter,
         card2: toward_fg(0.06),
-        line: toward_fg(0.08),
+        line: toward_fg(0.05),
         line2: toward_fg(0.12),
         hover: toward_fg(0.04),
         sel: selection,
