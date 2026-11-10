@@ -1172,16 +1172,6 @@ impl Reader {
                     |this, window, cx| this.mark_read(&MarkRead, window, cx),
                 ))
                 .into_any_element()
-        } else if self.before.is_some() {
-            div()
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .mono(11.5)
-                .text_color(p.faint)
-                .child(icon(Icon::Check).text_color(p.ok))
-                .child("Up to date")
-                .into_any_element()
         } else {
             div().into_any_element()
         };
