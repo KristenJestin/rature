@@ -1,0 +1,1 @@
+{"station": "hillside", "sensors": [{"name": "climate", "bus": "i2c", "address": "0x76", "measures": ["temperature", "humidity", "pressure"], "enabled": true}, {"name": "anemometer", "bus": "pulse", "pin": 14, "enabled": true}, {"name": "vane", "bus": "adc", "pin": 1, "enabled": false, "calibrated": null}], "updated": "2026-11-09"}

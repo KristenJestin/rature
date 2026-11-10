@@ -1,0 +1,17 @@
+name: hillside
+altitude_m: 212
+sampling:
+  interval_s: 60
+  average_of: 5
+radio:
+  band: 868MHz
+  spreading_factor: 9
+battery:
+  low_v: 3.4
+  skip_upload_below_v: 3.3
+sensors:
+  - temperature
+  - humidity
+  - pressure
+  - wind
+  - rain

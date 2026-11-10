@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="300" viewBox="0 0 480 300">
+  <rect width="480" height="300" fill="#eef3f7"/>
+  <rect x="150" y="30" width="180" height="40" rx="4" fill="#2f4a68"/>
+  <line x1="240" y1="70" x2="240" y2="270" stroke="#7a7f86" stroke-width="6"/>
+  <rect x="180" y="110" width="120" height="90" rx="6" fill="#ffffff" stroke="#7a7f86" stroke-width="3"/>
+  <g fill="#ffffff" stroke="#7a7f86" stroke-width="3">
+    <ellipse cx="370" cy="130" rx="40" ry="8"/>
+    <ellipse cx="370" cy="150" rx="40" ry="8"/>
+    <ellipse cx="370" cy="170" rx="40" ry="8"/>
+  </g>
+  <line x1="300" y1="150" x2="330" y2="150" stroke="#7a7f86" stroke-width="4"/>
+  <line x1="40" y1="270" x2="440" y2="270" stroke="#5b8c4a" stroke-width="8"/>
+  <text x="240" y="56" font-family="sans-serif" font-size="14" fill="#ffffff" text-anchor="middle">solar panel</text>
+  <text x="240" y="160" font-family="sans-serif" font-size="14" fill="#2f3a45" text-anchor="middle">board, cells</text>
+  <text x="370" y="205" font-family="sans-serif" font-size="14" fill="#2f3a45" text-anchor="middle">sensor shield</text>
+</svg>
