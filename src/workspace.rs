@@ -69,6 +69,13 @@ impl Workspace {
         let subscription = cx.subscribe(&reader, |this, _, event: &ReaderEvent, cx| match event {
             ReaderEvent::Opened(path) => {
                 if let Some(tree) = &this.tree {
+                    // A file read in the folder keeps the folder among the recent ones, just
+                    // after the file.
+                    let root = tree.read(cx).root().to_path_buf();
+                    let state = cx.global_mut::<State>();
+                    state.opened(&root);
+                    state.opened(path);
+                    state.save();
                     tree.update(cx, |tree, cx| tree.reveal(path, cx));
                 }
             }
