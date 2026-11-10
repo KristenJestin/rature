@@ -373,7 +373,7 @@ fn text_flow(ctx: &Ctx, inlines: &[Inline]) -> AnyElement {
             color: marks
                 .link
                 .as_ref()
-                .map(|_| if marks.broken { t.fail } else { t.run }),
+                .map(|_| if marks.broken { t.fail } else { t.link }),
             underline: marks.link.as_ref().map(|_| UnderlineStyle {
                 thickness: px(1.),
                 color: None,
@@ -507,7 +507,7 @@ fn word(ctx: &Ctx, text: &str, marks: &Marks, change: Change) -> AnyElement {
                 .px_1()
         })
         .when(marks.link.is_some(), |d| {
-            d.text_color(if marks.broken { t.fail } else { t.run })
+            d.text_color(if marks.broken { t.fail } else { t.link })
                 .underline()
                 .cursor_pointer()
         })

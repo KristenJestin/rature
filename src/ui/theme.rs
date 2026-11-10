@@ -38,6 +38,8 @@ pub struct Palette {
     pub acc: Hsla,
     /// The ink on the primary.
     pub on_acc: Hsla,
+    /// Links, and the open file in the tree.
+    pub link: Hsla,
     /// The composer's outer shell.
     pub shell: Hsla,
     /// The composer's field.
@@ -110,6 +112,7 @@ impl Palette {
             faint: hex(0x636362),
             acc: hex(0x1c1c1c),
             on_acc: hex(0xfafafa),
+            link: hex(0x2251c4),
             shell: hex(0xf4f4f3),
             field: hex(0xfdfdfd),
             field_line: hex(0xdadad8),
@@ -152,6 +155,7 @@ impl Palette {
             faint: hex(0x8a8a8a),
             acc: hex(0xececec),
             on_acc: hex(0x111111),
+            link: hex(0x7aa7ff),
             shell: hex(0x1a1a1a),
             field: hex(0x121212),
             field_line: hex(0x2a2a2a),
@@ -183,6 +187,7 @@ impl Palette {
         self.mute = readable(self.mute, self.card, min);
         self.faint = readable(self.faint, self.card2, min);
         self.on_acc = readable(self.on_acc, self.acc, min);
+        self.link = readable(self.link, self.sel, min);
         self.run = readable(self.run, self.run_bg, min);
         self.wait = readable(self.wait, self.wait_bg, min);
         self.on_wait = readable(self.on_wait, self.wait, min);
@@ -211,6 +216,7 @@ impl Palette {
             faint: m(self.faint, to.faint),
             acc: m(self.acc, to.acc),
             on_acc: m(self.on_acc, to.on_acc),
+            link: m(self.link, to.link),
             shell: m(self.shell, to.shell),
             field: m(self.field, to.field),
             field_line: m(self.field_line, to.field_line),
@@ -403,6 +409,7 @@ mod tests {
         }
         for (name, ink, fill) in [
             ("on_acc", light.on_acc, light.acc),
+            ("link", light.link, light.sel),
             ("run", light.run, light.run_bg),
             ("wait", light.wait, light.wait_bg),
             ("on_wait", light.on_wait, light.wait),

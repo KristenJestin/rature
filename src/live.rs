@@ -867,7 +867,7 @@ impl Render for LiveBlock {
                     color: match look.ink {
                         Ink::Text => look.colour.map_or(base.color, Hsla::from),
                         Ink::Mark => p.faint.opacity(shown),
-                        Ink::Link => p.run,
+                        Ink::Link => p.link,
                     },
                     background_color: look.shade.then_some(p.card2),
                     underline: (look.ink == Ink::Link).then_some(UnderlineStyle {

@@ -385,7 +385,7 @@ impl Tree {
                     .justify_center()
                     .children(chevron),
             )
-            .child(icon(glyph).text_color(if current { p.text } else { p.faint }))
+            .child(icon(glyph).text_color(if current { p.link } else { p.faint }))
             .child(
                 div()
                     .flex_1()
@@ -393,7 +393,13 @@ impl Tree {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
-                    .text_color(if current || entry.dir { p.text } else { p.mute })
+                    .text_color(if current {
+                        p.link
+                    } else if entry.dir {
+                        p.text
+                    } else {
+                        p.mute
+                    })
                     .when(current, |d| d.medium())
                     .child(name),
             )

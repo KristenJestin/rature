@@ -139,6 +139,7 @@ pub fn palette_from_toml(text: &str) -> Result<Palette, String> {
         faint: dark_fg,
         acc: accent,
         on_acc: bg,
+        link: accent,
         shell: lighter,
         field: dark,
         field_line: toward_fg(0.10),
