@@ -85,6 +85,9 @@ fn main() {
             ui::init(cx);
             cx.set_global(config::Config::load());
             cx.set_global(state::State::load());
+            cx.background_executor()
+                .spawn(async { highlight::warm() })
+                .detach();
             reader::bind_keys(cx);
             live::bind_keys(cx);
             list::bind_keys(cx);

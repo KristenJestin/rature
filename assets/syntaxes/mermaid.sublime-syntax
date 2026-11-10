@@ -1,0 +1,48 @@
+%YAML 1.2
+---
+# Mermaid diagrams, which bat's languages lack: their keywords, arrows, texts and labels.
+name: Mermaid
+file_extensions: [mermaid, mmd]
+scope: source.mermaid
+contexts:
+  main:
+    - match: '%%.*$'
+      scope: comment.line.mermaid
+    - match: '"'
+      scope: punctuation.definition.string.begin.mermaid
+      push: string
+    - match: '\|'
+      scope: punctuation.definition.string.begin.mermaid
+      push: label
+    - match: '\b(flowchart|graph|subgraph|end|direction|classDef|class|style|linkStyle|click|sequenceDiagram|participant|actor|activate|deactivate|loop|alt|else|opt|par|and|rect|note|Note|over|left of|right of|classDiagram|stateDiagram|stateDiagram-v2|erDiagram|gantt|pie|journey|gitGraph|mindmap|timeline|quadrantChart|title|section|dateFormat|axisFormat|state)\b'
+      scope: keyword.control.mermaid
+    - match: '\b(TD|TB|BT|RL|LR)\b'
+      scope: constant.language.mermaid
+    - match: '<?(-->>|->>|-->|---|-\.->|-\.-|==>|===|--x|--o|-x|-\)|->)'
+      scope: keyword.operator.mermaid
+    - match: '\[\[|\[\(|\(\(|\[|\(|\{\{|\{|>'
+      scope: punctuation.section.mermaid
+      push: shape
+    - match: '\b\d+(\.\d+)?\b'
+      scope: constant.numeric.mermaid
+    - match: '[A-Za-z_][\w-]*'
+      scope: entity.name.tag.mermaid
+  string:
+    - meta_scope: string.quoted.double.mermaid
+    - match: '"'
+      scope: punctuation.definition.string.end.mermaid
+      pop: true
+  label:
+    - meta_scope: string.unquoted.label.mermaid
+    - match: '\|'
+      scope: punctuation.definition.string.end.mermaid
+      pop: true
+  shape:
+    - match: '"'
+      scope: punctuation.definition.string.begin.mermaid
+      push: string
+    - match: '\]\]|\)\]|\)\)|\]|\)|\}\}|\}'
+      scope: punctuation.section.mermaid
+      pop: true
+    - match: '[^"\]\)\}]+'
+      scope: string.unquoted.mermaid

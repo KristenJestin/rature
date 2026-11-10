@@ -15,7 +15,7 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{
     FontStyle, HighlightIterator, HighlightState, Highlighter as Painter, Style, Theme, ThemeSet,
 };
-use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
+use syntect::parsing::{ParseState, ScopeStack, SyntaxDefinition, SyntaxReference, SyntaxSet};
 
 pub struct Span {
     pub range: Range<usize>,
@@ -38,7 +38,18 @@ fn kit() -> &'static Kit {
     KIT.get_or_init(|| {
         let mut themes = ThemeSet::load_defaults().themes;
         Kit {
-            syntaxes: two_face::syntax::extra_newlines(),
+            syntaxes: {
+                let mut syntaxes = two_face::syntax::extra_newlines().into_builder();
+                syntaxes.add(
+                    SyntaxDefinition::load_from_str(
+                        include_str!("../assets/syntaxes/mermaid.sublime-syntax"),
+                        true,
+                        None,
+                    )
+                    .expect("the Mermaid syntax"),
+                );
+                syntaxes.build()
+            },
             dark: themes.remove("base16-ocean.dark").expect("a default theme"),
             light: themes.remove("InspiredGitHub").expect("a default theme"),
         }
@@ -63,6 +74,11 @@ fn span(style: Style, range: Range<usize>) -> Span {
         bold: style.font_style.contains(FontStyle::BOLD),
         italic: style.font_style.contains(FontStyle::ITALIC),
     }
+}
+
+/// Loads the languages: done in the background at start, a block edited then colours at once.
+pub fn warm() {
+    kit();
 }
 
 /// The colours of `text` read as `lang` (a fence's language or a file's extension); none when
@@ -229,6 +245,17 @@ impl InputHighlighter for Highlighter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mermaid_is_coloured() {
+        let lines = highlight("mermaid", "flowchart TD\n    A[\"x\"] -->|y| B\n", true).unwrap();
+        let colours: std::collections::HashSet<_> = lines
+            .iter()
+            .flatten()
+            .map(|span| format!("{:?}", span.color))
+            .collect();
+        assert!(colours.len() >= 3, "{colours:?}");
+    }
 
     #[test]
     fn rust_is_coloured_and_an_unknown_language_is_not() {

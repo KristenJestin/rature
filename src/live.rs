@@ -11,6 +11,7 @@ use gpui_kit::*;
 use markdown::mdast::Node;
 
 use crate::config::Config;
+use crate::highlight;
 use crate::ui::motion::{ENTER, MODAL, Motion};
 use crate::ui::palette;
 
@@ -140,6 +141,8 @@ pub struct LiveBlock {
     /// The marks left out of the layout: those away from the caret, so the block reads as it
     /// does when it is not edited.
     hidden: Vec<Range<usize>>,
+    /// The colours of its fenced code, for the text and theme they were found for.
+    colours: Option<(String, bool, Colours)>,
     /// A caret placed from the window's coordinates once the text is laid out.
     pending: Option<Caret>,
     selecting: bool,
@@ -173,6 +176,7 @@ impl LiveBlock {
             focus,
             layout: None,
             hidden: Vec::new(),
+            colours: None,
             pending: Some(caret),
             selecting: false,
             undo: Vec::new(),
@@ -794,7 +798,19 @@ impl Render for LiveBlock {
         let closing = self.shown.target() == 0.;
         let base = window.text_style();
         let code_font: SharedString = cx.global::<Config>().code_font.clone().into();
-        let looks = looks(&self.text);
+        let dark = crate::render::is_dark(cx);
+        if self
+            .colours
+            .as_ref()
+            .is_none_or(|(text, was_dark, _)| *text != self.text || *was_dark != dark)
+        {
+            let colours = code_colours(&self.text, dark);
+            self.colours = Some((self.text.clone(), dark, colours));
+        }
+        let looks = looks(
+            &self.text,
+            self.colours.as_ref().map_or(&[], |(_, _, colours)| colours),
+        );
         // Marks show around the caret only. Closing, they go at once but for a line's leading
         // ones, which slide away; a block not yet given its caret is laid out as it is read,
         // so the click that opened it lands where it was aimed.
@@ -842,7 +858,7 @@ impl Render for LiveBlock {
                     len: range.len(),
                     font,
                     color: match look.ink {
-                        Ink::Text => base.color,
+                        Ink::Text => look.colour.map_or(base.color, Hsla::from),
                         Ink::Mark => p.faint.opacity(shown),
                         Ink::Link => p.run,
                     },
@@ -998,12 +1014,17 @@ struct Look {
     ink: Ink,
     /// Where the caret shows a mark: its line, or what it marks. A fence's show always.
     zone: Option<(usize, usize)>,
+    /// Fenced code's colour, by its language.
+    colour: Option<Rgba>,
 }
 
 /// The looks of `text`, in runs that cover it whole: its marks faint, what they mark drawn as it
 /// reads.
-fn looks(text: &str) -> Vec<(Range<usize>, Look)> {
+fn looks(text: &str, colours: &[(Range<usize>, Rgba)]) -> Vec<(Range<usize>, Look)> {
     let mut each = vec![Look::default(); text.len()];
+    for (range, colour) in colours {
+        paint(&mut each, range.clone(), |l| l.colour = Some(*colour));
+    }
     let mut fenced = false;
     let mut at = 0;
     for line in text.split_inclusive('\n') {
@@ -1045,6 +1066,42 @@ fn looks(text: &str) -> Vec<(Range<usize>, Look)> {
         }
     }
     runs
+}
+
+/// Pieces of code and their colours.
+type Colours = Vec<(Range<usize>, Rgba)>;
+
+/// The colours of the code fenced in `text`, read in the language its fence names.
+fn code_colours(text: &str, dark: bool) -> Colours {
+    let mut out = Vec::new();
+    let mut open: Option<(&str, usize)> = None;
+    let mut at = 0;
+    for line in text.split_inclusive('\n') {
+        let start = at;
+        at += line.len();
+        let trimmed = line.trim();
+        if !(trimmed.starts_with("```") || trimmed.starts_with("~~~")) {
+            continue;
+        }
+        let Some((lang, body)) = open.take() else {
+            open = Some((&trimmed[3..], at));
+            continue;
+        };
+        let Some(lines) = highlight::highlight(lang, &text[body..start], dark) else {
+            continue;
+        };
+        let mut line_start = body;
+        for (spans, line) in lines.iter().zip(text[body..start].split_inclusive('\n')) {
+            out.extend(spans.iter().map(|span| {
+                (
+                    line_start + span.range.start..line_start + span.range.end,
+                    span.color,
+                )
+            }));
+            line_start += line.len();
+        }
+    }
+    out
 }
 
 /// The length of the marks a line starts with: a heading's `#`, a quote's `>`, a list item's
@@ -1170,7 +1227,7 @@ mod tests {
     use super::{Ink, from_shown, looks, to_shown};
 
     fn marked(text: &str) -> String {
-        looks(text)
+        looks(text, &[])
             .into_iter()
             .map(|(range, look)| match look.ink {
                 Ink::Mark => format!("[{}]", &text[range]),
@@ -1201,19 +1258,19 @@ mod tests {
             marked("see `x` and [it](a.md)"),
             "see [`]x[`] and [[]it[](a.md)]"
         );
-        let runs = looks("a **b** c");
+        let runs = looks("a **b** c", &[]);
         assert!(
             runs.iter()
                 .any(|(r, l)| l.bold && &"a **b** c"[r.clone()] == "b")
         );
-        let fence = looks("```rust\nlet x;\n```");
+        let fence = looks("```rust\nlet x;\n```", &[]);
         assert!(fence.iter().all(|(_, l)| l.mono));
     }
 
     #[test]
     fn runs_cover_the_text_on_char_boundaries() {
         let text = "é **ü** `ß` ✓";
-        let runs = looks(text);
+        let runs = looks(text, &[]);
         assert_eq!(runs.first().unwrap().0.start, 0);
         assert_eq!(runs.last().unwrap().0.end, text.len());
         assert!(runs.windows(2).all(|w| w[0].0.end == w[1].0.start));
