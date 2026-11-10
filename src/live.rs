@@ -111,6 +111,10 @@ pub enum LiveEvent {
     Change,
     /// The caret was moved out of the block: the next one is edited.
     Leave(Edge),
+    /// Enter in a single line, at this offset: the owner decides what a new line is.
+    Break(usize),
+    /// Backspace at the start of a single line: the owner joins it to the one before.
+    Join,
     Blur,
 }
 
@@ -127,7 +131,10 @@ pub struct LiveBlock {
     /// Text being composed by an input method.
     marked: Option<Range<usize>>,
     /// Where vertical moves aim, kept across them.
-    goal: Option<Pixels>,
+    /// The x vertical moves aim at, and the top of the line they reached from the text's
+    /// top: an index where a line wraps is drawn at the end of the line above, not where the
+    /// caret went.
+    goal: Option<Point<Pixels>>,
     focus: FocusHandle,
     layout: Option<TextLayout>,
     /// A caret placed from the window's coordinates once the text is laid out.
@@ -138,7 +145,7 @@ pub struct LiveBlock {
     last_edit: Option<Instant>,
     /// How far the marks are shown: they fade in as the block opens, out as it closes.
     shown: Motion,
-    /// A table's cell: Enter leaves it rather than breaking its line.
+    /// A table's cell or a list's line: Enter and Backspace at its start go to its owner.
     single_line: bool,
     _blur: Subscription,
 }
@@ -192,9 +199,14 @@ impl LiveBlock {
 
     /// Takes the caret, at its start or its end: a table's cell moved to.
     pub fn enter(&mut self, end: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.enter_at(if end { self.text.len() } else { 0 }, window, cx);
+    }
+
+    /// Takes the caret at the offset `at`: where two lines were joined.
+    pub fn enter_at(&mut self, at: usize, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
         self.goal = None;
-        self.move_to(if end { self.text.len() } else { 0 }, cx);
+        self.move_to(at.min(self.text.len()), cx);
     }
 
     pub fn value(&self) -> &str {
@@ -283,21 +295,25 @@ impl LiveBlock {
     /// The index one line of the layout above or below `at`, none past the block's edge.
     fn vertical(&mut self, at: usize, down: bool) -> Option<usize> {
         let layout = self.layout.as_ref()?;
-        let here = layout.position_for_index(at)?;
         let height = layout.line_height();
         let bounds = layout.bounds();
-        let x = *self.goal.get_or_insert(here.x);
-        let y = if down {
-            here.y + height * 1.5
-        } else {
-            here.y - height * 0.5
+        let here = match self.goal {
+            Some(goal) => point(goal.x, bounds.top() + goal.y),
+            None => layout.position_for_index(at)?,
         };
+        let top = if down {
+            here.y + height
+        } else {
+            here.y - height
+        };
+        let y = top + height * 0.5;
         if y < bounds.top() || y > bounds.bottom() {
             return None;
         }
+        self.goal = Some(point(here.x, top - bounds.top()));
         Some(
             layout
-                .index_for_position(point(x, y))
+                .index_for_position(point(here.x, y))
                 .unwrap_or_else(|ix| ix),
         )
     }
@@ -427,6 +443,9 @@ impl LiveBlock {
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.single_line && self.selected == (0..0) {
+            return cx.emit(LiveEvent::Join);
+        }
         if self.selected.is_empty() {
             let at = self.caret();
             self.selected = self.previous(at)..at;
@@ -457,7 +476,7 @@ impl LiveBlock {
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
         if self.single_line {
-            return cx.emit(LiveEvent::Leave(Edge::Below));
+            return cx.emit(LiveEvent::Break(self.caret()));
         }
         self.replace_text_in_range(None, "\n", window, cx);
     }
@@ -810,6 +829,7 @@ impl Render for LiveBlock {
         let focus = self.focus.clone();
         let (selected, caret) = (self.selected.clone(), self.caret());
         let (caret_ink, selection_ink) = (p.acc, p.run.opacity(0.28));
+        let line_top = self.goal.map(|goal| goal.y);
         let placing = self.pending.is_some();
         div()
             .when(!closing, |d| d.key_context("LiveBlock"))
@@ -873,8 +893,14 @@ impl Render for LiveBlock {
                             window.paint_quad(fill(rect, selection_ink));
                         }
                         if selected.is_empty()
-                            && let Some(at) = layout.position_for_index(caret)
+                            && let Some(mut at) = layout.position_for_index(caret)
                         {
+                            // Moved down onto where a line wraps: the start of the line below.
+                            if let Some(top) = line_top.map(|y| layout.bounds().top() + y)
+                                && top != at.y
+                            {
+                                at = point(layout.bounds().left(), top);
+                            }
                             let caret = Bounds::new(at, size(px(2.), layout.line_height()));
                             window.paint_quad(fill(caret, caret_ink));
                         }

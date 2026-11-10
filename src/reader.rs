@@ -20,6 +20,7 @@ use crate::document::{self, Block, Document, Picture};
 use crate::formats::{self, Content};
 use crate::highlight::Highlighter;
 use crate::highlight::{self, Lines};
+use crate::list::ListEdit;
 use crate::live::{Caret, Edge, LiveBlock, LiveEvent};
 use crate::render::{self, Ctx};
 use crate::start::key_hint;
@@ -158,6 +159,7 @@ struct CodeFile {
 enum Field {
     Text(Entity<LiveBlock>),
     Table(Entity<TableEdit>),
+    List(Entity<ListEdit>),
 }
 
 impl Field {
@@ -165,6 +167,7 @@ impl Field {
         match self {
             Field::Text(field) => field.read(cx).value().to_string(),
             Field::Table(table) => table.read(cx).value(cx),
+            Field::List(list) => list.read(cx).value(cx),
         }
     }
 
@@ -172,6 +175,7 @@ impl Field {
         match self {
             Field::Text(field) => field.update(cx, |field, cx| field.set_value(text, cx)),
             Field::Table(table) => table.update(cx, |table, _| table.set_value(text)),
+            Field::List(list) => list.update(cx, |list, _| list.set_value(text)),
         }
     }
 
@@ -179,6 +183,7 @@ impl Field {
         match self {
             Field::Text(field) => field.read(cx).focus_handle().clone(),
             Field::Table(table) => table.read(cx).focus_handle(cx),
+            Field::List(list) => list.read(cx).focus_handle(cx),
         }
     }
 
@@ -186,6 +191,7 @@ impl Field {
         match self {
             Field::Text(field) => field.update(cx, |field, cx| field.close(cx)),
             Field::Table(table) => table.update(cx, |table, cx| table.close(cx)),
+            Field::List(list) => list.update(cx, |list, cx| list.close(cx)),
         }
     }
 
@@ -193,6 +199,7 @@ impl Field {
         match self {
             Field::Text(field) => field.clone().into_any_element(),
             Field::Table(table) => table.clone().into_any_element(),
+            Field::List(list) => list.clone().into_any_element(),
         }
     }
 }
@@ -909,6 +916,8 @@ impl Reader {
                 LiveEvent::Change => this.autosave_later(cx),
                 LiveEvent::Blur => this.finish_editing(window, cx),
                 LiveEvent::Leave(edge) => this.leave(block, *edge, window, cx),
+                // A paragraph breaks its own lines; tables and lists take these themselves.
+                LiveEvent::Break(_) | LiveEvent::Join => {}
             }
         };
         let (field, events) = if matches!(doc.blocks[block], Block::Table(_)) {
@@ -917,6 +926,12 @@ impl Reader {
                 on(this, event, window, cx)
             });
             (Field::Table(table), events)
+        } else if matches!(doc.blocks[block], Block::List { .. }) {
+            let list = cx.new(|cx| ListEdit::new(original.clone(), caret, window, cx));
+            let events = cx.subscribe_in(&list, window, move |this, _, event, window, cx| {
+                on(this, event, window, cx)
+            });
+            (Field::List(list), events)
         } else {
             let text = cx.new(|cx| LiveBlock::new(original.clone(), caret, window, cx));
             let events = cx.subscribe_in(&text, window, move |this, _, event, window, cx| {

@@ -263,12 +263,48 @@ fn broken(ctx: &Ctx, source: &str, error: &str) -> Div {
 }
 
 fn item(ctx: &Ctx, ordered: bool, number: usize, item: &Item) -> impl IntoElement {
-    let t = ctx.theme;
-    let box_size = ctx.size(0.95);
-    let marker: AnyElement = match (item.checked, ordered) {
+    let size = ctx.size(1.);
+    bullet(
+        size,
+        marker(size, ctx.theme, item.checked, ordered, number),
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .when(item.checked == Some(true), |d| d.text_color(ctx.theme.mute))
+            .children(item.blocks.iter().map(|b| block(ctx, b))),
+    )
+}
+
+/// A list's line: its marker in a column of its own, its text beside it. The list's editor
+/// lays its lines out the same way.
+pub fn bullet(size: Pixels, marker: impl IntoElement, content: impl IntoElement) -> Div {
+    div()
+        .flex()
+        .gap_2()
+        .child(
+            div()
+                .min_w(size * 1.4)
+                .flex_none()
+                .flex()
+                .justify_center()
+                .child(marker),
+        )
+        .child(div().flex_1().min_w_0().child(content))
+}
+
+/// A list item's bullet, number or task box, for text of `size`.
+pub fn marker(
+    size: Pixels,
+    t: &Palette,
+    checked: Option<bool>,
+    ordered: bool,
+    number: usize,
+) -> AnyElement {
+    match (checked, ordered) {
         (Some(done), _) => div()
-            .mt(ctx.size(0.33))
-            .size(box_size)
+            .mt(size * 0.33)
+            .size(size * 0.95)
             .flex()
             .items_center()
             .justify_center()
@@ -277,42 +313,22 @@ fn item(ctx: &Ctx, ordered: bool, number: usize, item: &Item) -> impl IntoElemen
             .border_color(if done { t.ok } else { t.line2 })
             .when(done, |d| d.bg(t.ok))
             .when(done, |d| {
-                d.child(icon(Icon::Check).size(ctx.size(0.7)).text_color(t.bg))
+                d.child(icon(Icon::Check).size(size * 0.7).text_color(t.bg))
             })
             .into_any_element(),
         (None, true) => div()
             .text_color(t.faint)
             .font_family(crate::ui::typography::MONO)
-            .text_size(ctx.size(0.85))
+            .text_size(size * 0.85)
             .child(format!("{number}."))
             .into_any_element(),
         (None, false) => div()
-            .mt(ctx.size(0.68))
-            .size(ctx.size(0.3))
+            .mt(size * 0.68)
+            .size(size * 0.3)
             .rounded_full()
             .bg(t.faint)
             .into_any_element(),
-    };
-    div()
-        .flex()
-        .gap_2()
-        .child(
-            div()
-                .min_w(ctx.size(1.4))
-                .flex_none()
-                .flex()
-                .justify_center()
-                .child(marker),
-        )
-        .child(
-            div()
-                .flex_1()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .when(item.checked == Some(true), |d| d.text_color(t.mute))
-                .children(item.blocks.iter().map(|b| block(ctx, b))),
-        )
+    }
 }
 
 /// Text wrapped to the column: laid out whole, or word by word when a formula sits in it.

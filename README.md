@@ -34,7 +34,9 @@ writes. Native, keyboard first, no webview.
   is read: its marks (`##`, `**`, backticks, a link's address) show faint, and what they mark keeps
   its look, the heading its size, the strong text bold. The arrows go on to the next block. A table keeps its grid: each cell is edited
   where it is, `Tab` to the next one, rows and columns added and deleted from the tools over it
-  (`Alt-Shift` and an arrow, `Backspace` or `Delete`), and the table is written back as Markdown. Saved 800 ms after you stop typing, code too; `Ctrl-s` saves and formats (Markdown by
+  (`Alt-Shift` and an arrow, `Backspace` or `Delete`), and the table is written back as Markdown. A list keeps its bullets, numbers and task boxes:
+  each line is edited beside its marker, `Enter` starts the next item, `Backspace` at a line's start
+  joins it to the one above, `Tab` and `Shift-Tab` nest and un-nest it, a click ticks a box. Saved 800 ms after you stop typing, code too; `Ctrl-s` saves and formats (Markdown by
   dprint, JSON pretty-printed).
 - **Theme**: Flottille's own colours, or the current Omarchy theme, followed live: a theme
   change cross-fades the open window, formulas and diagrams drawn again in its colours.

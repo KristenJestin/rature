@@ -129,7 +129,12 @@ impl TableEdit {
                         this.go(r, c, *edge, window, cx)
                     }
                 }
-                LiveEvent::Blur => {}
+                LiveEvent::Break(_) => {
+                    if let Some((r, c)) = this.position(cell) {
+                        this.go(r, c, Edge::Below, window, cx)
+                    }
+                }
+                LiveEvent::Join | LiveEvent::Blur => {}
             },
         ));
         cell
