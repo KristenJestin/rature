@@ -196,24 +196,20 @@ fn ago(at: u64) -> String {
     }
 }
 
-/// The mark: a page with its lines, one struck through, in the theme's own colours.
+/// Rature's icon, `assets/brand/icon.svg`: its tile and its ink are put in the theme's colours.
+const ICON: &str = include_str!("../assets/brand/icon.svg");
+const ICON_TILE: &str = r##"<rect width="64" height="64" rx="15" fill="#161412"/>"##;
+const ICON_INK: &str = "#EDE6D8";
+
+/// The mark: the R of the icon, in the theme's text colour on a tile of its cards.
 fn logo_svg(p: &Palette) -> String {
-    format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
-  <rect x="8" y="8" width="240" height="240" rx="56" fill="{card}" stroke="{line}" stroke-width="4"/>
-  <path d="M84 52h70l38 38v110a14 14 0 0 1-14 14H84a14 14 0 0 1-14-14V66a14 14 0 0 1 14-14z" fill="{text}"/>
-  <path d="M154 52v26a12 12 0 0 0 12 12h26z" fill="{mute}"/>
-  <g stroke-linecap="round" stroke-width="10" stroke="{card}">
-    <path d="M94 120h74"/><path d="M94 146h74"/><path d="M94 172h48"/>
-  </g>
-  <path d="M74 166l108-40" stroke="{fail}" stroke-width="14" stroke-linecap="round"/>
-</svg>"##,
-        card = hex(p.card),
-        line = hex(p.line2),
-        text = hex(p.text),
-        mute = hex(p.mute),
-        fail = hex(p.fail),
-    )
+    let tile = format!(
+        r##"<rect x=".5" y=".5" width="63" height="63" rx="14.5" fill="{}" stroke="{}"/>"##,
+        hex(p.card),
+        hex(p.line2),
+    );
+    ICON.replacen(ICON_TILE, &tile, 1)
+        .replace(ICON_INK, &hex(p.text))
 }
 
 impl Render for Start {
@@ -342,4 +338,15 @@ pub fn key_hint(key: &'static str, what: &'static str, p: &Palette) -> impl Into
                 .text_color(p.faint)
                 .child(what),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ICON, ICON_INK, ICON_TILE};
+
+    #[test]
+    fn the_logo_takes_the_icon_in_the_theme_s_colours() {
+        assert_eq!(ICON.matches(ICON_TILE).count(), 1);
+        assert!(ICON.contains(ICON_INK));
+    }
 }

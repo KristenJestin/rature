@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="packaging/linux/icons/hicolor/scalable/apps/rature.svg" alt="Rature" width="96">
+  <img src="assets/brand/icon.svg" alt="Rature" width="96">
 </p>
 
 <h1 align="center">Rature</h1>
