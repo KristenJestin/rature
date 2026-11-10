@@ -90,6 +90,10 @@ pub enum Caret {
     End,
     /// Where the block was clicked, in the window.
     At(Point<Pixels>),
+    /// Where a table was clicked: the cell under it takes the caret, the others none.
+    Inside(Point<Pixels>),
+    /// No caret: a table's cell not chosen.
+    Nowhere,
 }
 
 /// An edge of the block the caret was moved past.
@@ -97,6 +101,10 @@ pub enum Caret {
 pub enum Edge {
     Above,
     Below,
+    /// Past its start, by the left arrow.
+    Before,
+    /// Past its end, by the right arrow.
+    After,
 }
 
 pub enum LiveEvent {
@@ -130,6 +138,8 @@ pub struct LiveBlock {
     last_edit: Option<Instant>,
     /// How far the marks are shown: they fade in as the block opens, out as it closes.
     shown: Motion,
+    /// A table's cell: Enter leaves it rather than breaking its line.
+    single_line: bool,
     _blur: Subscription,
 }
 
@@ -158,6 +168,7 @@ impl LiveBlock {
             redo: Vec::new(),
             last_edit: None,
             shown,
+            single_line: false,
             _blur: blur,
         }
     }
@@ -172,6 +183,18 @@ impl LiveBlock {
             cx.reduce_motion(),
         );
         cx.notify();
+    }
+
+    pub fn single_line(mut self) -> Self {
+        self.single_line = true;
+        self
+    }
+
+    /// Takes the caret, at its start or its end: a table's cell moved to.
+    pub fn enter(&mut self, end: bool, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus, cx);
+        self.goal = None;
+        self.move_to(if end { self.text.len() } else { 0 }, cx);
     }
 
     pub fn value(&self) -> &str {
@@ -305,7 +328,7 @@ impl LiveBlock {
             return self.move_to(self.selected.start, cx);
         }
         if self.caret() == 0 {
-            return cx.emit(LiveEvent::Leave(Edge::Above));
+            return cx.emit(LiveEvent::Leave(Edge::Before));
         }
         self.move_to(self.previous(self.caret()), cx);
     }
@@ -316,7 +339,7 @@ impl LiveBlock {
             return self.move_to(self.selected.end, cx);
         }
         if self.caret() == self.text.len() {
-            return cx.emit(LiveEvent::Leave(Edge::Below));
+            return cx.emit(LiveEvent::Leave(Edge::After));
         }
         self.move_to(self.next(self.caret()), cx);
     }
@@ -433,6 +456,9 @@ impl LiveBlock {
     }
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
+        if self.single_line {
+            return cx.emit(LiveEvent::Leave(Edge::Below));
+        }
         self.replace_text_in_range(None, "\n", window, cx);
     }
 
@@ -527,12 +553,21 @@ impl LiveBlock {
     }
 
     /// Places the caret asked for at the opening, now that the text is laid out.
-    fn place(&mut self, cx: &mut Context<Self>) {
+    fn place(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let at = match self.pending.take() {
             Some(Caret::Start) => 0,
             Some(Caret::End) => self.text.len(),
             Some(Caret::At(position)) => self.index_at(position),
-            None => return,
+            Some(Caret::Inside(position))
+                if self
+                    .layout
+                    .as_ref()
+                    .is_some_and(|layout| layout.bounds().contains(&position)) =>
+            {
+                window.focus(&self.focus, cx);
+                self.index_at(position)
+            }
+            _ => return cx.notify(),
         };
         self.move_to(at, cx);
     }
@@ -819,7 +854,7 @@ impl Render for LiveBlock {
                     |_, _, _| {},
                     move |bounds, _, window, cx| {
                         if placing {
-                            entity.update(cx, |this, cx| this.place(cx));
+                            entity.update(cx, |this, cx| this.place(window, cx));
                             return;
                         }
                         if closing {
@@ -830,6 +865,10 @@ impl Render for LiveBlock {
                             ElementInputHandler::new(bounds, entity.clone()),
                             cx,
                         );
+                        // A table's other cells keep no caret.
+                        if !focus.is_focused(window) {
+                            return;
+                        }
                         for rect in selection(&layout, &selected) {
                             window.paint_quad(fill(rect, selection_ink));
                         }

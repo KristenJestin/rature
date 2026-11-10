@@ -178,7 +178,8 @@ pub fn block(ctx: &Ctx, block: &Block) -> AnyElement {
                 .into_any_element()
         }
         Block::Table(rows) => grid(
-            ctx,
+            ctx.id("table"),
+            ctx.theme,
             rows.iter()
                 .map(|row| {
                     row.iter()
@@ -499,10 +500,10 @@ fn code_line(ctx: &Ctx, line: &str, spans: Option<&[crate::highlight::Span]>) ->
         .into_any_element()
 }
 
-fn grid(ctx: &Ctx, rows: Vec<Vec<AnyElement>>) -> Stateful<Div> {
-    let t = ctx.theme;
+/// A table: its first row the header, the others under it.
+pub fn grid(id: ElementId, t: &Palette, rows: Vec<Vec<AnyElement>>) -> Stateful<Div> {
     let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
-    div().id(ctx.id("table")).overflow_x_scroll().child(
+    div().id(id).overflow_x_scroll().child(
         div()
             .min_w_full()
             .flex()
@@ -550,7 +551,7 @@ pub fn table(ctx: &Ctx, rows: &[Vec<String>]) -> AnyElement {
         .flex()
         .flex_col()
         .gap_2()
-        .child(grid(ctx, shown))
+        .child(grid(ctx.id("table"), ctx.theme, shown))
         .when(rows.len() > LIMIT, |d| {
             d.child(
                 div()

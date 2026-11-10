@@ -24,6 +24,7 @@ use crate::live::{Caret, Edge, LiveBlock, LiveEvent};
 use crate::render::{self, Ctx};
 use crate::start::key_hint;
 use crate::state::{self, State};
+use crate::table::TableEdit;
 use crate::ui::field::{field_style, focus_frame, follow_theme};
 use crate::ui::motion::MODAL;
 use crate::ui::toast::Toast;
@@ -152,11 +153,55 @@ struct CodeFile {
     _events: Subscription,
 }
 
+/// What a block is edited in: its text, or a table's cells.
+#[derive(Clone)]
+enum Field {
+    Text(Entity<LiveBlock>),
+    Table(Entity<TableEdit>),
+}
+
+impl Field {
+    fn value(&self, cx: &App) -> String {
+        match self {
+            Field::Text(field) => field.read(cx).value().to_string(),
+            Field::Table(table) => table.read(cx).value(cx),
+        }
+    }
+
+    fn set_value(&self, text: String, cx: &mut App) {
+        match self {
+            Field::Text(field) => field.update(cx, |field, cx| field.set_value(text, cx)),
+            Field::Table(table) => table.update(cx, |table, _| table.set_value(text)),
+        }
+    }
+
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match self {
+            Field::Text(field) => field.read(cx).focus_handle().clone(),
+            Field::Table(table) => table.read(cx).focus_handle(cx),
+        }
+    }
+
+    fn close(&self, cx: &mut App) {
+        match self {
+            Field::Text(field) => field.update(cx, |field, cx| field.close(cx)),
+            Field::Table(table) => table.update(cx, |table, cx| table.close(cx)),
+        }
+    }
+
+    fn element(&self) -> AnyElement {
+        match self {
+            Field::Text(field) => field.clone().into_any_element(),
+            Field::Table(table) => table.clone().into_any_element(),
+        }
+    }
+}
+
 struct Editing {
     block: usize,
     /// The block's source as last written: what is looked for in the file to replace it.
     original: String,
-    field: Entity<LiveBlock>,
+    field: Field,
     autosave: Option<Task<()>>,
     _events: Subscription,
 }
@@ -188,7 +233,7 @@ pub struct Reader {
     editing: Option<Editing>,
     code: Option<CodeFile>,
     /// A block just edited, its marks fading out before it is read again.
-    closing: Option<(usize, Entity<LiveBlock>, Task<()>)>,
+    closing: Option<(usize, Field, Task<()>)>,
     /// Blocks read again after an edit: they are back in place, they do not rise into it.
     settled: HashSet<u64>,
     zoom: f32,
@@ -856,17 +901,30 @@ impl Reader {
             return;
         }
         let original = doc.source_of(block).to_string();
-        let field = cx.new(|cx| LiveBlock::new(original.clone(), caret, window, cx));
-        let events = cx.subscribe_in(
-            &field,
-            window,
-            move |this, _, event: &LiveEvent, window, cx| match event {
+        let on = move |this: &mut Self,
+                       event: &LiveEvent,
+                       window: &mut Window,
+                       cx: &mut Context<Self>| {
+            match event {
                 LiveEvent::Change => this.autosave_later(cx),
                 LiveEvent::Blur => this.finish_editing(window, cx),
                 LiveEvent::Leave(edge) => this.leave(block, *edge, window, cx),
-            },
-        );
-        let focus = field.read(cx).focus_handle().clone();
+            }
+        };
+        let (field, events) = if matches!(doc.blocks[block], Block::Table(_)) {
+            let table = cx.new(|cx| TableEdit::new(original.clone(), caret, window, cx));
+            let events = cx.subscribe_in(&table, window, move |this, _, event, window, cx| {
+                on(this, event, window, cx)
+            });
+            (Field::Table(table), events)
+        } else {
+            let text = cx.new(|cx| LiveBlock::new(original.clone(), caret, window, cx));
+            let events = cx.subscribe_in(&text, window, move |this, _, event, window, cx| {
+                on(this, event, window, cx)
+            });
+            (Field::Text(text), events)
+        };
+        let focus = field.focus_handle(cx);
         window.focus(&focus, cx);
         self.editing = Some(Editing {
             block,
@@ -895,7 +953,7 @@ impl Reader {
         let (Some(path), Some(editing)) = (self.path.clone(), &mut self.editing) else {
             return;
         };
-        let text = editing.field.read(cx).value().to_string();
+        let text = editing.field.value(cx);
         if text == editing.original {
             return;
         }
@@ -927,7 +985,7 @@ impl Reader {
             return;
         };
         let (block, field) = (editing.block, editing.field);
-        field.update(cx, |field, cx| field.close(cx));
+        field.close(cx);
         let done = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(MODAL).await;
             this.update(cx, |this, cx| {
@@ -951,8 +1009,8 @@ impl Reader {
     fn leave(&mut self, block: usize, edge: Edge, window: &mut Window, cx: &mut Context<Self>) {
         let count = self.document().map_or(0, |doc| doc.blocks.len());
         let (next, caret) = match edge {
-            Edge::Above if block > 0 => (block - 1, Caret::End),
-            Edge::Below if block + 1 < count => (block + 1, Caret::Start),
+            Edge::Above | Edge::Before if block > 0 => (block - 1, Caret::End),
+            Edge::Below | Edge::After if block + 1 < count => (block + 1, Caret::Start),
             _ => return,
         };
         self.edit_block(next, caret, window, cx);
@@ -1065,8 +1123,7 @@ impl Reader {
         }
         if let Some(editing) = &self.editing {
             let original = editing.original.clone();
-            let field = editing.field.clone();
-            field.update(cx, |field, cx| field.set_value(original, cx));
+            editing.field.clone().set_value(original, cx);
         }
     }
 
@@ -1298,13 +1355,12 @@ impl Reader {
                                 Block::Code { .. }
                                 | Block::Diagram(_)
                                 | Block::Broken { .. }
-                                | Block::Table(_)
                                 | Block::FrontMatter(_) => frame
                                     .font_family(cx.global::<Config>().code_font.clone())
                                     .text_size(ctx.size(0.9)),
                                 _ => frame,
                             };
-                            frame.child(field).into_any_element()
+                            frame.child(field.element()).into_any_element()
                         }
                         None => self.block_element(ctx, doc, ix, block, mark, cx),
                     };
