@@ -29,7 +29,8 @@ writes. Native, keyboard first, no webview.
 - **Live reload**: written in place or replaced by a rename, the file is read again where you are.
 - **What changed**: since the last read (or against git `HEAD`), block by block: new blocks green,
   changed ones yellow with their changed words, removed ones struck in red. The first opening
-  takes the snapshot; `m` marks the current state read.
+  takes the snapshot; leaving the file (another one, or quitting) marks what you saw read, `m`
+  does it at once.
 - **Edit in place**: click a block, or `i` for the block at the top, and you write in it where it
   is read, and it looks as it is read: a mark (`##`, `**`, backticks, a link's address) shows,
   faint, only where the caret touches what it marks. The arrows go on to the next block. A table keeps its grid: each cell is edited

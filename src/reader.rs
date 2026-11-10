@@ -327,7 +327,7 @@ impl Reader {
 
     /// Shows no file: a folder opened without a page to show first.
     pub fn close(&mut self, cx: &mut Context<Self>) {
-        self.keep_position(cx);
+        self.put_down(cx);
         self.path = None;
         self.watch = None;
         self.before = None;
@@ -342,7 +342,7 @@ impl Reader {
             return;
         }
         self.finish_editing(window, cx);
-        self.keep_position(cx);
+        self.put_down(cx);
         self.watch = match watch::file(&path) {
             Ok((watcher, mut changes)) => {
                 let task = cx.spawn(async move |this, cx| {
@@ -515,13 +515,19 @@ impl Reader {
         self.before.as_ref().map(|(_, c)| c)
     }
 
-    /// Keeps where the current file is read up to, for the next time it opens.
-    pub fn keep_position(&self, cx: &mut Context<Self>) {
-        if let Some(path) = &self.path {
-            let (block, within) = self.scroll.logical_scroll_top();
-            cx.global_mut::<State>()
-                .positions
-                .insert(path.clone(), (block, -f32::from(within)));
+    /// What is kept of the file the reader leaves, for the next time it opens: where it was
+    /// read up to, and that its changes were seen.
+    pub fn put_down(&self, cx: &mut Context<Self>) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let (block, within) = self.scroll.logical_scroll_top();
+        cx.global_mut::<State>()
+            .positions
+            .insert(path.clone(), (block, -f32::from(within)));
+        if let (Content::Markdown(doc), Some(_)) = (&self.content, &self.before) {
+            state::mark_read(&path, &doc.source);
+            cx.emit(ReaderEvent::MarkedRead(path));
         }
     }
 
@@ -740,7 +746,7 @@ impl Reader {
     }
     fn quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
         self.finish_editing(window, cx);
-        self.keep_position(cx);
+        self.put_down(cx);
         cx.global::<State>().save();
         cx.quit();
     }
@@ -1294,12 +1300,6 @@ impl Reader {
                     Icon::Chevron,
                     "Next change  ]c",
                     |this, window, cx| this.next_change(&NextChange, window, cx),
-                ))
-                .child(act(
-                    "mark-read",
-                    Icon::Check,
-                    "Mark read  m",
-                    |this, window, cx| this.mark_read(&MarkRead, window, cx),
                 ))
                 .into_any_element()
         } else {

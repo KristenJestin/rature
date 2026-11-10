@@ -109,7 +109,7 @@ fn main() {
                 workspace.update(cx, |workspace, cx| workspace.open(path, window, cx));
                 let reader = workspace.read(cx).reader().clone();
                 window.on_window_should_close(cx, move |_, cx| {
-                    reader.update(cx, |reader, cx| reader.keep_position(cx));
+                    reader.update(cx, |reader, cx| reader.put_down(cx));
                     cx.global::<state::State>().save();
                     cx.quit();
                     true
