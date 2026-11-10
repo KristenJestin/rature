@@ -135,6 +135,7 @@ impl TableEdit {
                     }
                 }
                 LiveEvent::Join | LiveEvent::Blur => {}
+                LiveEvent::Follow(link) => cx.emit(LiveEvent::Follow(link.clone())),
             },
         ));
         cell

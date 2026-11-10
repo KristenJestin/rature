@@ -136,6 +136,7 @@ impl ListEdit {
                     LiveEvent::Break(at) => this.break_line(ix, *at, window, cx),
                     LiveEvent::Join => this.join(ix, window, cx),
                     LiveEvent::Blur => {}
+                    LiveEvent::Follow(link) => cx.emit(LiveEvent::Follow(link.clone())),
                 }
             },
         ));

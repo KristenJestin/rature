@@ -225,6 +225,8 @@ pub struct Reader {
     /// The file as the baseline has it, and how the file now differs from it.
     before: Option<(Document, Changes)>,
     drawings: Cache<String, Picture>,
+    /// The link under the last click, followed if Ctrl was held.
+    pub clicked_link: Option<String>,
     highlights: Cache<(String, String), Option<Lines>>,
     folded: HashSet<Vec<usize>>,
     /// The folder's tree, if there is one: the side it stands on and whether it is shown.
@@ -285,6 +287,7 @@ impl Reader {
             baseline: Baseline::LastRead,
             before: None,
             drawings: Cache::new(),
+            clicked_link: None,
             highlights: Cache::new(),
             folded: HashSet::new(),
             scroll: ScrollHandle::new(),
@@ -924,6 +927,7 @@ impl Reader {
                 LiveEvent::Leave(edge) => this.leave(block, *edge, window, cx),
                 // A paragraph breaks its own lines; tables and lists take these themselves.
                 LiveEvent::Break(_) | LiveEvent::Join => {}
+                LiveEvent::Follow(link) => this.follow(link, window, cx),
             }
         };
         let (field, events) = if matches!(doc.blocks[block], Block::Table(_)) {
@@ -1503,6 +1507,11 @@ impl Reader {
             .id(("block", ix))
             .child(arrived)
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                if let Some(link) = this.clicked_link.take()
+                    && event.modifiers().secondary()
+                {
+                    return this.follow(&link, window, cx);
+                }
                 this.edit_block(ix, Caret::At(event.position()), window, cx);
             }))
             .into_any_element()

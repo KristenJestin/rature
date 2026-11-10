@@ -117,6 +117,8 @@ pub enum LiveEvent {
     /// Backspace at the start of a single line: the owner joins it to the one before.
     Join,
     Blur,
+    /// A link was ctrl-clicked: its address.
+    Follow(String),
 }
 
 impl EventEmitter<LiveEvent> for LiveBlock {}
@@ -550,6 +552,11 @@ impl LiveBlock {
         window.focus(&self.focus, cx);
         self.goal = None;
         let at = self.index_at(event.position);
+        if event.modifiers.secondary()
+            && let Some(link) = link_at(&self.text, at)
+        {
+            return cx.emit(LiveEvent::Follow(link));
+        }
         match event.click_count {
             2 => {
                 self.selected = self.word_before(self.next(at))..self.word_after(at);
@@ -1139,6 +1146,19 @@ fn line_marker(line: &str) -> usize {
     at
 }
 
+/// The address of the link `at` falls in.
+fn link_at(text: &str, at: usize) -> Option<String> {
+    fn find(node: &Node, at: usize) -> Option<String> {
+        if let Node::Link(link) = node
+            && span(node).is_some_and(|range| range.contains(&at))
+        {
+            return Some(link.url.clone());
+        }
+        node.children()?.iter().find_map(|child| find(child, at))
+    }
+    find(&markdown::to_mdast(text, &markdown::ParseOptions::gfm()).ok()?, at)
+}
+
 fn paint(each: &mut [Look], range: Range<usize>, change: impl Fn(&mut Look)) {
     let end = range.end.min(each.len());
     for look in &mut each[range.start.min(end)..end] {
@@ -1224,7 +1244,7 @@ fn inline(node: &Node, each: &mut [Look]) {
 #[cfg(test)]
 mod tests {
     // Not the glob: GPUI's own `test` attribute would come with it.
-    use super::{Ink, from_shown, looks, to_shown};
+    use super::{Ink, from_shown, link_at, looks, to_shown};
 
     fn marked(text: &str) -> String {
         looks(text, &[])
@@ -1234,6 +1254,13 @@ mod tests {
                 _ => text[range].to_string(),
             })
             .collect()
+    }
+
+    #[test]
+    fn a_link_is_found_under_its_text() {
+        let text = "See [the plan](plan.md) now";
+        assert_eq!(link_at(text, 6).as_deref(), Some("plan.md"));
+        assert_eq!(link_at(text, 1), None);
     }
 
     #[test]

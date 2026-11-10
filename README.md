@@ -22,8 +22,8 @@ writes. Native, keyboard first, no webview.
 - **Other formats**: JSON and YAML as foldable trees, CSV as a table, images, read only. Code
   opens in an editor, highlighted by extension: click in it or `i`, `Esc` to leave. Binary files
   and files over 10 MB are refused.
-- **Links**: relative links to files and anchors, back and forward, an outline. Broken links are
-  red. Clicking a heading copies its link (`file.md#slug`).
+- **Links**: relative links to files and anchors, back and forward, an outline. `Ctrl`-click
+  follows a link, a plain click edits it like any text. Broken links are red. Clicking a heading copies its link (`file.md#slug`).
 - **Search**: in the file (`Ctrl-F`), across the folder through ripgrep (`s`), files by a few letters
   (`f`, recent first).
 - **Live reload**: written in place or replaced by a rename, the file is read again where you are.

@@ -422,13 +422,10 @@ fn text_flow(ctx: &Ctx, inlines: &[Inline]) -> AnyElement {
     let reader = ctx.cx.entity().downgrade();
     let (ranges, targets): (Vec<_>, Vec<_>) = links.into_iter().unzip();
     InteractiveText::new(ctx.id("text"), styled)
-        .on_click(ranges, move |ix, window, cx| {
-            // Followed, not edited.
-            cx.stop_propagation();
+        .on_click(ranges, move |ix, _, cx| {
+            // The block's own click edits it, or follows this with Ctrl held.
             let link = targets[ix].clone();
-            reader
-                .update(cx, |this, cx| this.follow(&link, window, cx))
-                .ok();
+            reader.update(cx, |this, _| this.clicked_link = Some(link.to_string())).ok();
         })
         .into_any_element()
 }
@@ -525,8 +522,11 @@ fn word(ctx: &Ctx, text: &str, marks: &Marks, change: Change) -> AnyElement {
             let link = link.clone();
             element
                 .id(ctx.id("link"))
-                .on_click(ctx.cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    // Followed, not edited.
+                .on_click(ctx.cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    // A click edits, as anywhere else; ctrl-click follows.
+                    if !event.modifiers().secondary() {
+                        return;
+                    }
                     cx.stop_propagation();
                     this.follow(&link, window, cx)
                 }))
