@@ -1,0 +1,8 @@
+# The variants a push to ci/bench builds, one per line (see .github/workflows/bench.yml):
+# `<name>` for stock, base, fonts, vulkan or both (the fork's bench/v0.1.10-<name>), or
+# `<name> <ref>` for any branch, tag or full commit SHA of KristenJestin/gpui-fast, built as rature-<name>.
+stock
+base
+fonts
+vulkan
+both

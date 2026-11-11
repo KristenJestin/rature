@@ -1,0 +1,253 @@
+# Builds Rature's start-up benchmark binaries, one per gpui-fast variant, and publishes them as a
+# prerelease (never the latest release) so they can be fetched without a login and measured on
+# a real machine. Nothing here measures anything: runners have no usable GPU.
+#
+# Variants: stock is Rature as it is (gpui-fast from crates.io, the lock untouched); every other
+# one is Rature with its gpui-fast crates patched to a branch of the KristenJestin/gpui-fast fork,
+# turned into release crates by the fork's own script/prepare-release.ts.
+#
+# Started by a push to ci/bench (the variants of .github/bench-variants), or by hand
+# (workflow_dispatch), where `gpui_ref` adds one variant built from any ref of the fork.
+name: Bench binaries
+
+on:
+  push:
+    branches: [ci/bench]
+  workflow_dispatch:
+    inputs:
+      variants:
+        description: "Variants to build, separated by spaces (stock base fonts vulkan both); empty: those of .github/bench-variants"
+        required: false
+        default: ""
+      gpui_ref:
+        description: "A branch, tag or full commit SHA of KristenJestin/gpui-fast to build as one more variant"
+        required: false
+        default: ""
+      gpui_name:
+        description: "That variant's name (rature-<name>)"
+        required: false
+        default: "custom"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # The toolchain the binaries measured so far were built with (rustc 1.99.1, Arch Linux).
+  RUST_TOOLCHAIN: "1.99.1"
+  # As Rature's Cargo.toml: the symbol tables are never loaded.
+  CARGO_PROFILE_RELEASE_STRIP: "true"
+  FORK: KristenJestin/gpui-fast
+  # A local version above every release: matches gpui-kit 0.8.0's ^0.1.10.
+  RELEASE_TAG: v0.1.99
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - id: plan
+        name: Variants to build
+        env:
+          VARIANTS: ${{ inputs.variants }}
+          GPUI_REF: ${{ inputs.gpui_ref }}
+          GPUI_NAME: ${{ inputs.gpui_name }}
+        run: |
+          set -euo pipefail
+          # One variant per line: `<name>` for a known one, `<name> <ref of the fork>` for any other.
+          if [ -n "${VARIANTS:-}" ]; then
+            lines=$(printf '%s\n' $VARIANTS)
+          else
+            lines=$(grep -v -e '^#' -e '^[[:space:]]*$' .github/bench-variants)
+          fi
+          if [ -n "${GPUI_REF:-}" ]; then
+            lines=$(printf '%s\n%s %s\n' "$lines" "${GPUI_NAME:-custom}" "$GPUI_REF")
+          fi
+          rows=()
+          while read -r v ref; do
+            [ -n "$v" ] || continue
+            [[ $v =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "::error::bad variant name $v"; exit 1; }
+            if [ -z "$ref" ]; then
+              case $v in
+                stock) ref= ;;
+                base|fonts|vulkan|both) ref=bench/v0.1.10-$v ;;
+                *) echo "::error::variant $v names no ref of the fork"; exit 1 ;;
+              esac
+            fi
+            rows+=("$(jq -cn --arg v "$v" --arg r "$ref" '{variant: $v, ref: $r}')")
+          done <<<"$lines"
+          matrix=$(printf '%s\n' "${rows[@]}" | jq -cs '{include: .}')
+          echo "$matrix" | jq .
+          echo "matrix=$matrix" >>"$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.variant }}
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: rature
+
+      - uses: actions/checkout@v4
+        if: matrix.ref != ''
+        with:
+          repository: ${{ env.FORK }}
+          ref: ${{ matrix.ref }}
+          path: gpui-fast
+
+      # As gpui-fast's own ci.yml.
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config \
+            libasound2-dev libfontconfig-dev libfreetype-dev libssl-dev \
+            libvulkan1 libwayland-dev libx11-xcb-dev libxcb1-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libzstd-dev \
+            libgtk-3-dev libwebkit2gtk-4.1-dev
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+          rustc -vV
+
+      - uses: oven-sh/setup-bun@v2
+        if: matrix.ref != ''
+
+      - name: Generate the gpui-fast release crates
+        if: matrix.ref != ''
+        run: |
+          set -euo pipefail
+          echo "gpui-fast $(git -C gpui-fast rev-parse HEAD) ($MATRIX_REF):"
+          git -C gpui-fast log --oneline -n 5
+          bun gpui-fast/script/prepare-release.ts --tag "$RELEASE_TAG"
+          ls gpui-fast/target/release-workspace
+        env:
+          MATRIX_REF: ${{ matrix.ref }}
+
+      - name: Patch Rature onto them
+        if: matrix.ref != ''
+        working-directory: rature
+        run: |
+          set -euo pipefail
+          rel=$GITHUB_WORKSPACE/gpui-fast/target/release-workspace
+          cp Cargo.lock "$RUNNER_TEMP/Cargo.lock.orig"
+          {
+            echo
+            echo "[patch.crates-io]"
+            for c in gpui gpui_macros gpui_apple gpui_wgpu gpui_macos gpui_linux gpui_windows gpui_web gpui_platform; do
+              name=$(grep -m1 '^name = ' "$rel/$c/Cargo.toml" | cut -d'"' -f2)
+              echo "$name = { path = \"$rel/$c\" }"
+            done
+          } >>Cargo.toml
+          tail -n 11 Cargo.toml
+          pkgs=(gpui-fast gpui-fast-macros gpui-fast-apple gpui-fast-wgpu gpui-fast-macos
+            gpui-fast-linux gpui-fast-windows gpui-fast-web gpui-fast-platform)
+          # The lock holds 0.1.10: the patch is taken only once these are updated to it.
+          args=(); for p in "${pkgs[@]}"; do args+=(-p "$p"); done
+          cargo update "${args[@]}"
+          for p in "${pkgs[@]}"; do
+            id=$(cargo pkgid "$p")
+            case $id in
+              *release-workspace*) ;;
+              *) echo "::error::the patch of $p is not used: $id"; exit 1 ;;
+            esac
+          done
+          echo "lock changes against Rature's:"
+          diff "$RUNNER_TEMP/Cargo.lock.orig" Cargo.lock | grep '^[<>] name = \|^[<>] version = \|^[<>] source = ' || true
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rature
+          key: ${{ matrix.variant }}
+
+      - name: Build
+        working-directory: rature
+        run: cargo build --release --locked
+
+      - name: Collect the binary
+        env:
+          VARIANT: ${{ matrix.variant }}
+          MATRIX_REF: ${{ matrix.ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp rature/target/release/rature "dist/rature-$VARIANT"
+          {
+            printf 'rature-%s: Rature %s' "$VARIANT" "$(git -C rature rev-parse --short=12 HEAD)"
+            if [ -n "$MATRIX_REF" ]; then
+              printf ', gpui-fast %s (%s)' "$(git -C gpui-fast rev-parse --short=12 HEAD)" "$MATRIX_REF"
+            else
+              printf ', gpui-fast from crates.io (%s)' "$(cd rature && cargo pkgid gpui-fast | sed 's/.*[#@]//')"
+            fi
+            printf ', %s\n' "$(rustc -V)"
+          } >"dist/rature-$VARIANT.txt"
+          cat "dist/rature-$VARIANT.txt"
+          ls -l dist
+          file "dist/rature-$VARIANT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rature-${{ matrix.variant }}
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
+
+  release:
+    name: Publish the prerelease
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create the prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: bench-${{ github.run_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          cd dist
+          bins=()
+          for f in rature-*; do
+            case $f in *.txt) ;; *) chmod +x "$f"; bins+=("$f") ;; esac
+          done
+          sha256sum "${bins[@]}" >SHA256SUMS
+          cat SHA256SUMS
+          {
+            echo "Start-up benchmark binaries, built by $RUN_URL from $GITHUB_SHA."
+            echo "Not a release of Rature: for measurements only."
+            echo
+            echo '```'
+            cat rature-*.txt
+            echo '```'
+            echo
+            echo "Fetch: \`target/startup-bench/tools/fetch.sh $TAG\`"
+          } >"$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --prerelease --latest=false \
+            --title "$TAG (bench binaries)" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            "${bins[@]}" SHA256SUMS
+          echo "### $TAG" >>"$GITHUB_STEP_SUMMARY"
+          echo "${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG" >>"$GITHUB_STEP_SUMMARY"
