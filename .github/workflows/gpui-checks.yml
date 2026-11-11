@@ -4,7 +4,7 @@
 #
 # Every ref is checked the same way, the base the fixes start from included, so that a failure
 # can be told apart from one that already exists there. Every check runs even when one before it
-# failed: the run shows them all.
+# failed, and the job's last step lists them all with the lines that tell why one failed.
 #
 # Started by a push to ci/gpui-checks (the default refs below), or by hand (workflow_dispatch).
 name: gpui-fast checks
@@ -84,7 +84,15 @@ jobs:
       run:
         shell: bash
         working-directory: gpui-fast
+    env:
+      # Relative to gpui-fast, the steps' folder: a Windows path would lose its backslashes.
+      CHECK: bash ../rature/.github/gpui-check.sh
     steps:
+      - uses: actions/checkout@v4
+        with:
+          path: rature
+          sparse-checkout: .github
+
       - uses: actions/checkout@v4
         with:
           repository: ${{ env.FORK }}
@@ -138,53 +146,70 @@ jobs:
       # Linux: gpui-fast's lint job, then its test job, then the tests of the crates the fixes touch.
       - name: Check that upstream files only hold hooks
         if: matrix.os == 'linux' && !cancelled()
-        run: script/check-upstream
+        run: $CHECK "check-upstream" script/check-upstream
 
       - name: Rustfmt (gpui-fast CI)
         if: matrix.os == 'linux' && !cancelled()
-        run: cargo fmt -p gpui -p gpui_perf -- --check
+        run: $CHECK "fmt gpui gpui_perf" cargo fmt -p gpui -p gpui_perf -- --check
 
       - name: Rustfmt gpui_wgpu, gpui_linux
         if: matrix.os == 'linux' && !cancelled()
-        run: cargo fmt -p gpui_wgpu -p gpui_linux -- --check
+        run: $CHECK "fmt gpui_wgpu gpui_linux" cargo fmt -p gpui_wgpu -p gpui_linux -- --check
 
       - name: Clippy (gpui-fast CI)
         if: matrix.os == 'linux' && !cancelled()
-        run: cargo clippy -p gpui -p gpui_perf --all-targets --features gpui/test-support -- -D warnings
+        run: $CHECK "clippy gpui gpui_perf" cargo clippy -p gpui -p gpui_perf --all-targets --features gpui/test-support -- -D warnings
 
       - name: Clippy gpui_wgpu, gpui_linux
         if: matrix.os == 'linux' && !cancelled()
-        run: cargo clippy -p gpui_wgpu -p gpui_linux --all-targets -- -D warnings
+        run: $CHECK "clippy gpui_wgpu gpui_linux" cargo clippy -p gpui_wgpu -p gpui_linux --all-targets -- -D warnings
 
       - name: Test gpui
         if: matrix.os == 'linux' && !cancelled()
-        run: cargo test -p gpui --features test-support
+        run: $CHECK "test gpui test-support" cargo test --no-fail-fast -p gpui --features test-support
 
       - name: Test composition on WGPU (gpui-fast CI)
         if: matrix.os == 'linux' && !cancelled()
-        run: cargo test -p gpui_linux fast::composition -- --nocapture
+        run: $CHECK "test gpui_linux fast::composition" cargo test --no-fail-fast -p gpui_linux fast::composition -- --nocapture
 
       - name: Test gpui_wgpu
         if: matrix.os == 'linux' && !cancelled()
-        run: cargo test -p gpui_wgpu
+        run: $CHECK "test gpui_wgpu" cargo test --no-fail-fast -p gpui_wgpu
 
       - name: Test gpui_linux
         if: matrix.os == 'linux' && !cancelled()
-        run: cargo test -p gpui_linux
+        run: $CHECK "test gpui_linux" cargo test --no-fail-fast -p gpui_linux
 
       - name: Test gpui_wgpu lib with test-support
         if: matrix.os == 'linux' && !cancelled()
-        run: cargo test -p gpui_wgpu --features test-support --lib
+        run: $CHECK "test gpui_wgpu test-support lib" cargo test --no-fail-fast -p gpui_wgpu --features test-support --lib
 
       # macOS and Windows: the fixes are meant for Linux; they must build there.
       - name: Check gpui_wgpu
         if: matrix.os != 'linux' && !cancelled()
-        run: cargo check -p gpui_wgpu --all-targets
+        run: $CHECK "check gpui_wgpu" cargo check -p gpui_wgpu --all-targets
 
       - name: Check gpui_wgpu with test-support
         if: matrix.os != 'linux' && !cancelled()
-        run: cargo check -p gpui_wgpu --all-targets --features test-support
+        run: $CHECK "check gpui_wgpu test-support" cargo check -p gpui_wgpu --all-targets --features test-support
 
       - name: Check gpui_perf (gpui-fast CI)
         if: '!cancelled()'
-        run: cargo check -p gpui_perf --all-targets
+        run: $CHECK "check gpui_perf" cargo check -p gpui_perf --all-targets
+
+      - name: Summary
+        if: always()
+        env:
+          TITLE: ${{ matrix.name }} (${{ matrix.os }}) at ${{ matrix.ref }}
+        run: |
+          {
+            echo "### $TITLE"
+            echo '```'
+            cat "$RUNNER_TEMP/results.txt" 2>/dev/null || echo "no check ran"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+          echo "===== RESULTS: $TITLE"
+          cat "$RUNNER_TEMP/results.txt" 2>/dev/null || echo "no check ran"
+          echo
+          cat "$RUNNER_TEMP/failures.txt" 2>/dev/null || true
+          echo "===== END OF RESULTS"
