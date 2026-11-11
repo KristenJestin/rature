@@ -23,6 +23,8 @@ else
     sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$log" |
       grep -E -A14 '^error|^warning: .* generated|^test .* FAILED$|panicked at|^failures:$|^FAIL:|^Diff in|^test result: FAILED' |
       head -n 250
+    echo "----- last lines"
+    sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$log" | tail -n 25
     echo
   } >>"$RUNNER_TEMP/failures.txt"
 fi

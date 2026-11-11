@@ -212,4 +212,6 @@ jobs:
           cat "$RUNNER_TEMP/results.txt" 2>/dev/null || echo "no check ran"
           echo
           cat "$RUNNER_TEMP/failures.txt" 2>/dev/null || true
+          echo "===== RESULTS AGAIN: $TITLE"
+          cat "$RUNNER_TEMP/results.txt" 2>/dev/null || echo "no check ran"
           echo "===== END OF RESULTS"
