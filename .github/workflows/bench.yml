@@ -109,17 +109,17 @@ jobs:
           # prepare-release.ts diffs against the upstream import commit.
           fetch-depth: 0
 
-      # The packages of gpui-fast's own ci.yml. A mirror that does not answer fails the job in
-      # minutes rather than at its timeout.
+      # Those of gpui-fast's own ci.yml that Rature's build needs: its lock has no crate that links
+      # GTK, WebKit, ALSA, OpenSSL or zstd. A mirror that does not answer fails the job in minutes
+      # rather than at its timeout.
       - name: Install Linux dependencies
         timeout-minutes: 20
         run: |
           apt=(sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
           pkgs=(build-essential pkg-config
-            libasound2-dev libfontconfig-dev libfreetype-dev libssl-dev
+            libfontconfig-dev libfreetype-dev
             libvulkan1 libwayland-dev libx11-xcb-dev libxcb1-dev
-            libxkbcommon-dev libxkbcommon-x11-dev libzstd-dev
-            libgtk-3-dev libwebkit2gtk-4.1-dev)
+            libxkbcommon-dev libxkbcommon-x11-dev)
           for attempt in 1 2 3; do
             "${apt[@]}" update && "${apt[@]}" install -y --no-install-recommends "${pkgs[@]}" && exit 0
             echo "::warning::apt-get failed (attempt $attempt)"; sleep 30
