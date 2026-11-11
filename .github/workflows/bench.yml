@@ -106,6 +106,8 @@ jobs:
           repository: ${{ env.FORK }}
           ref: ${{ matrix.ref }}
           path: gpui-fast
+          # prepare-release.ts diffs against the upstream import commit.
+          fetch-depth: 0
 
       # The packages of gpui-fast's own ci.yml. A mirror that does not answer fails the job in
       # minutes rather than at its timeout.
