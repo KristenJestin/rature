@@ -104,6 +104,13 @@ jobs:
       - name: Commit checked
         run: git log --oneline -n 3
 
+      # script/check-upstream reads the import commit named in UPSTREAM, which lives on
+      # longbridge/gpui-fast's upstream/* branches: a fork does not copy them.
+      - name: Fetch longbridge's upstream import branches
+        if: matrix.os == 'linux'
+        timeout-minutes: 10
+        run: git fetch --no-tags https://github.com/longbridge/gpui-fast.git '+refs/heads/upstream/*:refs/remotes/longbridge/upstream/*'
+
       # Several feature sets of gpui are built in one job: room for their target folders.
       - name: Free disk space
         if: matrix.os == 'linux'
@@ -163,6 +170,15 @@ jobs:
       - name: Clippy gpui_wgpu, gpui_linux
         if: matrix.os == 'linux' && !cancelled()
         run: $CHECK "clippy gpui_wgpu gpui_linux" cargo clippy -p gpui_wgpu -p gpui_linux --all-targets -- -D warnings
+
+      # The same, with the two lints that already fail on the fixes' base (in files they do not
+      # touch) allowed: anything else it finds is new.
+      - name: Clippy gpui_wgpu, gpui_linux, base's lints allowed
+        if: matrix.os == 'linux' && !cancelled()
+        run: >-
+          $CHECK "clippy gpui_wgpu gpui_linux, base's lints allowed"
+          cargo clippy -p gpui_wgpu -p gpui_linux --all-targets --
+          -D warnings -A clippy::duplicate_mod -A clippy::manual_is_multiple_of
 
       - name: Test gpui
         if: matrix.os == 'linux' && !cancelled()
