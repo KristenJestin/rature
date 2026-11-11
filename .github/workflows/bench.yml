@@ -257,5 +257,12 @@ jobs:
             --title "$TAG (bench binaries)" \
             --notes-file "$RUNNER_TEMP/notes.md" \
             "${bins[@]}" SHA256SUMS
+          # Only the 3 latest bench prereleases are kept, with their tags.
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName,createdAt \
+            --jq '[.[] | select(.tagName | startswith("bench-"))] | sort_by(.createdAt) | reverse | .[3:] | .[].tagName' |
+            while read -r old; do
+              echo "deleting the old prerelease $old"
+              gh release delete "$old" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+            done
           echo "### $TAG" >>"$GITHUB_STEP_SUMMARY"
           echo "${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG" >>"$GITHUB_STEP_SUMMARY"
