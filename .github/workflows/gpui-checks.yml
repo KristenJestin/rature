@@ -1,0 +1,190 @@
+# Runs gpui-fast's own checks (as longbridge/gpui-fast's .github/workflows/ci.yml runs them, plus
+# those of the crates a fix touches) on branches of the KristenJestin/gpui-fast fork, so nothing is
+# compiled on the owner's machine before a pull request is opened upstream.
+#
+# Every ref is checked the same way, the base the fixes start from included, so that a failure
+# can be told apart from one that already exists there. Every check runs even when one before it
+# failed: the run shows them all.
+#
+# Started by a push to ci/gpui-checks (the default refs below), or by hand (workflow_dispatch).
+name: gpui-fast checks
+
+on:
+  push:
+    branches: [ci/gpui-checks]
+  workflow_dispatch:
+    inputs:
+      refs:
+        description: "Refs of KristenJestin/gpui-fast to check, separated by spaces (branches, tags or full SHAs); empty: the defaults"
+        required: false
+        default: ""
+      os:
+        description: "Systems, separated by spaces (linux macos windows)"
+        required: false
+        default: "linux macos windows"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  FORK: KristenJestin/gpui-fast
+  # The two fixes, and the commit of longbridge/gpui-fast main they are based on.
+  DEFAULT_REFS: >-
+    perf/linux-background-font-scan
+    perf/vulkan-first-instance
+    c2bec823e37692f2be7d87307fdd77b0035de34b
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
+        name: Refs and systems
+        env:
+          REFS: ${{ inputs.refs }}
+          SYSTEMS: ${{ inputs.os || 'linux macos windows' }}
+        run: |
+          set -euo pipefail
+          refs=${REFS:-$DEFAULT_REFS}
+          rows=()
+          for ref in $refs; do
+            # A short name for the job: the branch's last part, or the SHA's first 10 characters.
+            if [[ $ref =~ ^[0-9a-f]{40}$ ]]; then name=base-${ref:0:10}; else name=${ref##*/}; fi
+            for os in $SYSTEMS; do
+              case $os in
+                linux) runner=ubuntu-24.04 ;;
+                macos) runner=macos-latest ;;
+                windows) runner=windows-latest ;;
+                *) echo "::error::unknown system $os"; exit 1 ;;
+              esac
+              rows+=("$(jq -cn --arg r "$ref" --arg n "$name" --arg o "$os" --arg u "$runner" \
+                '{ref: $r, name: $n, os: $o, runner: $u}')")
+            done
+          done
+          matrix=$(printf '%s\n' "${rows[@]}" | jq -cs '{include: .}')
+          echo "$matrix" | jq .
+          echo "matrix=$matrix" >>"$GITHUB_OUTPUT"
+
+  check:
+    name: ${{ matrix.name }} (${{ matrix.os }})
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: gpui-fast
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FORK }}
+          ref: ${{ matrix.ref }}
+          path: gpui-fast
+          # script/check-upstream compares with the upstream import commit.
+          fetch-depth: 0
+
+      - name: Commit checked
+        run: git log --oneline -n 3
+
+      # Several feature sets of gpui are built in one job: room for their target folders.
+      - name: Free disk space
+        if: matrix.os == 'linux'
+        working-directory: .
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      # gpui-fast's own list, plus Mesa's software Vulkan and GL drivers so the headless wgpu
+      # tests find an adapter on a runner without a GPU. A mirror that does not answer fails the
+      # job in minutes rather than at its timeout.
+      - name: Install Linux dependencies
+        if: matrix.os == 'linux'
+        timeout-minutes: 20
+        run: |
+          apt=(sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          pkgs=(build-essential pkg-config
+            libasound2-dev libfontconfig-dev libfreetype-dev libssl-dev
+            libvulkan1 libwayland-dev libx11-xcb-dev libxcb1-dev
+            libxkbcommon-dev libxkbcommon-x11-dev libzstd-dev
+            libgtk-3-dev libwebkit2gtk-4.1-dev
+            mesa-vulkan-drivers libegl1 libegl-mesa0)
+          for attempt in 1 2 3; do
+            "${apt[@]}" update && "${apt[@]}" install -y "${pkgs[@]}" && exit 0
+            echo "::warning::apt-get failed (attempt $attempt)"; sleep 30
+          done
+          exit 1
+
+      # rust-toolchain.toml pins the toolchain; this installs it.
+      - name: Install Rust
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: gpui-fast
+          key: ${{ matrix.name }}
+          # A failing check would otherwise leave the next run to build everything again.
+          cache-on-failure: true
+
+      # Linux: gpui-fast's lint job, then its test job, then the tests of the crates the fixes touch.
+      - name: Check that upstream files only hold hooks
+        if: matrix.os == 'linux' && !cancelled()
+        run: script/check-upstream
+
+      - name: Rustfmt (gpui-fast CI)
+        if: matrix.os == 'linux' && !cancelled()
+        run: cargo fmt -p gpui -p gpui_perf -- --check
+
+      - name: Rustfmt gpui_wgpu, gpui_linux
+        if: matrix.os == 'linux' && !cancelled()
+        run: cargo fmt -p gpui_wgpu -p gpui_linux -- --check
+
+      - name: Clippy (gpui-fast CI)
+        if: matrix.os == 'linux' && !cancelled()
+        run: cargo clippy -p gpui -p gpui_perf --all-targets --features gpui/test-support -- -D warnings
+
+      - name: Clippy gpui_wgpu, gpui_linux
+        if: matrix.os == 'linux' && !cancelled()
+        run: cargo clippy -p gpui_wgpu -p gpui_linux --all-targets -- -D warnings
+
+      - name: Test gpui
+        if: matrix.os == 'linux' && !cancelled()
+        run: cargo test -p gpui --features test-support
+
+      - name: Test composition on WGPU (gpui-fast CI)
+        if: matrix.os == 'linux' && !cancelled()
+        run: cargo test -p gpui_linux fast::composition -- --nocapture
+
+      - name: Test gpui_wgpu
+        if: matrix.os == 'linux' && !cancelled()
+        run: cargo test -p gpui_wgpu
+
+      - name: Test gpui_linux
+        if: matrix.os == 'linux' && !cancelled()
+        run: cargo test -p gpui_linux
+
+      - name: Test gpui_wgpu lib with test-support
+        if: matrix.os == 'linux' && !cancelled()
+        run: cargo test -p gpui_wgpu --features test-support --lib
+
+      # macOS and Windows: the fixes are meant for Linux; they must build there.
+      - name: Check gpui_wgpu
+        if: matrix.os != 'linux' && !cancelled()
+        run: cargo check -p gpui_wgpu --all-targets
+
+      - name: Check gpui_wgpu with test-support
+        if: matrix.os != 'linux' && !cancelled()
+        run: cargo check -p gpui_wgpu --all-targets --features test-support
+
+      - name: Check gpui_perf (gpui-fast CI)
+        if: '!cancelled()'
+        run: cargo check -p gpui_perf --all-targets
