@@ -59,6 +59,12 @@ const TTL_MS: u64 = 3_600_000;
 /// marked `truncated`: a client keeps a tool's answer to some 25 000 tokens (Claude Code).
 const SUMMARY_PAST: usize = 50_000;
 
+/// The longest line read on stdin, its end included: past it, the line is skipped without being
+/// kept, and answered with a parse error. A request is far smaller: a `canvas_create` of a few
+/// thousand cards of text is some hundreds of kilobytes; this leaves room for any canvas a
+/// person reads, and keeps a line that never ends from filling the memory.
+const LONGEST_LINE: usize = 16 * 1024 * 1024;
+
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -446,17 +452,34 @@ struct Server {
 }
 
 impl Server {
-    fn serve(&mut self, mut input: impl BufRead, mut output: impl Write) -> io::Result<()> {
+    fn serve(&mut self, input: impl BufRead, output: impl Write) -> io::Result<()> {
+        self.serve_lines(input, output, LONGEST_LINE)
+    }
+
+    /// [`Server::serve`], a line read up to `longest` bytes.
+    fn serve_lines(
+        &mut self,
+        mut input: impl BufRead,
+        mut output: impl Write,
+        longest: usize,
+    ) -> io::Result<()> {
         let mut line = Vec::new();
         loop {
-            line.clear();
-            if input.read_until(b'\n', &mut line)? == 0 {
-                return Ok(());
-            }
-            if line.iter().all(u8::is_ascii_whitespace) {
-                continue;
-            }
-            if let Some(answer) = self.answer(&line) {
+            let answer = match read_line(&mut input, &mut line, longest)? {
+                Line::End => return Ok(()),
+                Line::TooLong => Some(failure(
+                    Value::Null,
+                    RpcError::new(
+                        PARSE_ERROR,
+                        format!(
+                            "Parse error: the message is longer than {longest} bytes, and was not read"
+                        ),
+                    ),
+                )),
+                Line::Whole if line.iter().all(u8::is_ascii_whitespace) => continue,
+                Line::Whole => self.answer(&line),
+            };
+            if let Some(answer) = answer {
                 let mut text = serde_json::to_string(&answer).expect("a JSON value is written");
                 text.push('\n');
                 output.write_all(text.as_bytes())?;
@@ -588,6 +611,56 @@ impl Server {
             "tools/list" => tools_list(params).map(Value::Object),
             "tools/call" => tools_call(&self.folders, params),
             _ => Err(unknown_method(method)),
+        }
+    }
+}
+
+/// What [`read_line`] read.
+#[derive(Debug, PartialEq)]
+enum Line {
+    /// The input ended before a line began.
+    End,
+    /// A line, whole, its end of line included if it has one.
+    Whole,
+    /// A line longer than the bound: read to its end, and not kept.
+    TooLong,
+}
+
+/// Reads the next line of `input` into `line`, at most `longest` bytes of it: a longer line is
+/// read on to its end (or the input's) without being kept.
+fn read_line(input: &mut impl BufRead, line: &mut Vec<u8>, longest: usize) -> io::Result<Line> {
+    line.clear();
+    let (mut began, mut too_long) = (false, false);
+    loop {
+        let available = match input.fill_buf() {
+            Ok(available) => available,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if available.is_empty() {
+            return Ok(match (began, too_long) {
+                (false, _) => Line::End,
+                (true, false) => Line::Whole,
+                (true, true) => Line::TooLong,
+            });
+        }
+        began = true;
+        let (used, ends) = match available.iter().position(|&b| b == b'\n') {
+            Some(end) => (end + 1, true),
+            None => (available.len(), false),
+        };
+        if !too_long {
+            if line.len() + used > longest {
+                too_long = true;
+                line.clear();
+                line.shrink_to_fit();
+            } else {
+                line.extend_from_slice(&available[..used]);
+            }
+        }
+        input.consume(used);
+        if ends {
+            return Ok(if too_long { Line::TooLong } else { Line::Whole });
         }
     }
 }
@@ -1068,6 +1141,54 @@ mod tests {
         );
         assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 1);
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_line_past_the_bound_is_skipped_unkept_and_the_next_one_read() {
+        // A buffer smaller than a line: the line comes in pieces.
+        let text = b"0123456789\nabcdefghijklmnopqrstuvwxyz\nend".to_vec();
+        let mut input = io::BufReader::with_capacity(4, io::Cursor::new(text));
+        let mut line = Vec::new();
+        assert_eq!(read_line(&mut input, &mut line, 11).unwrap(), Line::Whole);
+        assert_eq!(line, b"0123456789\n", "at the bound, its end included");
+        assert_eq!(read_line(&mut input, &mut line, 11).unwrap(), Line::TooLong);
+        assert!(line.is_empty());
+        assert_eq!(read_line(&mut input, &mut line, 11).unwrap(), Line::Whole);
+        assert_eq!(line, b"end");
+        assert_eq!(read_line(&mut input, &mut line, 11).unwrap(), Line::End);
+        // A line that never ends, past the bound.
+        let mut input = io::Cursor::new(vec![b'x'; 100]);
+        assert_eq!(read_line(&mut input, &mut line, 11).unwrap(), Line::TooLong);
+        assert_eq!(read_line(&mut input, &mut line, 11).unwrap(), Line::End);
+    }
+
+    #[test]
+    fn a_message_past_the_bound_gets_a_parse_error_and_the_next_one_its_answer() {
+        let mut server = Server {
+            folders: Folders {
+                start: "/nowhere".into(),
+                allowed: Vec::new(),
+            },
+            legacy: None,
+        };
+        let ping = r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#;
+        let input = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{}\"}}\n{ping}\n",
+            "x".repeat(200)
+        );
+        let mut output = Vec::new();
+        server
+            .serve_lines(io::Cursor::new(input), &mut output, 100)
+            .unwrap();
+        let answers: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(answers.len(), 2, "{answers:?}");
+        assert_eq!(answers[0]["id"], Value::Null);
+        assert_eq!(answers[0]["error"]["code"], PARSE_ERROR);
+        assert_eq!(answers[1], json!({"jsonrpc": "2.0", "id": 7, "result": {}}));
     }
 
     #[test]

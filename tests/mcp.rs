@@ -788,6 +788,25 @@ fn the_arguments_are_checked_before_serving() {
 }
 
 #[test]
+fn a_message_past_16_mib_is_not_read_and_the_next_one_is_served() {
+    let place = Place::new("long");
+    // A request the server would answer, were it read: a ping with a long, unknown field.
+    let long = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"ping","params":{{"pad":"{}"}}}}"#,
+        "x".repeat(16 * 1024 * 1024)
+    );
+    let lines = [
+        long,
+        r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#.to_owned(),
+    ];
+    let answers = place.raw_session(&[], &lines);
+    assert_eq!(answers.len(), 2, "{answers:?}");
+    assert!(answers[0]["id"].is_null(), "{}", answers[0]);
+    assert_eq!(answers[0]["error"]["code"], -32700);
+    assert_eq!(result(&answers, 2), &json!({}));
+}
+
+#[test]
 fn the_server_ends_when_stdin_does() {
     let place = Place::new("eof");
     let (out, _, status) = place.run(&[], &[]);
