@@ -74,7 +74,7 @@ grouped (breaking changes, features, fixes, performance, other), `- **<scope>**:
 the commits' own language.
 
 `Cargo.toml` keeps its own version. CI gives the computed one to the build
-(`RATURE_BUILD_VERSION`, `RATURE_BUILD_CHANNEL`, `RATURE_BUILD_BRANCH`, read by `build.rs`).
+(`RATURE_BUILD_VERSION` and `RATURE_BUILD_CHANNEL`, read by `build.rs`).
 `rature --version` says the version, the channel and the commit:
 `rature 0.2.0-beta.12 (beta, 3f2a9c1d7b44)`. A build CI did not make is `local`:
 `rature 0.1.0 (local, 3f2a9c1d7b44)`.

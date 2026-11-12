@@ -11,7 +11,6 @@ fn main() {
     };
     let version = from("RATURE_BUILD_VERSION").unwrap_or_else(|| env!("CARGO_PKG_VERSION").into());
     let channel = from("RATURE_BUILD_CHANNEL").unwrap_or_else(|| "local".into());
-    let branch = from("RATURE_BUILD_BRANCH").unwrap_or_default();
     let git = |args: &[&str]| {
         let output = Command::new("git").args(args).output().ok()?;
         output
@@ -32,5 +31,4 @@ fn main() {
     println!("cargo:rustc-env=RATURE_VERSION={full}");
     println!("cargo:rustc-env=RATURE_VERSION_NUMBER={version}");
     println!("cargo:rustc-env=RATURE_CHANNEL={channel}");
-    println!("cargo:rustc-env=RATURE_BRANCH={branch}");
 }
