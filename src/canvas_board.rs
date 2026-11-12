@@ -7,8 +7,8 @@
 //! 800 ms after the last key in a card's text. Changes to the same fields of a node one after
 //! the other, before they are written (a drag, keys typed), are one operation, undone at once.
 //!
-//! The lock is a file of Rature's own, `$XDG_RUNTIME_DIR/rature/canvas-<hash of the path>.lock`,
-//! never one beside the canvas: it keeps the window and `rature mcp` from writing the same
+//! The lock is a file of Rature's own, `$XDG_RUNTIME_DIR/rature/canvas-<hash of the path>.lock`
+//! (`/run/user/<uid>` without the variable), never one beside the canvas: it keeps the window and `rature mcp` from writing the same
 //! canvas at once. Against another program (Obsidian, an editor), `fsio::update`'s look just
 //! before its rename stays the only guard.
 
@@ -354,7 +354,8 @@ pub fn create_in(folder: &File, name: &OsStr, locks: &Path, text: &str) -> io::R
 }
 
 /// The folder of the canvases' locks: `rature` in the user's runtime folder, beside the
-/// socket of the window (in a private folder of the temporary one when there is none).
+/// socket of the window: the same folder whether `XDG_RUNTIME_DIR` is set or not, so that the
+/// window and `rature mcp` take the same locks (`instance::runtime_folder`).
 pub fn runtime_locks() -> PathBuf {
     let socket = crate::instance::socket();
     socket.parent().unwrap_or(Path::new("/")).join("rature")

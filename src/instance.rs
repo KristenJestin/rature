@@ -4,6 +4,7 @@
 //! The protocol is one message per connection: the path's raw bytes, then a NUL (a path never
 //! holds one). A lone NUL asks only for the window.
 
+use std::ffi::OsString;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -16,17 +17,40 @@ const MOST: usize = 64 * 1024;
 /// How long a connection may take to say what it asks.
 const PATIENCE: Duration = Duration::from_secs(2);
 
-/// Where the socket is: the user's runtime folder, or else a folder of the user's own in the
-/// temporary one, that no other user can write in.
+/// Where the socket is: in the user's runtime folder ([`runtime_folder`]).
 pub fn socket() -> PathBuf {
-    if let Some(folder) = std::env::var_os("XDG_RUNTIME_DIR").filter(|f| !f.is_empty()) {
-        return PathBuf::from(folder).join("rature.sock");
+    runtime_folder(
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        uid(),
+        Path::new("/run/user"),
+        &std::env::temp_dir(),
+    )
+    .join("rature.sock")
+}
+
+/// The user's runtime folder, where the socket and the canvases' locks are: the one `variable`
+/// (`XDG_RUNTIME_DIR`) names; without it, the one the system gives the user
+/// (`<user_runs>/<uid>`), when it is a private folder of theirs, so that a Rature started with
+/// its environment cleaned (as an MCP client may start `rature mcp`) meets the others there;
+/// else a folder of the user's own in `temp`, that no other user can write in.
+fn runtime_folder(
+    variable: Option<OsString>,
+    uid: Option<u32>,
+    user_runs: &Path,
+    temp: &Path,
+) -> PathBuf {
+    if let Some(folder) = variable.filter(|f| !f.is_empty()) {
+        return PathBuf::from(folder);
     }
-    let temp = std::env::temp_dir();
-    if let Some(uid) = uid() {
+    if let Some(uid) = uid {
+        // Never made: the system makes it, at the user's first login.
+        let system = user_runs.join(uid.to_string());
+        if is_private(&system, uid) {
+            return system;
+        }
         let folder = temp.join(format!("rature-{uid}"));
         if private_folder(&folder, uid) {
-            return folder.join("rature.sock");
+            return folder;
         }
         eprintln!(
             "rature: {} is not a private folder: other windows will open beside this one",
@@ -36,7 +60,7 @@ pub fn socket() -> PathBuf {
     // No folder to trust: a socket of this process alone, so nobody can take it over.
     let folder = temp.join(format!("rature-{}", std::process::id()));
     let _ = std::fs::DirBuilder::new().mode(0o700).create(&folder);
-    folder.join("rature.sock")
+    folder
 }
 
 /// The user this process runs as: the owner of its `/proc` entry.
@@ -47,6 +71,11 @@ fn uid() -> Option<u32> {
 /// Makes `folder` if need be, and says whether it is a real folder of `uid` that only it can use.
 fn private_folder(folder: &Path, uid: u32) -> bool {
     let _ = std::fs::DirBuilder::new().mode(0o700).create(folder);
+    is_private(folder, uid)
+}
+
+/// Whether `folder` is a real folder of `uid` that only it can use.
+fn is_private(folder: &Path, uid: u32) -> bool {
     std::fs::symlink_metadata(folder)
         .is_ok_and(|m| m.is_dir() && m.uid() == uid && m.mode() & 0o077 == 0)
 }
@@ -251,6 +280,39 @@ mod tests {
         std::os::unix::fs::symlink(&mine, &link).unwrap();
         assert!(!private_folder(&link, uid), "a link may lead anywhere");
         assert!(!private_folder(&mine, uid + 1));
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    /// Every Rature of a user finds the same folder, with the variable or without it. The
+    /// system's folders are stood in for by the test's own: none is read.
+    #[test]
+    fn the_runtime_folder_is_the_same_without_the_variable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let folder = folder("runtime");
+        let uid = uid().unwrap();
+        let (runs, temp) = (folder.join("run-user"), folder.join("tmp"));
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::create_dir_all(&temp).unwrap();
+        let chosen = |variable: Option<&str>| {
+            runtime_folder(variable.map(OsString::from), Some(uid), &runs, &temp)
+        };
+        assert_eq!(chosen(Some("/elsewhere")), PathBuf::from("/elsewhere"));
+        // No folder of the system's: a private one in the temporary folder, the same each time.
+        let private = temp.join(format!("rature-{uid}"));
+        assert_eq!(chosen(None), private);
+        assert_eq!(chosen(Some("")), private);
+        assert_eq!(chosen(None), private);
+        // The system's, once it is there: the one a session's variable names.
+        let system = runs.join(uid.to_string());
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&system)
+            .unwrap();
+        assert_eq!(chosen(None), system);
+        assert_eq!(chosen(Some(system.to_str().unwrap())), system);
+        // Open to others, it is not the user's own.
+        std::fs::set_permissions(&system, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(chosen(None), private);
         std::fs::remove_dir_all(folder).unwrap();
     }
 }
