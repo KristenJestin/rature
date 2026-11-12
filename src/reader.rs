@@ -931,6 +931,18 @@ impl Reader {
         let Some(target) = target else {
             return self.jump(jump, window, cx);
         };
+        self.open_linked(target, jump, window, cx);
+    }
+
+    /// Opens the file at `target`, a link's or a canvas's file card's, where `jump` says; the
+    /// back key returns to where the reading stands now (a canvas, its camera kept).
+    pub(crate) fn open_linked(
+        &mut self,
+        target: PathBuf,
+        jump: Jump,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Ok(target) = std::fs::canonicalize(&target) else {
             return self.fail(format!("{} is not there", target.display()), cx);
         };

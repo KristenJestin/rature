@@ -15,6 +15,12 @@
 //!
 //! What changed since the canvas was last read is drawn on it as [`crate::canvas_changes`] has
 //! it: the cards' colours, the ghosts of what was deleted or moved, the cards that rise.
+//!
+//! A file card shows its file as [`crate::canvas_files`] reads it, off the main thread: a
+//! Markdown file's heading, or its icon and name; in red when it is not there. The folders of
+//! those files are watched, and a file read again when it changes. A link card shows its
+//! address. A double click or a Ctrl-click opens either: the file in the reader, at its heading,
+//! back returning to the board; the address by the desktop, as a link of a page is.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -30,17 +36,20 @@ use gpui_design_system::{Icon, Palette, icon, palette, toast};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use futures::StreamExt as _;
+
 use crate::canvas::{self as model, Canvas, Color, Edge, End, Node, NodeKind, Problem, Rect};
 use crate::canvas_board::{self, Board, Saved, Written};
 use crate::canvas_changes::{self, BoardChanges, OnBoard};
 use crate::canvas_edges::{self as edges, Line};
+use crate::canvas_files::{self, Preview};
 use crate::canvas_ops::{Op, Report, Target};
 use crate::config::Config;
 use crate::document::{self, Document, Links};
 use crate::live::{Caret, LiveBlock, LiveEvent};
-use crate::reader::Reader;
+use crate::reader::{Jump, Reader};
 use crate::render::{self, Ctx, Drawn, Host, Wanted};
-use crate::timing;
+use crate::{formats, icons, timing, watch};
 
 /// The closest and the furthest the camera goes.
 pub const MIN_ZOOM: f32 = 0.1;
@@ -341,12 +350,21 @@ pub enum Tint {
 pub enum CardKind {
     Text(Arc<Document>),
     Group,
-    /// A file card, drawn as its path for now.
-    File,
-    /// A link card, drawn as its address for now.
+    /// A file card: the file it shows, as the board's previews have it.
+    File(FileCard),
+    /// A link card, drawn as its address.
     Link,
     /// A type the board does not know: its name.
     Other,
+}
+
+/// What a file card points to.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileCard {
+    /// Its `file` found from the canvas's folder; none when the card names no file.
+    pub path: Option<PathBuf>,
+    /// Its heading (`#Heading`) or Obsidian's block (`#^id`).
+    pub subpath: Option<String>,
 }
 
 #[derive(Clone)]
@@ -408,7 +426,9 @@ impl CanvasFile {
             .iter()
             .enumerate()
             .filter_map(|(index, node)| {
-                card(index, node, |text| document::parse(text, ink, folder))
+                card(index, node, folder, |text| {
+                    document::parse(text, ink, folder)
+                })
             })
             .collect();
         // Stable: each kind keeps the canvas's order.
@@ -546,9 +566,14 @@ fn lines(canvas: &Canvas, rects: &HashMap<&str, edges::Rect>) -> Vec<EdgeLine> {
         .collect()
 }
 
-/// The card of the node at `index` of the canvas, a text's Markdown read by `parse`; `None` for
-/// a node without a place and a size.
-fn card(index: usize, node: &Node, parse: impl FnOnce(&str) -> Document) -> Option<Card> {
+/// The card of the node at `index` of the canvas, a text's Markdown read by `parse`, a file's
+/// path found from `folder`, the canvas's; `None` for a node without a place and a size.
+fn card(
+    index: usize,
+    node: &Node,
+    folder: Option<&Path>,
+    parse: impl FnOnce(&str) -> Document,
+) -> Option<Card> {
     let rect = node.rect()?;
     let area = Area {
         x: rect.x as f32,
@@ -570,7 +595,22 @@ fn card(index: usize, node: &Node, parse: impl FnOnce(&str) -> Document) -> Opti
             (CardKind::Text(Arc::new(doc)), title)
         }
         Some(NodeKind::Group) => (CardKind::Group, named(node.label())),
-        Some(NodeKind::File) => (CardKind::File, named(node.file())),
+        Some(NodeKind::File) => {
+            let file = node.file().filter(|file| !file.trim().is_empty());
+            let subpath = node.subpath().filter(|s| !s.trim().is_empty());
+            let path = file.map(|file| model::resolve(folder.unwrap_or(Path::new("")), file));
+            // The path as the canvas writes it: two files of one name stay apart.
+            let title = format!(
+                "{}{}",
+                file.unwrap_or_default(),
+                subpath.unwrap_or_default()
+            );
+            let file = FileCard {
+                path,
+                subpath: subpath.map(str::to_string),
+            };
+            (CardKind::File(file), title)
+        }
         Some(NodeKind::Link) => (CardKind::Link, named(node.url())),
         Some(NodeKind::Other(kind)) => (CardKind::Other, kind.to_string()),
         None => (CardKind::Other, String::new()),
@@ -654,6 +694,28 @@ pub struct CanvasView {
     labels: Labels,
     /// What changed since the canvas was last read, and the cards rising into place.
     changes: OnBoard,
+    /// The files the file cards show.
+    files: Files,
+}
+
+/// The files the file cards show, by path, and the watch on their folders.
+#[derive(Default)]
+struct Files {
+    previews: HashMap<PathBuf, Shown>,
+    /// The reads asked for: a read's result is put in place only when no read of its file was
+    /// asked for after it.
+    asked: u64,
+    /// The folders of the files, each watched alone: the events, and the worker that adds and
+    /// removes the watches off the main thread. Made with the first file card.
+    watch: Option<(watch::Folders, Task<()>, Task<()>)>,
+}
+
+/// A file as its cards show it.
+struct Shown {
+    /// None until it is first read.
+    preview: Option<Preview>,
+    /// The last read asked for it.
+    asked: u64,
 }
 
 /// The selection, what the pointer holds, and the canvas as it is edited.
@@ -772,6 +834,7 @@ impl CanvasView {
             paths: Rc::default(),
             labels: Rc::default(),
             changes: OnBoard::new(cx.background_executor().now()),
+            files: Files::default(),
         };
         view.set_file(file, cx);
         view
@@ -780,8 +843,6 @@ impl CanvasView {
     /// The canvas read again: the camera stays where it is. What is not written yet is replayed
     /// on it, and the cards held stay where the pointer has them.
     pub fn set_file(&mut self, file: Arc<CanvasFile>, cx: &mut Context<Self>) {
-        self.drawn
-            .fill(file.wanted(), &[], |this: &mut Self| &mut this.drawn, cx);
         self.paths.borrow_mut().clear();
         self.labels.borrow_mut().clear();
         self.hovered = None;
@@ -789,6 +850,8 @@ impl CanvasView {
         self.changes.arrived(&self.file, &file, now);
         self.file = file;
         self.read_again(cx);
+        self.want_files(cx);
+        self.fill_drawn(cx);
         cx.notify();
     }
 
@@ -834,6 +897,8 @@ impl CanvasView {
     /// The colours changed: what was drawn in the old ones is drawn again with the file.
     pub fn restyle(&mut self) {
         self.drawn.clear();
+        // Their formulas drawn again too, once the canvas is read again in the new colours.
+        self.files.previews.clear();
     }
 
     /// Zooms by `factor`, or back to 1 (`None`), around the pointer when it is over the board,
@@ -1022,7 +1087,59 @@ impl CanvasView {
                     }
                 }))
                 .into_any_element(),
-            CardKind::File | CardKind::Link | CardKind::Other => frame
+            CardKind::File(file) => {
+                let broken = self.broken(card);
+                // Red as a broken link, unless what changed says more.
+                let border = match (broken, changed) {
+                    (true, None) => p.fail,
+                    _ => border,
+                };
+                frame
+                    .overflow_hidden()
+                    .border_color(border)
+                    .bg(background(color.map_or(p.card, |c| mix(p.card, c, 0.1))))
+                    .child(render::scaled(
+                        ctx.zoom,
+                        div()
+                            .size_full()
+                            .px_5()
+                            .py_4()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .text_size(ctx.size(1.))
+                            .line_height(ctx.line_height(render::LINE))
+                            .children(self.file_body(ctx, card, file, broken, p)),
+                    ))
+                    .on_click(ctx.cx.listener(|this, _: &ClickEvent, _, _| {
+                        // A link of the preview is not followed: the card opens its file.
+                        this.clicked_link = None;
+                    }))
+                    .into_any_element()
+            }
+            CardKind::Link => frame
+                .overflow_hidden()
+                .border_color(border)
+                .bg(background(color.map_or(p.card, |c| mix(p.card, c, 0.1))))
+                .p(px(16. * zoom))
+                .flex()
+                .flex_col()
+                .gap(px(8. * zoom))
+                .text_size(ctx.size(1.))
+                .line_height(ctx.line_height(render::LINE))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6. * zoom))
+                        .text_size(ctx.size(0.85))
+                        .text_color(p.mute)
+                        .child(icon(icons::LINK).size(ctx.size(0.9)).text_color(p.mute))
+                        .child(link_host(&card.title)),
+                )
+                .child(div().text_color(ctx.link).child(card.title.clone()))
+                .into_any_element(),
+            CardKind::Other => frame
                 .overflow_hidden()
                 .border_color(border)
                 .bg(background(color.map_or(p.card, |c| mix(p.card, c, 0.1))))
@@ -1034,8 +1151,75 @@ impl CanvasView {
         }
     }
 
-    /// A card as a coloured box and its title, at a fixed size on screen.
-    fn light_card(card: &Card, camera: Camera, p: &Palette, changes: &OnBoard) -> AnyElement {
+    /// A file card's body: its file's name, and its Markdown cut to its heading, or why it
+    /// shows nothing more.
+    fn file_body(
+        &self,
+        ctx: &Ctx<Self>,
+        card: &Card,
+        file: &FileCard,
+        broken: bool,
+        p: &Palette,
+    ) -> Vec<AnyElement> {
+        let preview = self.preview(file);
+        let section = match preview {
+            Some(Preview::Markdown(doc)) => {
+                Some((doc, canvas_files::section(doc, file.subpath.as_deref())))
+            }
+            _ => None,
+        };
+        let missing_heading = section.as_ref().is_some_and(|(_, s)| s.missing);
+        let kind = file.path.as_deref().map_or(Icon::File, formats::file_icon);
+        let ink = if broken { p.fail } else { p.mute };
+        let name = match (broken, missing_heading) {
+            (true, _) => format!("{}: not found", card.title),
+            (false, true) => format!("{}: no such heading, all of it shown", card.title),
+            _ => card.title.clone(),
+        };
+        let mut out = vec![
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_size(ctx.size(0.85))
+                .text_color(ink)
+                .when(missing_heading && !broken, |d| d.text_color(p.wait))
+                .child(
+                    icon(if broken { Icon::Warning } else { kind })
+                        .size(ctx.size(0.9))
+                        .text_color(ink),
+                )
+                .child(name)
+                .into_any_element(),
+        ];
+        let said = |text: String| div().text_color(p.mute).child(text).into_any_element();
+        match (preview, section) {
+            (_, Some((doc, section))) => out.extend(
+                doc.blocks[section.blocks]
+                    .iter()
+                    .map(|block| render::block(ctx, block)),
+            ),
+            (Some(Preview::Missing), _) => out.push(said(match &file.path {
+                Some(path) => format!("{} is not there.", path.display()),
+                None => "This card names no file.".into(),
+            })),
+            (None, _) if file.path.is_none() => out.push(said("This card names no file.".into())),
+            (Some(Preview::Folder), _) => out.push(said("A folder, not a file.".into())),
+            (Some(Preview::Unread(why)), _) => out.push(said(why.clone())),
+            (Some(Preview::Other | Preview::Markdown(_)), _) | (None, _) => {}
+        }
+        out
+    }
+
+    /// A card as a coloured box and its title, at a fixed size on screen; in red when it is a
+    /// file card whose file is not there (`broken`).
+    fn light_card(
+        card: &Card,
+        camera: Camera,
+        p: &Palette,
+        changes: &OnBoard,
+        broken: bool,
+    ) -> AnyElement {
         let (area, shown) = changes.risen(&card.id, camera.on_screen(card.area));
         let color = card.tint.map(|t| tint(p, t));
         let changed = changes.changes().and_then(|c| c.card_colors(&card.id, p));
@@ -1048,24 +1232,32 @@ impl CanvasView {
             .overflow_hidden()
             .rounded(px(4.))
             .border(px(if changed.is_some() { 2. } else { 1. }))
-            .border_color(changed.map_or(color.unwrap_or(p.line2), |(border, _)| border))
+            .border_color(changed.map_or(
+                if broken {
+                    p.fail
+                } else {
+                    color.unwrap_or(p.line2)
+                },
+                |(border, _)| border,
+            ))
             .bg(changed
                 .and_then(|(_, bg)| bg)
                 .unwrap_or(color.map_or(p.card2, |c| mix(p.card, c, 0.3))))
             .p(px(6.))
             .text_size(px(TITLE))
             .line_height(px(TITLE * 1.3))
-            .text_color(p.text)
+            .text_color(if broken { p.fail } else { p.text })
             .child(card.title.clone())
             .into_any_element()
     }
 
-    /// Every card as a rectangle, in one element.
+    /// Every card as a rectangle, in one element; outlined in red when it is `broken`.
     fn rects(
         cards: &[&Card],
         camera: Camera,
         p: &Palette,
         changes: Option<&BoardChanges>,
+        broken: impl Fn(&Card) -> bool,
     ) -> AnyElement {
         let quads: Vec<(Area, Hsla, Hsla)> = cards
             .iter()
@@ -1081,6 +1273,9 @@ impl CanvasView {
                         color.map_or(p.text.opacity(0.03), |c| c.opacity(0.08)),
                         color.map_or(p.line2, |c| c.opacity(0.6)),
                     ),
+                    _ if broken(card) => {
+                        (area, color.map_or(p.card2, |c| mix(p.card, c, 0.4)), p.fail)
+                    }
                     _ => (
                         area,
                         color.map_or(p.card2, |c| mix(p.card, c, 0.4)),
@@ -1819,6 +2014,19 @@ impl CanvasView {
             }
             self.stop_typing(cx);
         }
+        // A file or link card opens, rather than being typed in or selected.
+        let double = event.click_count == 2 && !event.modifiers.modified();
+        let control = event.click_count == 1
+            && event.modifiers.secondary()
+            && !event.modifiers.shift
+            && !event.modifiers.alt;
+        if (double || control)
+            && let Hit::Card(id) = &hit
+            && self.open_card(id, window, cx)
+        {
+            window.prevent_default();
+            return true;
+        }
         if event.click_count != 2 || event.modifiers.modified() {
             return false;
         }
@@ -2091,6 +2299,7 @@ impl CanvasView {
             .filter(|typing| !typing.label)
             .map(|typing| typing.id.as_str());
         let (mut added, mut read) = (Vec::new(), Vec::new());
+        let folder = self.edits.path.parent();
         for (index, node) in board.canvas().nodes().iter().enumerate() {
             let Some(id) = node.id() else {
                 continue;
@@ -2103,7 +2312,7 @@ impl CanvasView {
                 }) => doc.source != text,
                 Some(_) => false,
                 // Shown empty until it is read.
-                None => match card(index, node, |_| document::parse("", "", None)) {
+                None => match card(index, node, folder, |_| document::parse("", "", None)) {
                     Some(new) => {
                         let text = matches!(new.kind, CardKind::Text(_));
                         added.push(new);
@@ -2135,6 +2344,8 @@ impl CanvasView {
                 file.cards.insert(at, new);
             }
             self.relay_edges();
+            // A file card given back by an undo shows its file again.
+            self.want_files(cx);
             cx.notify();
         }
         if read.is_empty() {
@@ -3364,6 +3575,226 @@ impl CanvasView {
 /// gap.
 const TOOLS_ABOVE: f32 = 42.;
 
+/// File cards: their files read off the main thread, watched, and opened; link cards opened.
+impl CanvasView {
+    /// What the file card `file` shows of its file, once read.
+    fn preview(&self, file: &FileCard) -> Option<&Preview> {
+        let shown = self.files.previews.get(file.path.as_ref()?)?;
+        shown.preview.as_ref()
+    }
+
+    /// Whether `card` is a file card that leads nowhere: no file named, or none there.
+    fn broken(&self, card: &Card) -> bool {
+        match &card.kind {
+            CardKind::File(file) if file.path.is_none() => true,
+            CardKind::File(file) => self.preview(file).is_some_and(Preview::is_broken),
+            _ => false,
+        }
+    }
+
+    /// The files the file cards show now: those not read yet are read, those no card shows any
+    /// more let go, and their folders watched.
+    fn want_files(&mut self, cx: &mut Context<Self>) {
+        let wanted: HashSet<PathBuf> = self
+            .file
+            .cards
+            .iter()
+            .filter_map(|card| match &card.kind {
+                CardKind::File(file) => file.path.clone(),
+                _ => None,
+            })
+            .collect();
+        let files = &mut self.files;
+        files.previews.retain(|path, _| wanted.contains(path));
+        let new: Vec<PathBuf> = wanted
+            .iter()
+            .filter(|path| !files.previews.contains_key(*path))
+            .cloned()
+            .collect();
+        if files.watch.is_none() && !wanted.is_empty() {
+            files.watch = watch_files(cx);
+        }
+        if let Some((folders, ..)) = &mut files.watch {
+            let parents = wanted
+                .iter()
+                .filter_map(|path| path.parent())
+                .filter(|folder| !folder.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+                .collect();
+            folders.set(parents);
+        }
+        self.read_files(new, cx);
+    }
+
+    /// Reads `paths` off the main thread, each put in place unless it was asked for again
+    /// meanwhile; what they showed before stays until then.
+    fn read_files(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        self.files.asked += 1;
+        let asked = self.files.asked;
+        for path in &paths {
+            self.files
+                .previews
+                .entry(path.clone())
+                .or_insert(Shown {
+                    preview: None,
+                    asked,
+                })
+                .asked = asked;
+        }
+        let ink = render::ink(cx);
+        let work = cx.background_executor().spawn(async move {
+            paths
+                .into_iter()
+                .map(|path| {
+                    let preview = canvas_files::read(&path, &ink);
+                    (path, preview)
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let read = work.await;
+            this.update(cx, |this, cx| this.files_read(asked, read, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Files read off the main thread, for the reads `asked`.
+    fn files_read(&mut self, asked: u64, read: Vec<(PathBuf, Preview)>, cx: &mut Context<Self>) {
+        let mut put = false;
+        for (path, preview) in read {
+            if let Some(shown) = self.files.previews.get_mut(&path)
+                && shown.asked == asked
+            {
+                shown.preview = Some(preview);
+                put = true;
+            }
+        }
+        if put {
+            self.fill_drawn(cx);
+            cx.notify();
+        }
+    }
+
+    /// Something changed in the folders of the files: those touched are read again.
+    fn files_touched(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let touched: Vec<PathBuf> = self
+            .files
+            .previews
+            .keys()
+            .filter(|path| paths.contains(*path))
+            .cloned()
+            .collect();
+        self.read_files(touched, cx);
+    }
+
+    /// The diagrams and code's colours the text cards and the files shown need, drawn off the
+    /// main thread.
+    fn fill_drawn(&mut self, cx: &mut Context<Self>) {
+        let mut wanted = self.file.wanted();
+        for card in &self.file.cards {
+            if let CardKind::File(file) = &card.kind
+                && let Some(Preview::Markdown(doc)) = self.preview(file)
+            {
+                let section = canvas_files::section(doc, file.subpath.as_deref());
+                let blocks = &doc.blocks[section.blocks];
+                document::diagrams(blocks, &mut wanted.diagrams);
+                document::code_blocks(blocks, &mut wanted.code);
+            }
+        }
+        self.drawn
+            .fill(wanted, &[], |this: &mut Self| &mut this.drawn, cx);
+    }
+
+    /// A double click or a Ctrl-click on the card `id`: a file card opens its file in the
+    /// reader, at its heading; a link card its address, by the desktop, when it is the web's or
+    /// a mail's. False when it is neither.
+    fn open_card(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(card) = self.file.cards.iter().find(|card| card.id == id) else {
+            return false;
+        };
+        match &card.kind {
+            CardKind::File(file) => {
+                let Some(path) = file.path.clone() else {
+                    toast(Toast::failure("This card names no file"), cx);
+                    return true;
+                };
+                let anchor = match self.preview(file) {
+                    Some(Preview::Markdown(doc)) => {
+                        canvas_files::section(doc, file.subpath.as_deref()).anchor
+                    }
+                    _ => None,
+                };
+                let jump = anchor.map_or(Jump::Top, Jump::Anchor);
+                let reader = self.reader.clone();
+                // The reader lets this board go as it opens the file: not while it is updated.
+                window.defer(cx, move |window, cx| {
+                    reader
+                        .update(cx, |reader, cx| reader.open_linked(path, jump, window, cx))
+                        .ok();
+                });
+                true
+            }
+            CardKind::Link => {
+                let url = card.title.trim().to_string();
+                match document::target(&url) {
+                    document::Target::Web => cx.open_url(&url),
+                    _ => toast(
+                        Toast::failure(format!(
+                            "Not opened: {url}. Only http, https and mailto links open from here"
+                        )),
+                        cx,
+                    ),
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// A watch on the folders of a canvas's files, its events read on the board; none when the
+/// system gives no watch, said once.
+fn watch_files(cx: &mut Context<CanvasView>) -> Option<(watch::Folders, Task<()>, Task<()>)> {
+    match watch::Folders::new() {
+        Ok((folders, mut events, work)) => {
+            let worker = cx.background_executor().spawn(work);
+            let task = cx.spawn(async move |this, cx| {
+                while let Some(mut paths) = events.next().await {
+                    // A burst of writes is read once.
+                    while let Ok(more) = events.try_recv() {
+                        paths.extend(more);
+                    }
+                    if this
+                        .update(cx, |this, cx| this.files_touched(paths, cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            Some((folders, task, worker))
+        }
+        Err(error) => {
+            eprintln!("rature: the files of this canvas are not followed: {error}");
+            None
+        }
+    }
+}
+
+/// What a link card's header names: the site of its address, or its scheme (`mailto`).
+fn link_host(url: &str) -> String {
+    let url = url.trim();
+    let host = match url.split_once("://") {
+        Some((_, rest)) => rest.split(['/', '?', '#']).next().unwrap_or(rest),
+        None => url.split(':').next().unwrap_or(url),
+    };
+    host.to_string()
+}
+
 impl Host for CanvasView {
     fn link_clicked(&mut self, link: String) {
         self.clicked_link = Some(link);
@@ -3475,7 +3906,10 @@ impl Render for CanvasView {
                     shown
                         .iter()
                         .filter(|card| !self.is_typed(card))
-                        .map(|card| Self::light_card(card, camera, &p, &self.changes)),
+                        .map(|card| {
+                            let broken = self.broken(card);
+                            Self::light_card(card, camera, &p, &self.changes, broken)
+                        }),
                 ),
             Detail::Rects => {
                 let shown: Vec<&Card> = shown
@@ -3489,7 +3923,9 @@ impl Render for CanvasView {
                             .into_iter()
                             .flat_map(|m| m.ghosts::<Self>(None, camera, &seen, &p)),
                     )
-                    .child(Self::rects(&shown, camera, &p, marks))
+                    .child(Self::rects(&shown, camera, &p, marks, |card| {
+                        self.broken(card)
+                    }))
             }
         };
         board = board.children(self.typed_card(detail, camera, &p, &config, cx));
@@ -3676,6 +4112,14 @@ mod tests {
     }
 
     #[test]
+    fn a_link_cards_header_names_its_site() {
+        use super::link_host;
+        assert_eq!(link_host("https://example.org/a/b?c#d"), "example.org");
+        assert_eq!(link_host(" http://localhost:8080 "), "localhost:8080");
+        assert_eq!(link_host("mailto:someone@example.org"), "mailto");
+    }
+
+    #[test]
     fn text_is_sized_to_half_a_pixel() {
         let camera = |zoom| Camera { x: 0., y: 0., zoom };
         assert_eq!(camera(1.).text_zoom(16.), 1.);
@@ -3744,6 +4188,36 @@ mod tests {
         assert_eq!(at(-20., -20.), Hit::Group("g".into()));
         assert_eq!(at(10., 10.), Hit::Card("a".into()));
         assert_eq!(at(-80., -80.), Hit::Empty);
+    }
+
+    #[test]
+    fn a_file_card_finds_its_file_from_the_canvass_folder() {
+        use super::{CardKind, FileCard};
+        use std::path::{Path, PathBuf};
+        let text = r##"{"nodes":[
+            {"id":"f","type":"file","file":"../notes/plan.md","subpath":"#Beds","x":0,"y":0,"width":100,"height":100},
+            {"id":"e","type":"file","file":"","x":200,"y":0,"width":100,"height":100},
+            {"id":"l","type":"link","url":"https://example.org","x":400,"y":0,"width":100,"height":100}
+        ],"edges":[]}"##;
+        let file = CanvasFile::read(text, "#000000", Some(Path::new("/garden/boards"))).unwrap();
+        let CardKind::File(plan) = &file.cards[0].kind else {
+            panic!("not a file card")
+        };
+        assert_eq!(
+            *plan,
+            FileCard {
+                path: Some(PathBuf::from("/garden/notes/plan.md")),
+                subpath: Some("#Beds".into()),
+            }
+        );
+        assert_eq!(file.cards[0].title, "../notes/plan.md#Beds");
+        // A card that names no file has no path: it is drawn broken.
+        assert!(matches!(
+            &file.cards[1].kind,
+            CardKind::File(FileCard { path: None, .. })
+        ));
+        assert!(matches!(file.cards[2].kind, CardKind::Link));
+        assert_eq!(file.cards[2].title, "https://example.org");
     }
 
     /// Cards `a` and `b`, an edge between them and one from `b` to `c`, and a group `g` holding

@@ -7,6 +7,7 @@ mod canvas;
 mod canvas_board;
 mod canvas_changes;
 mod canvas_edges;
+mod canvas_files;
 #[allow(dead_code)]
 mod canvas_ops;
 mod canvas_view;

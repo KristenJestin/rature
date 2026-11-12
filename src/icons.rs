@@ -19,6 +19,7 @@ pub const ROW_ABOVE: Icon = Icon::Lucide("between-horizontal-start");
 pub const ROW_BELOW: Icon = Icon::Lucide("between-horizontal-end");
 pub const COLUMN_LEFT: Icon = Icon::Lucide("between-vertical-start");
 pub const COLUMN_RIGHT: Icon = Icon::Lucide("between-vertical-end");
+pub const LINK: Icon = Icon::Lucide("link");
 
 gpui_kit::assets::icon_assets!(
     Lucide,
@@ -35,7 +36,8 @@ gpui_kit::assets::icon_assets!(
         BetweenHorizontalStart,
         BetweenHorizontalEnd,
         BetweenVerticalStart,
-        BetweenVerticalEnd
+        BetweenVerticalEnd,
+        Link
     ]
 );
 
@@ -77,6 +79,7 @@ mod tests {
             ROW_BELOW,
             COLUMN_LEFT,
             COLUMN_RIGHT,
+            LINK,
         ] {
             assert!(Assets.load(&icon.path()).unwrap().is_some(), "{icon:?}");
         }

@@ -27,6 +27,7 @@ use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{BuildHasher, Hasher};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -801,6 +802,31 @@ fn set_number(fields: &mut Map<String, Value>, key: &str, value: f64) {
 /// The fields of a node that say where it is and how large it is.
 const PLACE: [&str; 4] = ["x", "y", "width", "height"];
 
+/// The file a file card's `file` names, from `folder`, the canvas's own: the JSON Canvas
+/// specification is the reference, and Obsidian's vault root is not looked for. `.` and `..` are
+/// worked out on the path's text, so that the path shown, watched and opened is the file's own,
+/// even when a folder on the way is not there; an absolute path stays one. Nothing is looked for
+/// on disk.
+pub fn resolve(folder: &Path, file: &str) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in folder.join(file).components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                // Above the root is the root.
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                // A relative path going up from where it starts.
+                _ => out.push(".."),
+            },
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// What happened to a node since the canvas it is compared to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeChange {
@@ -956,6 +982,42 @@ mod tests {
 
     /// The specification's `sample.canvas`, byte for byte: see the README beside it.
     const SAMPLE: &str = include_str!("../tests/fixtures/jsoncanvas/sample.canvas");
+
+    #[test]
+    fn a_file_cards_path_is_found_from_the_canvass_folder() {
+        let folder = Path::new("/notes/plans");
+        // Beside the canvas, and below it.
+        assert_eq!(
+            resolve(folder, "todo.md"),
+            Path::new("/notes/plans/todo.md")
+        );
+        assert_eq!(
+            resolve(folder, "./week/Mon day.md"),
+            Path::new("/notes/plans/week/Mon day.md")
+        );
+        // Up from it: the path is the file's own, whatever is not there on the way.
+        assert_eq!(
+            resolve(folder, "../archive/../ideas/a.md"),
+            Path::new("/notes/ideas/a.md")
+        );
+        assert_eq!(resolve(folder, "../../../../a.md"), Path::new("/a.md"));
+        // Absolute, it stays where it says.
+        assert_eq!(
+            resolve(folder, "/elsewhere/b.md"),
+            Path::new("/elsewhere/b.md")
+        );
+        // From a relative folder, going up past it is kept.
+        assert_eq!(
+            resolve(Path::new("plans"), "../../c.md"),
+            Path::new("../c.md")
+        );
+        // No vault root is looked for: a file that is not beside the canvas is not found
+        // elsewhere (`canvas_files` says it is missing).
+        assert_eq!(
+            resolve(folder, "Inbox/x.md"),
+            Path::new("/notes/plans/Inbox/x.md")
+        );
+    }
 
     #[test]
     fn the_specifications_sample_is_written_back_byte_for_byte() {
