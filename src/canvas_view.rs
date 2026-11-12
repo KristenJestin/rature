@@ -4,7 +4,9 @@
 //! keeps the file, its watcher, its bar, back and forward; the board draws it.
 //!
 //! Cards are selected, moved, resized, nudged and deleted on it, each change an operation of
-//! [`crate::canvas_ops`] done on a [`Board`] and written by it, off the window's thread.
+//! [`crate::canvas_ops`] done on a [`Board`] and written by it, off the window's thread. A double
+//! click on empty space makes a text card there; a text card's Markdown is typed whole in a
+//! [`LiveBlock`], written 800 ms after the last key.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -20,12 +22,13 @@ use gpui_design_system::{Palette, palette, toast};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::canvas::{Canvas, Color, End, NodeKind, Problem};
+use crate::canvas::{self as model, Canvas, Color, End, Node, NodeKind, Problem, Rect};
 use crate::canvas_board::{self, Board, Saved, Written};
 use crate::canvas_edges::{self as edges, Line};
-use crate::canvas_ops::{Op, Report};
+use crate::canvas_ops::{Op, Report, Target};
 use crate::config::Config;
-use crate::document::{self, Document};
+use crate::document::{self, Document, Links};
+use crate::live::{Caret, LiveBlock, LiveEvent};
 use crate::reader::Reader;
 use crate::render::{self, Ctx, Drawn, Host, Wanted};
 use crate::timing;
@@ -101,8 +104,27 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("delete", DeleteSelection, at),
         KeyBinding::new("ctrl-z", Undo, at),
         KeyBinding::new("ctrl-shift-z", Redo, at),
+        KeyBinding::new("enter", EditCard, at),
+    ]);
+    // Around a card's text being typed, inside the reader's page.
+    let card = Some("CanvasCard");
+    cx.bind_keys([
+        KeyBinding::new("escape", StopTyping, card),
+        KeyBinding::new("ctrl-enter", StopTyping, card),
+        KeyBinding::new("ctrl-s", WriteCard, card),
     ]);
 }
+
+actions!(
+    canvas_card,
+    [
+        /// The text of the card selected alone is typed.
+        EditCard,
+        StopTyping,
+        /// What was typed is written now.
+        WriteCard,
+    ]
+);
 
 /// The board's keys on `element`, the one that holds the focus (the reader's page): the board
 /// itself is not on the way of the keys.
@@ -130,6 +152,7 @@ pub fn on_keys<E: InteractiveElement>(element: E, board: &Entity<CanvasView>) ->
         })
         .on_action(move |_: &Undo, _, cx| undone.update(cx, |board, cx| board.undo(false, cx)))
         .on_action(move |_: &Redo, _, cx| redone.update(cx, |board, cx| board.undo(true, cx)))
+        .on_action(on_edit_card(board))
 }
 
 /// A place and a size, in the canvas's pixels or on screen.
@@ -374,40 +397,7 @@ impl CanvasFile {
             .iter()
             .enumerate()
             .filter_map(|(index, node)| {
-                let rect = node.rect()?;
-                let area = Area {
-                    x: rect.x as f32,
-                    y: rect.y as f32,
-                    width: rect.width as f32,
-                    height: rect.height as f32,
-                };
-                let tint = match node.color() {
-                    Some(Color::Preset(n)) => Some(Tint::Preset(n)),
-                    Some(Color::Rgb(rgb)) => Some(Tint::Rgb(rgb)),
-                    Some(Color::Other(_)) | None => None,
-                };
-                let named = |name: Option<&str>| name.unwrap_or_default().to_string();
-                let (kind, title) = match node.kind() {
-                    Some(NodeKind::Text) => {
-                        let text = node.text().unwrap_or_default();
-                        let doc = document::parse(text, ink, folder);
-                        let title = title(&doc, text);
-                        (CardKind::Text(Arc::new(doc)), title)
-                    }
-                    Some(NodeKind::Group) => (CardKind::Group, named(node.label())),
-                    Some(NodeKind::File) => (CardKind::File, named(node.file())),
-                    Some(NodeKind::Link) => (CardKind::Link, named(node.url())),
-                    Some(NodeKind::Other(kind)) => (CardKind::Other, kind.to_string()),
-                    None => (CardKind::Other, String::new()),
-                };
-                Some(Card {
-                    index,
-                    id: node.id().unwrap_or_default().to_string(),
-                    area,
-                    tint,
-                    kind,
-                    title,
-                })
+                card(index, node, |text| document::parse(text, ink, folder))
             })
             .collect();
         // Stable: each kind keeps the canvas's order.
@@ -544,6 +534,45 @@ fn lines(canvas: &Canvas, rects: &HashMap<&str, edges::Rect>) -> Vec<EdgeLine> {
         .collect()
 }
 
+/// The card of the node at `index` of the canvas, a text's Markdown read by `parse`; `None` for
+/// a node without a place and a size.
+fn card(index: usize, node: &Node, parse: impl FnOnce(&str) -> Document) -> Option<Card> {
+    let rect = node.rect()?;
+    let area = Area {
+        x: rect.x as f32,
+        y: rect.y as f32,
+        width: rect.width as f32,
+        height: rect.height as f32,
+    };
+    let tint = match node.color() {
+        Some(Color::Preset(n)) => Some(Tint::Preset(n)),
+        Some(Color::Rgb(rgb)) => Some(Tint::Rgb(rgb)),
+        Some(Color::Other(_)) | None => None,
+    };
+    let named = |name: Option<&str>| name.unwrap_or_default().to_string();
+    let (kind, title) = match node.kind() {
+        Some(NodeKind::Text) => {
+            let text = node.text().unwrap_or_default();
+            let doc = parse(text);
+            let title = title(&doc, text);
+            (CardKind::Text(Arc::new(doc)), title)
+        }
+        Some(NodeKind::Group) => (CardKind::Group, named(node.label())),
+        Some(NodeKind::File) => (CardKind::File, named(node.file())),
+        Some(NodeKind::Link) => (CardKind::Link, named(node.url())),
+        Some(NodeKind::Other(kind)) => (CardKind::Other, kind.to_string()),
+        None => (CardKind::Other, String::new()),
+    };
+    Some(Card {
+        index,
+        id: node.id().unwrap_or_default().to_string(),
+        area,
+        tint,
+        kind,
+        title,
+    })
+}
+
 /// A text card's title: its first heading, else its first line that says something.
 fn title(doc: &Document, text: &str) -> String {
     if let Some(heading) = doc.headings.first() {
@@ -630,6 +659,20 @@ struct Edits {
     stalled: bool,
     /// A write to come: nudges resting, a lock waited for.
     later: Option<Task<()>>,
+    /// The text card being typed in.
+    typing: Option<Typing>,
+}
+
+/// A text card whose Markdown is typed whole, where it is read.
+struct Typing {
+    id: String,
+    field: Entity<LiveBlock>,
+    /// How many actions undo held before: those done since are one once it ends.
+    mark: usize,
+    /// What had the keys before, given them back when it ends.
+    before: Option<FocusHandle>,
+    window: AnyWindowHandle,
+    _events: Subscription,
 }
 
 /// What the pointer holds.
@@ -693,6 +736,7 @@ impl CanvasView {
                 again: false,
                 stalled: false,
                 later: None,
+                typing: None,
             },
             hovered: None,
             paths: Rc::default(),
@@ -759,8 +803,12 @@ impl CanvasView {
         }
     }
 
-    /// Space pressed or let go: while it is held, a drag on a card pans too.
+    /// Space pressed or let go: while it is held, a drag on a card pans too. A space typed in a
+    /// card is not held.
     pub fn hold_space(&mut self, held: bool, cx: &mut Context<Self>) {
+        if held && self.typing() {
+            return;
+        }
         if self.space != held {
             self.space = held;
             cx.notify();
@@ -788,7 +836,10 @@ impl CanvasView {
         true
     }
 
-    fn press(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn press(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.press_typing(event, window, cx) {
+            return;
+        }
         if self.space || self.press_selection(event, cx) {
             self.panning = Some(event.position);
             cx.notify();
@@ -887,7 +938,7 @@ impl CanvasView {
                         .gap_2()
                         .text_size(ctx.size(1.))
                         .line_height(ctx.line_height(render::LINE))
-                        .children(doc.blocks.iter().map(|block| render::block(ctx, block))),
+                        .map(|body| self.card_text(ctx, card, doc, body)),
                 ))
                 .on_click(ctx.cx.listener(|this, event: &ClickEvent, window, cx| {
                     if let Some(link) = this.clicked_link.take()
@@ -1262,7 +1313,7 @@ impl CanvasView {
     }
 
     /// Undoes the last action, or does again the last undone, and writes it. A card a deletion
-    /// undone gives back is shown once the file is read again, as written.
+    /// undone gives back, or a text, is shown as soon as its Markdown is read.
     fn undo(&mut self, redo: bool, cx: &mut Context<Self>) {
         if self.edits.held.is_some() {
             return;
@@ -1273,6 +1324,7 @@ impl CanvasView {
         let done = if redo { board.redo() } else { board.undo() };
         if done {
             self.show_board();
+            self.show_texts(cx);
             self.save(cx);
             cx.notify();
         }
@@ -1321,6 +1373,8 @@ impl CanvasView {
         };
         board.refreshed((*self.file.canvas).clone());
         self.show_board();
+        self.show_texts(cx);
+        self.sync_typing(cx);
         if std::mem::take(&mut self.edits.stalled) {
             self.save(cx);
         }
@@ -1439,6 +1493,7 @@ impl CanvasView {
     /// before a write off it ends. It waits for the lock as long as a write does, at most.
     /// What cannot be written is said, never dropped in silence.
     pub fn put_down(&mut self, cx: &mut Context<Self>) {
+        self.end_typing(cx);
         self.edits.later = None;
         let Some(saved) = self.edits.board.as_mut().and_then(write_now) else {
             return;
@@ -1488,6 +1543,7 @@ impl CanvasView {
             None => {}
         }
         self.show_board();
+        self.sync_typing(cx);
         if std::mem::take(&mut self.edits.again) {
             self.save(cx);
         }
@@ -1532,15 +1588,435 @@ fn lost(saved: &io::Result<Saved>) -> Option<String> {
 /// What a write could not do as Rature did it, said in a toast; the text typed that the disk
 /// did not take, on the clipboard.
 fn tell(report: Report, cx: &mut App) {
-    if report.is_clean() {
+    let Some((said, clipboard)) = told(&report) else {
         return;
+    };
+    if let Some(text) = clipboard {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+    toast(Toast::failure(said), cx);
+}
+
+/// What [`tell`] says of `report`, and what it puts on the clipboard; `None` for a clean one.
+fn told(report: &Report) -> Option<(String, Option<String>)> {
+    if report.is_clean() {
+        return None;
     }
     let mut said: Vec<String> = report.conflicts.iter().map(ToString::to_string).collect();
-    if !report.clipboard.is_empty() {
-        cx.write_to_clipboard(ClipboardItem::new_string(report.clipboard.join("\n\n")));
+    let clipboard = (!report.clipboard.is_empty()).then(|| report.clipboard.join("\n\n"));
+    if clipboard.is_some() {
         said.push("what you typed is in the clipboard".into());
     }
-    toast(Toast::failure(said.join("; ")), cx);
+    Some((said.join("; "), clipboard))
+}
+
+/// How long typing rests before it is written, as the reader's autosave.
+const TYPING_REST: Duration = Duration::from_millis(800);
+
+/// Enter, through [`on_keys`]: the card selected alone, if a text, is typed in.
+fn on_edit_card(board: &Entity<CanvasView>) -> impl Fn(&EditCard, &mut Window, &mut App) + 'static {
+    let board = board.clone();
+    move |_, window, cx| board.update(cx, |board, cx| board.edit_selected(window, cx))
+}
+
+/// Text cards made by a double click, and their Markdown typed whole where it is read.
+impl CanvasView {
+    /// Whether a card's text is being typed: the reader's keys are kept from it then.
+    pub fn typing(&self) -> bool {
+        self.edits.typing.is_some()
+    }
+
+    /// A press while a card is typed in, or a double click; true when it is taken. In the card
+    /// typed in, its field takes it; anywhere else the typing ends first. A double click on a
+    /// text card types in it, the caret where it was; on empty space or a group's background, it
+    /// makes a text card there.
+    fn press_typing(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (Some(camera), Some(bounds)) = (self.camera, self.bounds) else {
+            return false;
+        };
+        if self.space {
+            return false;
+        }
+        let (x, y) = local(event.position, bounds);
+        let label = self.label_line(camera, cx);
+        let hit = hit(&self.file.cards, camera, label, self.edits.alone(), x, y);
+        if let Some(typing) = &self.edits.typing {
+            if hit == Hit::Card(typing.id.clone()) {
+                return true;
+            }
+            self.stop_typing(cx);
+        }
+        if event.click_count != 2 || event.modifiers.modified() {
+            return false;
+        }
+        match hit {
+            Hit::Card(id) if self.is_text(&id) => {
+                self.type_in(id, Caret::At(event.position), window, cx)
+            }
+            Hit::Empty | Hit::Group(_) => {
+                let (x, y) = camera.to_canvas(x, y);
+                self.make_card(x, y, window, cx);
+            }
+            _ => return false,
+        }
+        // The page, which holds the keys otherwise, would take them back on this press.
+        window.prevent_default();
+        true
+    }
+
+    fn is_text(&self, id: &str) -> bool {
+        self.file
+            .cards
+            .iter()
+            .any(|card| card.id == id && matches!(card.kind, CardKind::Text(_)))
+    }
+
+    /// Enter: the text card selected alone is typed in, the caret at its end.
+    fn edit_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.edits.held.is_some() || self.typing() {
+            return;
+        }
+        let Some(id) = self.edits.alone().map(str::to_string) else {
+            return;
+        };
+        if self.is_text(&id) {
+            self.type_in(id, Caret::End, window, cx);
+        }
+    }
+
+    /// The text card `id` typed in, its text as the canvas being edited has it.
+    fn type_in(&mut self, id: String, caret: Caret, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_board(cx);
+        let Some(board) = &self.edits.board else {
+            return;
+        };
+        let Some(text) = board.canvas().node(&id).and_then(Node::text) else {
+            return;
+        };
+        let (text, mark) = (text.to_string(), board.actions());
+        self.start_typing(id, text, caret, mark, window, cx);
+    }
+
+    /// A text card made at the canvas's point (`x`, `y`), empty, and typed in: written once the
+    /// keys rest, undone at once with what is typed in it.
+    fn make_card(&mut self, x: f32, y: f32, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_board(cx);
+        let Some(board) = &self.edits.board else {
+            return;
+        };
+        let mark = board.actions();
+        let node = new_card(board.canvas(), x, y);
+        let id = node.id().unwrap_or_default().to_string();
+        if !self.edit(|_| vec![Op::add_node(node)], cx) {
+            return;
+        }
+        self.show_texts(cx);
+        self.save_later(TYPING_REST, cx);
+        self.start_typing(id, String::new(), Caret::Start, mark, window, cx);
+    }
+
+    fn start_typing(
+        &mut self,
+        id: String,
+        text: String,
+        caret: Caret,
+        mark: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let folder = self.edits.path.parent().unwrap_or(Path::new("."));
+        let anchors = self
+            .file
+            .cards
+            .iter()
+            .find(|card| card.id == id)
+            .and_then(|card| match &card.kind {
+                CardKind::Text(doc) => Some(doc.anchors.keys().cloned().collect()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let links = Rc::new(Links::new(folder.to_path_buf(), anchors));
+        let field = cx.new(|cx| LiveBlock::new(text, caret, links, window, cx));
+        let events = cx.subscribe_in(
+            &field,
+            window,
+            |this: &mut Self, _, event: &LiveEvent, window, cx| match event {
+                LiveEvent::Change => this.typed(cx),
+                LiveEvent::Blur => this.stop_typing(cx),
+                LiveEvent::Follow(link) => this.follow(link, window, cx),
+                // Typed whole: nothing past its edges, no line of an owner to break or join.
+                LiveEvent::Leave(_) | LiveEvent::Break(_) | LiveEvent::Join => {}
+            },
+        );
+        let before = window.focused(cx);
+        let focus = field.read(cx).focus_handle().clone();
+        window.focus(&focus, cx);
+        self.edits.selected = vec![id.clone()];
+        self.edits.typing = Some(Typing {
+            id,
+            field,
+            mark,
+            before,
+            window: window.window_handle(),
+            _events: events,
+        });
+        self.tell_reader(cx);
+        cx.notify();
+    }
+
+    /// The text typed changed: an operation sets it, joined to the one before until a write
+    /// begins, which waits for the keys to rest.
+    fn typed(&mut self, cx: &mut Context<Self>) {
+        let Some(typing) = &self.edits.typing else {
+            return;
+        };
+        let (id, text) = (typing.id.clone(), typing.field.read(cx).value().to_string());
+        if self.edit(|canvas| typing_ops(canvas, &id, &text), cx) {
+            self.save_later(TYPING_REST, cx);
+        }
+    }
+
+    /// `Esc`, `Ctrl-Enter`, a press elsewhere, the keys gone elsewhere: the typing ends, and
+    /// what was typed is written now.
+    fn stop_typing(&mut self, cx: &mut Context<Self>) {
+        if self.end_typing(cx) {
+            self.save(cx);
+        }
+    }
+
+    /// The typing ends, nothing written: what it did is one action to undo, the keys go back
+    /// where they were unless they went elsewhere, and the card's Markdown is read again. False
+    /// when no card was typed in.
+    fn end_typing(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(typing) = self.edits.typing.take() else {
+            return false;
+        };
+        if let Some(board) = &mut self.edits.board {
+            board.join_since(typing.mark);
+        }
+        let (field, before) = (typing.field.read(cx).focus_handle().clone(), typing.before);
+        let window = typing.window;
+        // Not while this window is being updated: it is out of reach then.
+        cx.defer(move |cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    if let Some(before) = before
+                        && (field.is_focused(window) || window.focused(cx).is_none())
+                    {
+                        window.focus(&before, cx);
+                    }
+                })
+                .ok();
+        });
+        self.show_texts(cx);
+        self.tell_reader(cx);
+        cx.notify();
+        true
+    }
+
+    /// The reader drawn again, which keeps its keys from a card typed in, or gives them back.
+    fn tell_reader(&self, cx: &mut Context<Self>) {
+        let reader = self.reader.clone();
+        // Not while the reader is updated: it may be the one that called.
+        cx.defer(move |cx| {
+            reader.update(cx, |_, cx| cx.notify()).ok();
+        });
+    }
+
+    /// The card typed in, as the canvas being edited has it now. Gone, the typing ends. Its text
+    /// changed by another program while nothing typed waits to be written: the disk's wins, and
+    /// is typed on. What waits is merged once written: the disk wins there too, and what was
+    /// typed goes to the clipboard ([`tell`]); then the disk's is typed on.
+    fn sync_typing(&mut self, cx: &mut Context<Self>) {
+        let (Some(typing), Some(board)) = (&self.edits.typing, &self.edits.board) else {
+            return;
+        };
+        let text = board.canvas().node(&typing.id).and_then(Node::text);
+        let waits = text_waits(board.pending(), &typing.id);
+        let field = typing.field.clone();
+        match text.map(str::to_string) {
+            None => {
+                self.end_typing(cx);
+            }
+            Some(text) if !waits && text != field.read(cx).value() => {
+                field.update(cx, |field, cx| field.set_value(text, cx));
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// The cards as the canvas being edited has them. One it has that the board does not show
+    /// (made, or given back by an undo) is added; a text changed (undone) is read again, off the
+    /// window's thread. The card typed in shows its field rather than its Markdown.
+    fn show_texts(&mut self, cx: &mut Context<Self>) {
+        let Some(board) = &self.edits.board else {
+            return;
+        };
+        let typing = self.edits.typing.as_ref().map(|typing| typing.id.as_str());
+        let (mut added, mut read) = (Vec::new(), Vec::new());
+        for (index, node) in board.canvas().nodes().iter().enumerate() {
+            let Some(id) = node.id() else {
+                continue;
+            };
+            let text = node.text().unwrap_or_default();
+            let stale = match self.file.cards.iter().find(|card| card.id == id) {
+                Some(Card {
+                    kind: CardKind::Text(doc),
+                    ..
+                }) => doc.source != text,
+                Some(_) => false,
+                // Shown empty until it is read.
+                None => match card(index, node, |_| document::parse("", "", None)) {
+                    Some(new) => {
+                        let text = matches!(new.kind, CardKind::Text(_));
+                        added.push(new);
+                        text
+                    }
+                    None => false,
+                },
+            };
+            if stale && !text.is_empty() && Some(id) != typing {
+                read.push((id.to_string(), text.to_string()));
+            }
+        }
+        if !added.is_empty() {
+            let file = Arc::make_mut(&mut self.file);
+            // An index no card has: the canvas being edited numbers its nodes otherwise.
+            let mut next = file.cards.iter().map(|card| card.index + 1).max();
+            for mut new in added {
+                new.index = next.unwrap_or(0);
+                next = Some(new.index + 1);
+                // Groups below the rest, as the file has them.
+                let at = match new.kind {
+                    CardKind::Group => file
+                        .cards
+                        .iter()
+                        .take_while(|card| matches!(card.kind, CardKind::Group))
+                        .count(),
+                    _ => file.cards.len(),
+                };
+                file.cards.insert(at, new);
+            }
+            self.relay_edges();
+            cx.notify();
+        }
+        if read.is_empty() {
+            return;
+        }
+        let (ink, folder) = (
+            render::ink(cx),
+            self.edits.path.parent().map(Path::to_path_buf),
+        );
+        let work = cx.background_executor().spawn(async move {
+            read.into_iter()
+                .map(|(id, text)| {
+                    let doc = document::parse(&text, &ink, folder.as_deref());
+                    let title = title(&doc, &text);
+                    (id, Arc::new(doc), title)
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let read = work.await;
+            this.update(cx, |this, cx| this.texts_read(read, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Markdown read off the window's thread, put on its cards unless their text changed again
+    /// meanwhile.
+    fn texts_read(&mut self, read: Vec<(String, Arc<Document>, String)>, cx: &mut Context<Self>) {
+        let disk = self.file.canvas.clone();
+        let canvas = self.edits.board.as_ref().map_or(&*disk, Board::canvas);
+        let now: Vec<(String, Arc<Document>, String)> = read
+            .into_iter()
+            .filter(|(id, doc, _)| canvas.node(id).and_then(Node::text) == Some(&doc.source))
+            .collect();
+        if now.is_empty() {
+            return;
+        }
+        let file = Arc::make_mut(&mut self.file);
+        for (id, doc, title) in now {
+            if let Some(card) = file.cards.iter_mut().find(|card| card.id == id) {
+                card.kind = CardKind::Text(doc);
+                card.title = title;
+            }
+        }
+        cx.notify();
+    }
+
+    fn is_typed(&self, card: &Card) -> bool {
+        self.edits
+            .typing
+            .as_ref()
+            .is_some_and(|typing| typing.id == card.id)
+    }
+
+    /// A text card's body: its Markdown read, or the field it is typed in.
+    fn card_text(&self, ctx: &Ctx<Self>, card: &Card, doc: &Document, body: Div) -> Div {
+        match &self.edits.typing {
+            Some(typing) if typing.id == card.id => body
+                .key_context("CanvasCard")
+                .on_action(
+                    ctx.cx
+                        .listener(|this, _: &StopTyping, _, cx| this.stop_typing(cx)),
+                )
+                .on_action(ctx.cx.listener(|this, _: &WriteCard, _, cx| this.save(cx)))
+                .child(typing.field.clone()),
+            _ => body.children(doc.blocks.iter().map(|block| render::block(ctx, block))),
+        }
+    }
+
+    /// The card typed in, at its whole Markdown whatever the zoom: it keeps its field, and the
+    /// keys. `None` at the full detail, where it is drawn with the others.
+    fn typed_card(
+        &self,
+        detail: Detail,
+        camera: Camera,
+        p: &Palette,
+        config: &Config,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let typing = self.edits.typing.as_ref()?;
+        if detail == Detail::Full {
+            return None;
+        }
+        let card = self.file.cards.iter().find(|card| card.id == typing.id)?;
+        let zoom = camera.text_zoom(config.font_size);
+        let ctx = Ctx::new(p, config, zoom, &self.drawn, None, cx);
+        Some(self.full_card(&ctx, card, camera, p))
+    }
+}
+
+/// A new text card, empty, at its default size, its middle at the canvas's point (`x`, `y`):
+/// where a double click asked for it.
+pub fn new_card(canvas: &Canvas, x: f32, y: f32) -> Node {
+    let (width, height) = model::default_size(NodeKind::Text, Some(""));
+    let rect = Rect {
+        x: (f64::from(x) - width / 2.).round(),
+        y: (f64::from(y) - height / 2.).round(),
+        width,
+        height,
+    };
+    Node::new_text(&canvas.new_id(), "", rect)
+}
+
+/// The operation that gives the card `id` of `canvas` the text `text`: none when it has it.
+fn typing_ops(canvas: &Canvas, id: &str, text: &str) -> Vec<Op> {
+    Op::set_text(canvas, id, text).into_iter().collect()
+}
+
+/// Whether a text typed in the card `id` waits in `pending` to be written.
+fn text_waits(pending: &[Op], id: &str) -> bool {
+    pending.iter().any(|op| {
+        matches!(op, Op::Set { target: Target::Node, id: set, fields }
+            if set == id && fields.iter().any(|field| field.key == "text"))
+    })
 }
 
 /// A corner of a card.
@@ -2171,11 +2647,23 @@ impl Render for CanvasView {
                         .map(|card| self.full_card(&ctx, card, camera, &p)),
                 )
             }
-            Detail::Light => {
-                board.children(shown.iter().map(|card| Self::light_card(card, camera, &p)))
+            // The card typed in is drawn whole, after them.
+            Detail::Light => board.children(
+                shown
+                    .iter()
+                    .filter(|card| !self.is_typed(card))
+                    .map(|card| Self::light_card(card, camera, &p)),
+            ),
+            Detail::Rects => {
+                let shown: Vec<&Card> = shown
+                    .iter()
+                    .copied()
+                    .filter(|card| !self.is_typed(card))
+                    .collect();
+                board.child(Self::rects(&shown, camera, &p))
             }
-            Detail::Rects => board.child(Self::rects(&shown, camera, &p)),
         };
+        board = board.children(self.typed_card(detail, camera, &p, &config, cx));
         board = board.children(self.selection(camera, &p));
         // A pan, or cards held, go on wherever the pointer goes, over the board or not.
         if self.panning.is_some() || self.edits.held.is_some() {
@@ -2770,5 +3258,158 @@ mod tests {
         assert!(all.y < -100., "{all:?}");
         assert_eq!((all.x, all.width), (0., 400.));
         assert_eq!(all.y + all.height, 50.);
+    }
+}
+
+#[cfg(test)]
+mod typing_tests {
+    use super::{Camera, CanvasFile, Hit, hit, new_card, text_waits, told, typing_ops, write_now};
+    use crate::canvas::{self, Canvas, NodeKind};
+    use crate::canvas_board::{Board, Saved};
+    use crate::canvas_ops::{Op, Report};
+    use serde_json::Value;
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// A card `a` whose text is `A`.
+    const ONE: &str = r#"{"nodes":[{"id":"a","type":"text","text":"A","x":0,"y":0,"width":200,"height":100}],"edges":[]}"#;
+
+    /// A folder of its own for the test `name`, holding `ONE` as `a.canvas`: the folder and the
+    /// canvas's path.
+    fn canvas_file(name: &str) -> (PathBuf, PathBuf) {
+        let folder = std::env::temp_dir().join(format!("rature-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&folder);
+        fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("a.canvas");
+        fs::write(&path, ONE).unwrap();
+        (folder, path)
+    }
+
+    fn on_disk(path: &PathBuf) -> Canvas {
+        Canvas::read(&fs::read_to_string(path).unwrap())
+    }
+
+    /// What each key gives the canvas being edited, as the field's text after it.
+    fn type_keys(board: &mut Board, id: &str, texts: &[&str]) {
+        for text in texts {
+            for op in typing_ops(board.canvas(), id, text) {
+                board.edit(op);
+            }
+        }
+    }
+
+    #[test]
+    fn a_double_click_on_empty_space_makes_a_card_at_the_pointer() {
+        let file = CanvasFile::read(ONE, "#000000", None).unwrap();
+        let camera = Camera {
+            x: -100.,
+            y: -50.,
+            zoom: 0.5,
+        };
+        // The board's point (400, 300) is the canvas's (700, 550): nothing there.
+        let (x, y) = (400., 300.);
+        assert_eq!(hit(&file.cards, camera, 0., None, x, y), Hit::Empty);
+        let (at_x, at_y) = camera.to_canvas(x, y);
+        assert_eq!((at_x, at_y), (700., 550.));
+        let node = new_card(&file.canvas, at_x, at_y);
+        let (width, height) = canvas::default_size(NodeKind::Text, Some(""));
+        let rect = node.rect().unwrap();
+        assert_eq!((rect.width, rect.height), (width, height));
+        // Its middle under the pointer, on whole pixels.
+        assert_eq!(
+            (rect.x + width / 2., rect.y + height / 2.),
+            (700., 550.),
+            "{rect:?}"
+        );
+        assert_eq!((rect.x.fract(), rect.y.fract()), (0., 0.));
+        assert_eq!(node.kind(), Some(NodeKind::Text));
+        assert_eq!(node.text(), Some(""));
+        let id = node.id().unwrap().to_string();
+        assert_eq!(id.len(), 16);
+        assert_ne!(id, "a");
+        // Added, it is what a press there finds.
+        let mut made = (*file.canvas).clone();
+        let mut report = Report::default();
+        Op::add_node(node).apply(&mut made, &mut report);
+        assert!(report.is_clean());
+        let made = CanvasFile::read(&made.write().unwrap(), "#000000", None).unwrap();
+        assert_eq!(hit(&made.cards, camera, 0., None, x, y), Hit::Card(id));
+    }
+
+    #[test]
+    fn typing_a_text_is_one_set_text_operation_and_a_card_made_one_action() {
+        let (folder, path) = canvas_file("view-typing");
+        let mut board = Board::open_with_locks(&path, folder.join("locks")).unwrap();
+        type_keys(&mut board, "a", &["A ", "A b", "A bc", "A bc"]);
+        match board.pending() {
+            [Op::Set { id, fields, .. }] => {
+                assert_eq!(id, "a");
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].key, "text");
+                assert_eq!(fields[0].base, Some(Value::from("A")));
+                assert_eq!(fields[0].value, Some(Value::from("A bc")));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(text_waits(board.pending(), "a"));
+        let saved = write_now(&mut board).unwrap().unwrap();
+        assert!(matches!(saved, Saved::Done { written: true, report } if report.is_clean()));
+        assert_eq!(on_disk(&path).node("a").unwrap().text(), Some("A bc"));
+        assert!(!text_waits(board.pending(), "a"));
+        // A card made and typed in, the keys resting between: written twice, undone at once.
+        let mark = board.actions();
+        let node = new_card(board.canvas(), 0., 300.);
+        let id = node.id().unwrap().to_string();
+        board.edit(Op::add_node(node));
+        type_keys(&mut board, &id, &["x"]);
+        write_now(&mut board).unwrap().unwrap();
+        type_keys(&mut board, &id, &["xy"]);
+        board.join_since(mark);
+        write_now(&mut board).unwrap().unwrap();
+        assert_eq!(on_disk(&path).node(&id).unwrap().text(), Some("xy"));
+        assert!(board.undo());
+        assert!(board.canvas().node(&id).is_none());
+        assert_eq!(
+            board.canvas().node("a").unwrap().text(),
+            Some("A bc"),
+            "the edit before is an action of its own"
+        );
+        write_now(&mut board).unwrap().unwrap();
+        assert!(on_disk(&path).node(&id).is_none());
+        assert!(board.redo());
+        assert_eq!(board.canvas().node(&id).unwrap().text(), Some("xy"));
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a_text_changed_on_disk_while_typing_wins_and_what_was_typed_goes_to_the_clipboard() {
+        let (folder, path) = canvas_file("view-typing-conflict");
+        let mut board = Board::open_with_locks(&path, folder.join("locks")).unwrap();
+        type_keys(&mut board, "a", &["A t", "A typed"]);
+        // Another program rewrites the card meanwhile; the file is read again.
+        let theirs = ONE.replace(r#""text":"A""#, r#""text":"A theirs""#);
+        fs::write(&path, &theirs).unwrap();
+        board.refresh(&theirs);
+        assert_eq!(board.canvas().node("a").unwrap().text(), Some("A theirs"));
+        assert!(
+            text_waits(board.pending(), "a"),
+            "what was typed still waits"
+        );
+        let Saved::Done { report, .. } = write_now(&mut board).unwrap().unwrap() else {
+            panic!("not written");
+        };
+        let (said, clipboard) = told(&report).unwrap();
+        assert_eq!(clipboard.as_deref(), Some("A typed"));
+        assert!(
+            said.starts_with("a was changed in the file too")
+                && said.ends_with("what you typed is in the clipboard"),
+            "{said}"
+        );
+        assert_eq!(on_disk(&path).node("a").unwrap().text(), Some("A theirs"));
+        // Nothing waits: the field is given the disk's text, typed on from there.
+        assert!(!text_waits(board.pending(), "a"));
+        assert_eq!(board.canvas().node("a").unwrap().text(), Some("A theirs"));
+        assert_eq!(told(&Report::default()), None);
+        let _ = fs::remove_dir_all(&folder);
     }
 }

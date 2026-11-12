@@ -2103,7 +2103,9 @@ impl Render for Reader {
         let editing = self.editing.is_some()
             || code
                 .as_ref()
-                .is_some_and(|field| field.read(cx).focus_handle(cx).contains_focused(window, cx));
+                .is_some_and(|field| field.read(cx).focus_handle(cx).contains_focused(window, cx))
+            // A canvas card's text typed: the board's keys and the reader's keep off it too.
+            || self.board.as_ref().is_some_and(|board| board.read(cx).typing());
         // A zoom changes every block's height.
         if self.zoomed != self.zoom {
             self.zoomed = self.zoom;

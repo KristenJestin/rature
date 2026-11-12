@@ -148,6 +148,20 @@ impl Board {
         self.undo.push(ops);
     }
 
+    /// How many actions undo holds now: a mark for [`Board::join_since`].
+    pub fn actions(&self) -> usize {
+        self.undo.len()
+    }
+
+    /// The actions done since `mark`, which [`Board::actions`] gave, made one, undone at once: a
+    /// card made and its text typed, written in several times.
+    pub fn join_since(&mut self, mark: usize) {
+        if self.undo.len() > mark + 1 {
+            let joined: Vec<Op> = self.undo.drain(mark..).flatten().collect();
+            self.undo.push(joined);
+        }
+    }
+
     /// Undoes the last action; false when there is none.
     pub fn undo(&mut self) -> bool {
         let Some(action) = self.undo.pop() else {
