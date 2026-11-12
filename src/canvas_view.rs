@@ -6,9 +6,11 @@
 //! Cards are selected, moved, resized, nudged and deleted on it, each change an operation of
 //! [`crate::canvas_ops`] done on a [`Board`] and written by it, off the window's thread.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,8 +20,9 @@ use gpui_design_system::{Palette, palette, toast};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::canvas::{Canvas, Color, NodeKind, Problem};
+use crate::canvas::{Canvas, Color, End, NodeKind, Problem};
 use crate::canvas_board::{self, Board, Saved, Written};
+use crate::canvas_edges::{self as edges, Line};
 use crate::canvas_ops::{Op, Report};
 use crate::config::Config;
 use crate::document::{self, Document};
@@ -336,8 +339,20 @@ pub struct CanvasFile {
     /// The cards with a place and a size, groups first, each kind in the canvas's order: a group
     /// lies below what it holds.
     pub cards: Vec<Card>,
-    /// What all the cards cover.
+    /// What all the cards and edges cover.
     pub all: Option<Area>,
+    /// The edges between two cards that have a place and a size, in the canvas's order.
+    pub edges: Vec<EdgeLine>,
+}
+
+/// An edge between two cards, as the board draws it.
+#[derive(Clone, PartialEq)]
+pub struct EdgeLine {
+    /// The edge's index in the canvas.
+    pub index: usize,
+    pub line: Line,
+    pub tint: Option<Tint>,
+    pub label: Option<String>,
 }
 
 impl CanvasFile {
@@ -397,12 +412,58 @@ impl CanvasFile {
             .collect();
         // Stable: each kind keeps the canvas's order.
         cards.sort_by_key(|card| !matches!(card.kind, CardKind::Group));
-        let all = cards.iter().map(|card| card.area).reduce(Area::union);
+        let edges = lines(&canvas, &node_rects(&canvas));
+        // The curves too: one may bulge out of its cards.
+        let all = cards
+            .iter()
+            .map(|card| card.area)
+            .chain(edges.iter().map(|edge| area(edge.line.extent())))
+            .reduce(Area::union);
         Some(Self {
             canvas: Arc::new(canvas),
             cards,
             all,
+            edges,
         })
+    }
+
+    /// The edges of `canvas`, the canvas being edited, laid on the cards where they are now:
+    /// moved, resized or held by the pointer; those to a card no longer there left out.
+    pub fn laid_edges(&self, canvas: &Canvas) -> Vec<EdgeLine> {
+        let rects: HashMap<&str, edges::Rect> = self
+            .cards
+            .iter()
+            .filter(|card| !card.id.is_empty())
+            .map(|card| {
+                let a = card.area;
+                let rect = edges::Rect {
+                    x: a.x,
+                    y: a.y,
+                    width: a.width,
+                    height: a.height,
+                };
+                (card.id.as_str(), rect)
+            })
+            .collect();
+        lines(canvas, &rects)
+    }
+
+    /// The edge nearest the canvas's point (`x`, `y`), no further than `reach`: its place in
+    /// `edges`.
+    pub fn edge_at(&self, x: f32, y: f32, reach: f32) -> Option<usize> {
+        let at = edges::Point::new(x, y);
+        self.edges
+            .iter()
+            .enumerate()
+            .filter(|(_, edge)| {
+                let b = edge.line.bounds;
+                (b.x - reach..=b.x + b.width + reach).contains(&x)
+                    && (b.y - reach..=b.y + b.height + reach).contains(&y)
+            })
+            .map(|(i, edge)| (i, edge.line.distance(at)))
+            .filter(|(_, distance)| *distance <= reach)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(i, _)| i)
     }
 
     /// What the text cards show that is drawn off the main thread.
@@ -416,6 +477,71 @@ impl CanvasFile {
         }
         wanted
     }
+}
+
+/// An edge's rectangle as an area of the canvas.
+fn area(rect: edges::Rect) -> Area {
+    Area {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+    }
+}
+
+/// The place and size of each node of `canvas` that has them, by id.
+fn node_rects(canvas: &Canvas) -> HashMap<&str, edges::Rect> {
+    canvas
+        .nodes()
+        .iter()
+        .filter_map(|node| {
+            let rect = node.rect()?;
+            let rect = edges::Rect {
+                x: rect.x as f32,
+                y: rect.y as f32,
+                width: rect.width as f32,
+                height: rect.height as f32,
+            };
+            Some((node.id()?, rect))
+        })
+        .collect()
+}
+
+/// The edges of `canvas` between two nodes of `rects`, the place and size of each by id, their
+/// geometry worked out once.
+fn lines(canvas: &Canvas, rects: &HashMap<&str, edges::Rect>) -> Vec<EdgeLine> {
+    canvas
+        .edges()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, edge)| {
+            let from = *rects.get(edge.source_node()?)?;
+            let to = *rects.get(edge.target_node()?)?;
+            let line = Line::new(
+                from,
+                edges::Side::of(edge.source_side()),
+                to,
+                edges::Side::of(edge.target_side()),
+                edge.source_end() == End::Arrow,
+                edge.target_end() == End::Arrow,
+            );
+            let tint = match edge.color() {
+                Some(Color::Preset(n)) => Some(Tint::Preset(n)),
+                Some(Color::Rgb(rgb)) => Some(Tint::Rgb(rgb)),
+                Some(Color::Other(_)) | None => None,
+            };
+            let label = edge
+                .label()
+                .filter(|label| !label.trim().is_empty())
+                .map(str::to_string);
+            Some(EdgeLine {
+                index,
+                line,
+                tint,
+                label,
+            })
+        })
+        .collect()
 }
 
 /// A text card's title: its first heading, else its first line that says something.
@@ -477,6 +603,12 @@ pub struct CanvasView {
     settle: Option<Task<()>>,
     /// What is being edited, and its writes.
     edits: Edits,
+    /// The edge under the pointer, by its place in the file's `edges`.
+    hovered: Option<usize>,
+    /// The edges' shapes, by their index in the canvas, kept while the file and the zoom stay.
+    paths: Rc<RefCell<HashMap<usize, Built>>>,
+    /// Where each label was last drawn, in the window, by its edge's place in the file's `edges`.
+    labels: Labels,
 }
 
 /// The selection, what the pointer holds, and the canvas as it is edited.
@@ -562,6 +694,9 @@ impl CanvasView {
                 stalled: false,
                 later: None,
             },
+            hovered: None,
+            paths: Rc::default(),
+            labels: Rc::default(),
         };
         view.set_file(file, cx);
         view
@@ -572,6 +707,9 @@ impl CanvasView {
     pub fn set_file(&mut self, file: Arc<CanvasFile>, cx: &mut Context<Self>) {
         self.drawn
             .fill(file.wanted(), &[], |this: &mut Self| &mut this.drawn, cx);
+        self.paths.borrow_mut().clear();
+        self.labels.borrow_mut().clear();
+        self.hovered = None;
         self.file = file;
         self.read_again(cx);
         cx.notify();
@@ -629,10 +767,11 @@ impl CanvasView {
         }
     }
 
-    /// The board laid out at `bounds`: framed the first time, unless a camera was kept.
-    fn laid_out(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
+    /// The board laid out at `bounds`: framed the first time, unless a camera was kept. Whether
+    /// it moved or changed size, and has to be drawn again.
+    fn laid_out(&mut self, bounds: Bounds<Pixels>) -> bool {
         if self.bounds == Some(bounds) {
-            return;
+            return false;
         }
         self.bounds = Some(bounds);
         if self.camera.is_none() {
@@ -646,7 +785,7 @@ impl CanvasView {
                 },
             });
         }
-        cx.notify();
+        true
     }
 
     fn press(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -1232,6 +1371,7 @@ impl CanvasView {
             });
         }
         self.show_held();
+        self.relay_edges();
     }
 
     /// The cards held, where the pointer has them, whatever the file says meanwhile.
@@ -1260,6 +1400,7 @@ impl CanvasView {
                 card.area = area;
             }
         }
+        self.relay_edges();
     }
 
     /// Writes what is not written yet, off the window's thread: the lock may keep it waiting.
@@ -1682,6 +1823,265 @@ fn local(position: Point<Pixels>, bounds: Bounds<Pixels>) -> (f32, f32) {
     (f32::from(at.x), f32::from(at.y))
 }
 
+/// An edge's line, in the canvas's pixels, and the hovered one's.
+const EDGE_WIDTH: f32 = 2.;
+const HOVERED_WIDTH: f32 = 3.;
+/// How near the pointer an edge is hovered, on screen.
+const HOVER: f32 = 6.;
+/// A label's widest, and the height of the room it is centred in, in the canvas's pixels.
+const LABEL_WIDTH: f32 = 260.;
+const LABEL_HEIGHT: f32 = 200.;
+
+/// Where labels are drawn, in the window, by their edge's place in the file's `edges`.
+type Labels = Rc<RefCell<Vec<(usize, Bounds<Pixels>)>>>;
+
+/// An edge's shapes, tessellated at a zoom and a width in the canvas's pixels scaled by it, from
+/// the canvas's origin: a pan only moves them, it does not tessellate them again. A card moved
+/// moves its edges' curves: they are tessellated again.
+struct Built {
+    zoom: f32,
+    width: f32,
+    curve: [edges::Point; 4],
+    stroke: Option<gpui_kit::Path<Pixels>>,
+    arrows: Option<gpui_kit::Path<Pixels>>,
+}
+
+impl Built {
+    fn new(line: &Line, zoom: f32, width: f32) -> Self {
+        let at = |p: edges::Point| point(px(p.x * zoom), px(p.y * zoom));
+        let mut stroke = PathBuilder::stroke(px(width));
+        stroke.move_to(at(line.from));
+        stroke.cubic_bezier_to(at(line.to), at(line.c1), at(line.c2));
+        let ends: Vec<[edges::Point; 3]> =
+            line.from_arrow.into_iter().chain(line.to_arrow).collect();
+        let arrows = (!ends.is_empty())
+            .then(|| {
+                let mut fill = PathBuilder::fill();
+                for arrow in ends {
+                    fill.add_polygon(&arrow.map(at), true);
+                }
+                fill.build().ok()
+            })
+            .flatten();
+        Self {
+            zoom,
+            width,
+            curve: curve(line),
+            stroke: stroke.build().ok(),
+            arrows,
+        }
+    }
+}
+
+/// What a line's shapes follow: its curve's ends and control points.
+fn curve(line: &Line) -> [edges::Point; 4] {
+    [line.from, line.c1, line.c2, line.to]
+}
+
+/// `path` moved by `by`.
+fn shifted(path: &gpui_kit::Path<Pixels>, by: Point<Pixels>) -> gpui_kit::Path<Pixels> {
+    let mut path = path.clone();
+    path.bounds.origin += by;
+    for vertex in &mut path.vertices {
+        vertex.xy_position += by;
+    }
+    path
+}
+
+/// The edges: painted below the cards, their labels, the one under the pointer.
+impl CanvasView {
+    /// The edges in the canvas's area `seen` added to `board`, below the cards it gets next:
+    /// their curves and arrows in one element, then their labels at the full detail only, each
+    /// with text `font_size` at zoom 1. The hovered edge is highlighted.
+    #[allow(clippy::too_many_arguments)]
+    fn edges(
+        &self,
+        board: Stateful<Div>,
+        seen: &Area,
+        camera: Camera,
+        detail: Detail,
+        font_size: f32,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let shown: Vec<(usize, Hsla, f32)> = self
+            .file
+            .edges
+            .iter()
+            .enumerate()
+            .filter(|(_, edge)| area(edge.line.bounds).meets(seen))
+            .map(|(i, edge)| {
+                let color = edge.tint.map_or(p.mute, |t| tint(p, t));
+                if self.hovered == Some(i) {
+                    (i, lighter(color), HOVERED_WIDTH)
+                } else {
+                    (i, color, EDGE_WIDTH)
+                }
+            })
+            .collect();
+        self.labels.borrow_mut().clear();
+        let labels: Vec<AnyElement> = match detail {
+            Detail::Full => {
+                let size = px(camera.text_zoom(font_size) * font_size);
+                shown
+                    .iter()
+                    .filter_map(|&(i, _, _)| {
+                        let edge = &self.file.edges[i];
+                        let text = edge.label.as_ref()?;
+                        Some(label(i, edge, text, camera, size, p, self.labels.clone()))
+                    })
+                    .collect()
+            }
+            Detail::Light | Detail::Rects => Vec::new(),
+        };
+        let (file, paths, this) = (
+            self.file.clone(),
+            self.paths.clone(),
+            cx.entity().downgrade(),
+        );
+        let zoom = camera.zoom;
+        let layer = canvas(
+            |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+            move |bounds, hitbox, window, _| {
+                let by = bounds.origin - point(px(camera.x * zoom), px(camera.y * zoom));
+                let mut paths = paths.borrow_mut();
+                for (i, color, width) in shown {
+                    let edge = &file.edges[i];
+                    let width = (width * zoom).max(1.);
+                    let built = paths
+                        .entry(edge.index)
+                        .or_insert_with(|| Built::new(&edge.line, zoom, width));
+                    if built.zoom != zoom
+                        || built.width != width
+                        || built.curve != curve(&edge.line)
+                    {
+                        *built = Built::new(&edge.line, zoom, width);
+                    }
+                    for path in [&built.stroke, &built.arrows].into_iter().flatten() {
+                        window.paint_path(shifted(path, by), color);
+                    }
+                }
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Bubble {
+                        let over = hitbox.is_hovered(window);
+                        this.update(cx, |this, cx| this.hover(event.position, over, cx))
+                            .ok();
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_full();
+        board.child(layer).children(labels)
+    }
+
+    /// The edges laid again on the cards as the board shows them, edited or held by the pointer.
+    fn relay_edges(&mut self) {
+        let disk = self.file.canvas.clone();
+        let canvas = self.edits.board.as_ref().map_or(&*disk, Board::canvas);
+        let edges = self.file.laid_edges(canvas);
+        if edges != self.file.edges {
+            if edges.len() != self.file.edges.len() {
+                self.hovered = None;
+            }
+            Arc::make_mut(&mut self.file).edges = edges;
+        }
+    }
+
+    /// The pointer moved to `position`, `over` the board or not: the edge under it is
+    /// highlighted.
+    fn hover(&mut self, position: Point<Pixels>, over: bool, cx: &mut Context<Self>) {
+        let hovered = if over {
+            self.edge_under(position, cx)
+        } else {
+            None
+        };
+        if hovered != self.hovered {
+            self.hovered = hovered;
+            cx.notify();
+        }
+    }
+
+    /// The edge within `HOVER` of `position` on screen, unless a card, a handle or a group's
+    /// label is there, as a press finds them: they come first, and hide the edges below them.
+    fn edge_under(&self, position: Point<Pixels>, cx: &App) -> Option<usize> {
+        let (Some(camera), Some(bounds)) = (self.camera, self.bounds) else {
+            return None;
+        };
+        if self.panning.is_some() || self.edits.held.is_some() {
+            return None;
+        }
+        let (x, y) = local(position, bounds);
+        let label = self.label_line(camera, cx);
+        match hit(&self.file.cards, camera, label, self.edits.alone(), x, y) {
+            Hit::Handle(..) | Hit::Card(_) => return None,
+            Hit::Group(_) | Hit::Empty => {}
+        }
+        let labels = self.labels.borrow();
+        if let Some(&(i, _)) = labels.iter().find(|(_, at)| at.contains(&position)) {
+            return Some(i);
+        }
+        let (x, y) = camera.to_canvas(x, y);
+        self.file.edge_at(x, y, HOVER / camera.zoom)
+    }
+}
+
+/// A hovered edge's colour: its own, lighter, so that its tint still says what it says.
+fn lighter(color: Hsla) -> Hsla {
+    hsla(color.h, color.s, (color.l + 0.15).min(1.), color.a)
+}
+
+/// The label of the edge at `i` in the file's `edges`: a box on the board's colour at the curve's
+/// middle, its text `size`; where it is drawn is pushed to `drawn`, for the pointer.
+fn label(
+    i: usize,
+    edge: &EdgeLine,
+    text: &str,
+    camera: Camera,
+    size: Pixels,
+    p: &Palette,
+    drawn: Labels,
+) -> AnyElement {
+    let middle = edge.line.middle();
+    let (x, y) = camera.to_screen(middle.x, middle.y);
+    let zoom = camera.zoom;
+    let (width, height) = (LABEL_WIDTH * zoom, LABEL_HEIGHT * zoom);
+    div()
+        .absolute()
+        .left(px(x - width / 2.))
+        .top(px(y - height / 2.))
+        .w(px(width))
+        .h(px(height))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .max_w(px(width))
+                .px(px(6. * zoom))
+                .py(px(2. * zoom))
+                .rounded(px(4. * zoom))
+                .bg(p.bg)
+                .text_size(size)
+                .line_height(size * 1.4)
+                .text_color(p.text)
+                .text_center()
+                .relative()
+                .child(text.to_string())
+                .child(
+                    canvas(
+                        move |bounds, _, _| drawn.borrow_mut().push((i, bounds)),
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+                ),
+        )
+        .into_any_element()
+}
+
 impl Host for CanvasView {
     fn link_clicked(&mut self, link: String) {
         self.clicked_link = Some(link);
@@ -1712,8 +2112,17 @@ impl Render for CanvasView {
         let watch = this.clone();
         // Where the board is: what the camera frames, and the cards it shows.
         let tracker = canvas(
-            move |bounds, _, cx| {
-                watch.update(cx, |this, cx| this.laid_out(bounds, cx)).ok();
+            move |bounds, window, cx| {
+                let moved = watch
+                    .update(cx, |this, _| this.laid_out(bounds))
+                    .unwrap_or(false);
+                // A notify while the window draws is lost: gpui-fast marks a window to be drawn
+                // again only between two draws. The next frame asks for it.
+                if moved {
+                    window.on_next_frame(move |_, cx| {
+                        watch.update(cx, |_, cx| cx.notify()).ok();
+                    });
+                }
             },
             |_, _, _, _| {},
         )
@@ -1751,6 +2160,7 @@ impl Render for CanvasView {
             .filter(|card| card.area.meets(&seen))
             .collect();
         let detail = Detail::at(camera.zoom, self.gesturing);
+        board = self.edges(board, &seen, camera, detail, config.font_size, &p, cx);
         board = match detail {
             Detail::Full => {
                 let zoom = camera.text_zoom(config.font_size);
@@ -2285,5 +2695,80 @@ mod tests {
         assert!(close(orange.h * 360., 28.) && orange.l == p.wait.l);
         let red = tint(&p, Tint::Rgb([255, 0, 0]));
         assert!(close(red.h, 0.) && close(red.s, 1.) && close(red.l, 0.5));
+    }
+
+    #[test]
+    fn the_specs_sample_has_its_edge_hovered_near_its_curve() {
+        let text = include_str!("../tests/fixtures/jsoncanvas/sample.canvas");
+        let file = CanvasFile::read(text, "#000000", None).unwrap();
+        assert_eq!(file.edges.len(), 1);
+        let line = &file.edges[0].line;
+        // From the logo's right side to the links' left side, an arrow at its end only.
+        assert_eq!((line.from.x, line.from.y), (-63., -400.));
+        let [tip, ..] = line.to_arrow.unwrap();
+        assert_eq!((tip.x, tip.y), (40., -360.));
+        assert!(line.from_arrow.is_none());
+        let middle = line.middle();
+        assert_eq!(file.edge_at(middle.x, middle.y + 3., 6.), Some(0));
+        assert_eq!(file.edge_at(middle.x, middle.y + 30., 6.), None);
+    }
+
+    #[test]
+    fn edges_keep_their_label_colour_and_ends_and_need_two_placed_cards() {
+        let text = r##"{"nodes":[
+            {"id":"a","type":"text","text":"A","x":0,"y":0,"width":100,"height":50},
+            {"id":"b","type":"text","text":"B","x":300,"y":0,"width":100,"height":50},
+            {"id":"n","type":"text","text":"no place"}
+        ],"edges":[
+            {"id":"e1","fromNode":"a","toNode":"b","label":"goes to","color":"4","fromEnd":"arrow","toEnd":"none"},
+            {"id":"e2","fromNode":"a","toNode":"n"},
+            {"id":"e3","fromNode":"a","toNode":"gone"}
+        ]}"##;
+        let file = CanvasFile::read(text, "#000000", None).unwrap();
+        assert_eq!(file.edges.len(), 1);
+        let edge = &file.edges[0];
+        assert_eq!(edge.index, 0);
+        assert_eq!(edge.label.as_deref(), Some("goes to"));
+        assert_eq!(edge.tint, Some(Tint::Preset(4)));
+        assert!(edge.line.from_arrow.is_some() && edge.line.to_arrow.is_none());
+        // Between the two cards, on the straight line joining them.
+        assert_eq!(file.edge_at(200., 25., 6.), Some(0));
+    }
+
+    #[test]
+    fn edges_follow_their_cards_moved_and_go_with_them() {
+        let text = r##"{"nodes":[
+            {"id":"a","type":"text","text":"A","x":0,"y":0,"width":100,"height":50},
+            {"id":"b","type":"text","text":"B","x":300,"y":0,"width":100,"height":50}
+        ],"edges":[{"id":"e","fromNode":"a","toNode":"b"}]}"##;
+        let mut file = CanvasFile::read(text, "#000000", None).unwrap();
+        let canvas = file.canvas.clone();
+        assert!(file.laid_edges(&canvas) == file.edges, "nothing moved");
+        let b = file.cards.iter_mut().find(|card| card.id == "b").unwrap();
+        b.area.y += 300.;
+        let laid = file.laid_edges(&canvas);
+        let [tip, ..] = laid[0].line.to_arrow.unwrap();
+        // The left side's middle of b where it is now.
+        assert_eq!((tip.x, tip.y), (300., 325.));
+        file.cards.retain(|card| card.id != "b");
+        assert!(file.laid_edges(&canvas).is_empty());
+    }
+
+    #[test]
+    fn the_framing_takes_in_a_curve_bulging_out_of_its_cards() {
+        let text = r##"{"nodes":[
+            {"id":"a","type":"text","text":"A","x":0,"y":0,"width":100,"height":50},
+            {"id":"b","type":"text","text":"B","x":300,"y":0,"width":100,"height":50}
+        ],"edges":[
+            {"id":"e","fromNode":"a","fromSide":"top","toNode":"b","toSide":"top"}
+        ]}"##;
+        let all = CanvasFile::read(text, "#000000", None)
+            .unwrap()
+            .all
+            .unwrap();
+        // Both ends leave upwards: the curve rises above the cards, about 118 at its top.
+        assert!(all.y < -100., "{all:?}");
+        assert_eq!((all.x, all.width), (0., 400.));
+        assert_eq!(all.y + all.height, 50.);
     }
 }

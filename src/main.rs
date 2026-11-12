@@ -5,6 +5,7 @@ mod cache;
 mod canvas;
 #[allow(dead_code)]
 mod canvas_board;
+mod canvas_edges;
 #[allow(dead_code)]
 mod canvas_ops;
 mod canvas_view;
