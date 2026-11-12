@@ -768,6 +768,8 @@ struct Edits {
     again: bool,
     /// The file was not a valid canvas at the last write: tried again once it is read again.
     stalled: bool,
+    /// The last write failed, said once: tried again after [`RETRY`].
+    failed: bool,
     /// A write to come: nudges resting, a lock waited for.
     later: Option<Task<()>>,
     /// The text card being typed in.
@@ -860,6 +862,7 @@ impl CanvasView {
                 writing: false,
                 again: false,
                 stalled: false,
+                failed: false,
                 later: None,
                 typing: None,
             },
@@ -1925,13 +1928,21 @@ impl CanvasView {
                 .as_mut()
                 .map(|board| board.written(written)),
             Err(error) => {
-                toast(
-                    Toast::failure(format!("The canvas cannot be written: {error}")),
-                    cx,
-                );
+                if !std::mem::replace(&mut self.edits.failed, true) {
+                    toast(
+                        Toast::failure(format!(
+                            "The canvas cannot be written: {error}. Tried again until it can"
+                        )),
+                        cx,
+                    );
+                }
+                self.save_later(RETRY, cx);
                 None
             }
         };
+        if saved.is_some() {
+            self.edits.failed = false;
+        }
         match saved {
             Some(Saved::Done { report, .. }) => {
                 tell(report, cx);
