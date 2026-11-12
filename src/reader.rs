@@ -2044,7 +2044,7 @@ impl Reader {
                             .max_w(px(config.column))
                             .font_family(config.code_font.clone())
                             .text_size(px(config.font_size * 0.875 * self.zoom))
-                            .line_height(render::line_height(1.5, self.zoom))
+                            .line_height(render::line_height(1.5, config.font_size, self.zoom))
                             .child(page(uniform_list("data", count, view)).px_8()),
                     )
                     .into_any_element()
@@ -2323,7 +2323,11 @@ impl Render for Reader {
                     .text_color(t.text)
                     .font_family(config.font.clone())
                     .text_size(px(config.font_size * self.zoom))
-                    .line_height(render::line_height(render::LINE, self.zoom))
+                    .line_height(render::line_height(
+                        render::LINE,
+                        config.font_size,
+                        self.zoom,
+                    ))
                     .map(|d| match code {
                         // The editor scrolls itself.
                         Some(field) => d.pt(space::XL).px_8().child(
@@ -2334,7 +2338,7 @@ impl Render for Reader {
                                 .size_full()
                                 .font_family(config.code_font.clone())
                                 .text_size(px(config.font_size * 0.9 * self.zoom))
-                                .line_height(render::line_height(1.5, self.zoom))
+                                .line_height(render::line_height(1.5, config.font_size, self.zoom))
                                 .child(Editor::new(&field)),
                         ),
                         // The page scrolls its list, or its rows, itself.

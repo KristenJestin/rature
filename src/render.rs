@@ -13,7 +13,7 @@ const CELL: f32 = 90.;
 pub const TABLE_CELL: f32 = 90.;
 /// GPUI's rem: the reader leaves it as it is, a `Scaled` makes it follow the zoom.
 const REM: f32 = 16.;
-/// The page's line, in rems at zoom 1.
+/// The page's line, against the text size: 1.6 rem at zoom 1 with the default 16 px text.
 pub const LINE: f32 = 1.6;
 
 use gpui_kit::prelude::FluentBuilder as _;
@@ -91,9 +91,9 @@ impl<'a, 'b, H: Host> Ctx<'a, 'b, H> {
         px(v * self.zoom)
     }
 
-    /// A line `rems_at_1` high at zoom 1, at the page's zoom.
+    /// A line `rems_at_1` times the text size high, at the page's zoom.
     pub fn line_height(&self, rems_at_1: f32) -> Pixels {
-        line_height(rems_at_1, self.zoom)
+        line_height(rems_at_1, self.config.font_size, self.zoom)
     }
 }
 
@@ -308,11 +308,13 @@ pub fn is_dark(cx: &App) -> bool {
     gpui_design_system::theme::target_palette(cx).bg.l < 0.5
 }
 
-/// A line `rems_at_1` rems high at zoom 1, as high as the zoom makes the text. In px, not in
+/// A line `rems_at_1` times the text size `font_size` high, at `zoom`: as high as the text the
+/// configured size and the zoom make, `rems_at_1` rems at zoom 1 with 16 px text. In px, not in
 /// rems: inside a `Scaled`, whose rem already follows the zoom, a line in rems would be zoomed
-/// twice. Worked out as GPUI turns rems into px, so that a line is the same to the bit.
-pub fn line_height(rems_at_1: f32, zoom: f32) -> Pixels {
-    px(rems_at_1 * zoom * REM)
+/// twice. At 16 px, the same to the bit as GPUI turns rems into px: a power of two scales
+/// without rounding.
+pub fn line_height(rems_at_1: f32, font_size: f32, zoom: f32) -> Pixels {
+    px(rems_at_1 * font_size * zoom)
 }
 
 /// A heading's size, against the text's.
@@ -1132,13 +1134,14 @@ pub fn image_file(path: &Path) -> AnyElement {
 #[cfg(test)]
 mod tests {
     use super::{LINE, REM, data_lines, formula_drop, line_height, node_at, one_line};
+    use crate::config::Config;
     use crate::formats::{Kind, Node, Value};
     use gpui_kit::{DefiniteLength, px, rems};
     use std::collections::HashSet;
 
-    /// The line at `zoom`, where the rem is `rem`.
+    /// The line of 16 px text at `zoom`, where the rem is `rem`.
     fn line_under(zoom: f32, rem: f32) -> f32 {
-        let line = DefiniteLength::from(line_height(LINE, zoom));
+        let line = DefiniteLength::from(line_height(LINE, 16., zoom));
         f32::from(line.to_pixels(px(16. * zoom).into(), px(rem)))
     }
 
@@ -1149,17 +1152,17 @@ mod tests {
     #[test]
     fn the_line_grows_with_the_zoom_and_stays_put_at_zoom_1() {
         // At zoom 1, the line the page always had: 1.6 rem, 25.6 px.
-        assert_eq!(line_height(LINE, 1.), rems(1.6).to_pixels(px(REM)));
+        assert_eq!(line_height(LINE, 16., 1.), rems(1.6).to_pixels(px(REM)));
         // At the reader's zooms, the same to the bit as the line in rems it was.
         for zoom in [0.6, 1.1, 1.4641, 2.5] {
             assert_eq!(
-                line_height(LINE, zoom),
+                line_height(LINE, 16., zoom),
                 rems(LINE * zoom).to_pixels(px(REM)),
                 "zoom {zoom}"
             );
         }
         assert_eq!(line_px(1.), 25.6);
-        // At the reader's zooms, 0.6 to 2.5, the line stays 1.6 times the text, 16 px at zoom 1:
+        // At the reader's zooms, 0.6 to 2.5, the line of 16 px text stays 1.6 times the text:
         // Noto Sans' glyphs, 1.362 em from top to bottom, fit in it.
         for zoom in [0.6, 1., 1.1, 1.4641, 2., 2.5] {
             let size = 16. * zoom;
@@ -1167,6 +1170,22 @@ mod tests {
             assert!(line_px(zoom) > 1.362 * size, "zoom {zoom}");
         }
         assert!((line_px(2.5) - 64.).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_line_follows_the_text_size() {
+        // 24 px text: its glyphs, about 32.7 px, once stood on a 25.6 px line.
+        let size = Config::parse("font_size = 24\n").unwrap().font_size;
+        for zoom in [0.6, 1., 1.4641, 2.5] {
+            let line = f32::from(line_height(LINE, size, zoom));
+            let text = size * zoom;
+            assert!((line - 1.6 * text).abs() < 1e-3, "zoom {zoom}");
+            assert!(line > 1.362 * text, "zoom {zoom}");
+        }
+        assert!((f32::from(line_height(LINE, size, 1.)) - 38.4).abs() < 1e-3);
+        // A text size of nothing reads as 1 px: the line is never empty.
+        let none = Config::parse("font_size = 0\n").unwrap().font_size;
+        assert_eq!(f32::from(line_height(LINE, none, 1.)), 1.6);
     }
 
     #[test]

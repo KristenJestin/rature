@@ -63,7 +63,7 @@ impl Config {
     }
 
     /// A file's text, its text size at least 1 px: a canvas's zoom divides by it.
-    fn parse(text: &str) -> Result<Self, toml::de::Error> {
+    pub(crate) fn parse(text: &str) -> Result<Self, toml::de::Error> {
         let mut config: Self = toml::from_str(text)?;
         config.font_size = config.font_size.max(1.);
         Ok(config)
