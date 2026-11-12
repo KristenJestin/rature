@@ -124,6 +124,7 @@ alone: remove it, or use `--no-rt`.
 rature notes.md     # a file
 rature docs/        # a folder: its tree and its README
 rt notes.md         # the same, shorter
+rature --version    # the version, its channel and its commit
 ```
 
 The window opens and the terminal is given back. There is one window per user: opening another
@@ -233,6 +234,9 @@ and folders, and a snapshot of each file as you last read it, which "what change
 cargo test
 cargo build --release
 ```
+
+CI checks every push and pull request, and publishes a build of `main` (stable), `dev` (beta)
+and each `feat/` or `fix/` branch (alpha): see [docs/releases.md](docs/releases.md).
 
 [`examples/weather-station/`](examples/weather-station/) is a small invented project that
 covers every view: Markdown with links, a broken one, an alert, a table and footnotes, plus CSV,

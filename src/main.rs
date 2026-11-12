@@ -37,10 +37,16 @@ use gpui_kit::*;
 const FOREGROUND: &str = "RATURE_FOREGROUND";
 
 const USAGE: &str = "usage: rature [file or folder]
+       rature --version
 
 Reads Markdown (and JSON, YAML, CSV, images, code) and follows its changes.
 `rt` is the same. Keys: see the README, or `f` `s` `o` `t` `Ctrl-f` `]c` `m` `i` `e` `q` in the
 window.";
+
+/// What `--version` prints: the version, the channel and the commit (`build.rs`).
+fn version() -> String {
+    format!("rature {}", env!("RATURE_VERSION"))
+}
 
 fn main() {
     let started = Instant::now();
@@ -62,6 +68,10 @@ fn main() {
     let path = match arg.as_deref().and_then(|a| a.to_str()) {
         Some("-h" | "--help") => {
             println!("{USAGE}");
+            return;
+        }
+        Some("-V" | "--version") => {
+            println!("{}", version());
             return;
         }
         _ => arg.map(|arg| {
@@ -198,4 +208,37 @@ fn main() {
         })
         .detach();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `super::*`: gpui_kit's own `test` attribute would come with it.
+    use super::version;
+
+    #[test]
+    fn the_version_names_its_channel_and_commit() {
+        let number = env!("RATURE_VERSION_NUMBER");
+        let channel = env!("RATURE_CHANNEL");
+        let rest = version()
+            .strip_prefix(&format!("rature {number} ({channel}"))
+            .expect("the number, then the channel")
+            .to_owned();
+        let commit = rest
+            .strip_prefix(", ")
+            .and_then(|rest| rest.strip_suffix(')'));
+        match commit {
+            Some(commit) => {
+                assert_eq!(commit.len(), 12, "{commit}");
+                assert!(commit.bytes().all(|b| b.is_ascii_hexdigit()), "{commit}");
+            }
+            None => assert_eq!(rest, ")"),
+        }
+        // A build CI did not make is a local one, at the crate's version.
+        if option_env!("RATURE_BUILD_CHANNEL").is_none_or(str::is_empty) {
+            assert_eq!(channel, "local");
+        }
+        if option_env!("RATURE_BUILD_VERSION").is_none_or(str::is_empty) {
+            assert_eq!(number, env!("CARGO_PKG_VERSION"));
+        }
+    }
 }
