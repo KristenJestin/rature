@@ -1,4 +1,7 @@
 mod cache;
+// The model of `.canvas` files: no window uses it before the canvas opens in one (#9).
+#[allow(dead_code)]
+mod canvas;
 mod config;
 mod diagram;
 mod diff;
