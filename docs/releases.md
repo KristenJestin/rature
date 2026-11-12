@@ -92,7 +92,9 @@ and `fix/**`, and by hand. A newer push cancels the older runs of its ref, but o
   current Arch and Debian stable. It computes the channel (`main` stable, `dev` beta, any other
   branch alpha) and the version, builds with `cargo build --release --locked`, packages with
   `tools/package.sh` and writes the notes: the version, the channel, the commit, the install
-  line, the window's system libraries and the changelog.
+  line, the window's system libraries and the changelog. A branch whose name holds another
+  character than ASCII letters, digits and `._/-` fails the run, and nothing is published: the
+  name goes as it is into the notes and the API's addresses.
 - **`publish`**, once `verify` and `build` passed: the only job that writes. It runs no code of
   the repository, no git, only `gh`. It reads the branch's tip again first: a branch that moved
   or was deleted publishes nothing. A version already published stays as it is; a draft left by a
