@@ -804,6 +804,16 @@ impl Reader {
         };
         self.write_edit(cx);
         self.write_code(cx);
+        // A canvas left: what it showed is read, before what was not written yet is written.
+        // The write then marks the user's own operations read, never what another program
+        // wrote meanwhile, which the board did not show.
+        let canvas_read = match (&self.board, &self.canvas_changes) {
+            (Some(board), Some(_)) => {
+                state::mark_read(&path, &board.read(cx).as_read());
+                true
+            }
+            _ => false,
+        };
         if let Some(board) = &self.board {
             board.update(cx, |board, cx| board.put_down(cx));
         }
@@ -816,9 +826,7 @@ impl Reader {
         if let Some(kept) = camera.and_then(|camera| camera.kept()) {
             cx.global_mut::<State>().set_camera(&path, kept);
         }
-        // A canvas left: what it showed, and what Rature just wrote of it, is read.
-        if let (Some(board), Some(_)) = (&self.board, &self.canvas_changes) {
-            state::mark_read(&path, &board.read(cx).as_read());
+        if canvas_read {
             cx.emit(ReaderEvent::MarkedRead(path.clone()));
         }
         if let (Content::Markdown(doc), Some(_)) = (&self.content, &self.before) {
