@@ -4491,10 +4491,17 @@ mod tests {
         };
         let said = report(board.written(first.run().unwrap()));
         assert_eq!(said.clipboard, ["A1"]);
-        assert_eq!(text(board.canvas()), "theirs", "the disk's, while A12 waits");
+        assert_eq!(
+            text(board.canvas()),
+            "theirs",
+            "the disk's, while A12 waits"
+        );
         let second = board.writing();
         typed(&mut board, "A12", "A123");
-        assert_eq!(report(board.written(second.run().unwrap())).clipboard, ["A12"]);
+        assert_eq!(
+            report(board.written(second.run().unwrap())).clipboard,
+            ["A12"]
+        );
         assert_eq!(report(board.save().unwrap()).clipboard, ["A123"]);
         let disk = Canvas::read(&std::fs::read_to_string(&path).unwrap());
         assert_eq!(text(&disk), "theirs");

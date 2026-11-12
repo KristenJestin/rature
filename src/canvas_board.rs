@@ -565,7 +565,10 @@ mod tests {
         let written = writing.run().unwrap();
         let op = Op::move_node(board.canvas(), "a", 10., 0.).unwrap();
         board.edit(op);
-        assert!(done(board.save().unwrap()).is_clean(), "n is not said taken");
+        assert!(
+            done(board.save().unwrap()).is_clean(),
+            "n is not said taken"
+        );
         assert!(board.pending().is_empty());
         assert!(done(board.written(written)).is_clean());
         assert!(board.pending().is_empty());
