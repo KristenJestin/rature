@@ -14,6 +14,7 @@ use gpui_kit::base::input::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::canvas_view::{Camera, CanvasView};
 use crate::config::{Config, Side};
 use crate::diff::{Changes, Mark};
 use crate::document::{self, Block, Document, Links};
@@ -90,9 +91,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("up", LineUp, at),
         KeyBinding::new("ctrl-d", HalfPageDown, at),
         KeyBinding::new("ctrl-u", HalfPageUp, at),
-        KeyBinding::new("space", PageDown, at),
+        // On a canvas, Space held pans with a drag.
+        KeyBinding::new("space", PageDown, Some("Reader && !Canvas")),
         KeyBinding::new("pagedown", PageDown, at),
-        KeyBinding::new("shift-space", PageUp, at),
+        KeyBinding::new("shift-space", PageUp, Some("Reader && !Canvas")),
         KeyBinding::new("ctrl-b", PageUp, at),
         KeyBinding::new("pageup", PageUp, at),
         KeyBinding::new("g g", Top, at),
@@ -270,6 +272,8 @@ pub struct Reader {
     query: String,
     editing: Option<Editing>,
     code: Option<CodeFile>,
+    /// The board a canvas is drawn on, while one is shown.
+    board: Option<Entity<CanvasView>>,
     /// A block just edited, its marks fading out before it is read again.
     closing: Option<(usize, Field, Task<()>)>,
     /// Blocks read again after an edit: they are back in place, they do not rise into it.
@@ -345,6 +349,7 @@ impl Reader {
             query: String::new(),
             editing: None,
             code: None,
+            board: None,
             closing: None,
             settled: HashSet::new(),
             zoom: 1.,
@@ -571,6 +576,9 @@ impl Reader {
         self.write_code(cx);
         self.code = None;
         self.drawn.clear();
+        if let Some(board) = &self.board {
+            board.update(cx, |board, _| board.restyle());
+        }
         // Only a file read is shown: read again, its formulas in the new ink.
         self.reload(cx);
     }
@@ -594,6 +602,24 @@ impl Reader {
         self.data_lines = match &content {
             Content::Data(nodes) => Rc::new(render::data_lines(nodes, &self.folded)),
             _ => Rc::default(),
+        };
+        // The same canvas read again keeps its board, and its camera; another one is opened
+        // after `Empty`, so it never takes the board of the one before.
+        self.board = match (&content, self.board.take()) {
+            (Content::Canvas(file), Some(board)) => {
+                board.update(cx, |board, cx| board.set_file(file.clone(), cx));
+                Some(board)
+            }
+            (Content::Canvas(file), None) => {
+                let camera = self
+                    .path
+                    .as_deref()
+                    .and_then(|path| cx.global::<State>().camera(path))
+                    .and_then(Camera::from_kept);
+                let reader = cx.entity().downgrade();
+                Some(cx.new(|cx| CanvasView::new(file.clone(), camera, reader, cx)))
+            }
+            _ => None,
         };
         self.content = content;
         self.prints = prints;
@@ -709,6 +735,9 @@ impl Reader {
             let position = self.position();
             cx.global_mut::<State>().set_position(&path, position);
         }
+        if let Some(camera) = self.board.as_ref().and_then(|b| b.read(cx).camera()) {
+            cx.global_mut::<State>().set_camera(&path, camera.kept());
+        }
         if let (Content::Markdown(doc), Some(_)) = (&self.content, &self.before) {
             state::mark_read(&path, &doc.source);
             cx.emit(ReaderEvent::MarkedRead(path));
@@ -814,7 +843,7 @@ impl Reader {
 
     /// Follows a link: a page on the web, an anchor of this file, or another file (and its
     /// anchor), which the back key returns from.
-    fn follow_link(&mut self, link: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn follow_link(&mut self, link: &str, window: &mut Window, cx: &mut Context<Self>) {
         match document::target(link) {
             document::Target::Web => return cx.open_url(link.trim()),
             document::Target::Foreign => {
@@ -941,6 +970,10 @@ impl Reader {
     }
 
     fn scroll_by(&mut self, delta: Pixels, cx: &mut Context<Self>) {
+        if let Some(board) = &self.board {
+            board.update(cx, |board, cx| board.pan_by(0., -f32::from(delta), cx));
+            return;
+        }
         if self.in_rows() {
             let rows = self.rows.0.borrow().base_handle.clone();
             let offset = rows.offset();
@@ -952,7 +985,10 @@ impl Reader {
         cx.notify();
     }
 
-    fn page(&self) -> Pixels {
+    fn page(&self, cx: &App) -> Pixels {
+        if let Some(board) = &self.board {
+            return board.read(cx).height();
+        }
         if self.in_rows() {
             return self.rows.0.borrow().base_handle.bounds().size.height;
         }
@@ -966,16 +1002,16 @@ impl Reader {
         self.scroll_by(px(-LINE), cx);
     }
     fn half_page_down(&mut self, _: &HalfPageDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.scroll_by(self.page() / 2., cx);
+        self.scroll_by(self.page(cx) / 2., cx);
     }
     fn half_page_up(&mut self, _: &HalfPageUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.scroll_by(-self.page() / 2., cx);
+        self.scroll_by(-self.page(cx) / 2., cx);
     }
     fn page_down(&mut self, _: &PageDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.scroll_by(self.page() - px(LINE), cx);
+        self.scroll_by(self.page(cx) - px(LINE), cx);
     }
     fn page_up(&mut self, _: &PageUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.scroll_by(-(self.page() - px(LINE)), cx);
+        self.scroll_by(-(self.page(cx) - px(LINE)), cx);
     }
     fn top(&mut self, _: &Top, _: &mut Window, cx: &mut Context<Self>) {
         if self.in_rows() {
@@ -1132,18 +1168,23 @@ impl Reader {
         }
     }
 
-    fn zoom_by(&mut self, factor: Option<f32>, cx: &mut Context<Self>) {
+    /// Zooms the page, or a canvas's camera around the pointer.
+    fn zoom_by(&mut self, factor: Option<f32>, window: &Window, cx: &mut Context<Self>) {
+        if let Some(board) = &self.board {
+            board.update(cx, |board, cx| board.zoom_key(factor, window, cx));
+            return;
+        }
         self.zoom = factor.map_or(1., |f| (self.zoom * f).clamp(0.6, 2.5));
         cx.notify();
     }
-    fn zoom_in(&mut self, _: &ZoomIn, _: &mut Window, cx: &mut Context<Self>) {
-        self.zoom_by(Some(1.1), cx);
+    fn zoom_in(&mut self, _: &ZoomIn, window: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_by(Some(1.1), window, cx);
     }
-    fn zoom_out(&mut self, _: &ZoomOut, _: &mut Window, cx: &mut Context<Self>) {
-        self.zoom_by(Some(1. / 1.1), cx);
+    fn zoom_out(&mut self, _: &ZoomOut, window: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_by(Some(1. / 1.1), window, cx);
     }
-    fn zoom_reset(&mut self, _: &ZoomReset, _: &mut Window, cx: &mut Context<Self>) {
-        self.zoom_by(None, cx);
+    fn zoom_reset(&mut self, _: &ZoomReset, window: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_by(None, window, cx);
     }
 
     /// Edits the first block of the window, in place.
@@ -1470,7 +1511,7 @@ impl Reader {
     fn save(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
         match self.content {
             Content::Markdown(_) | Content::Code { .. } | Content::Data(_) | Content::Table(_) => {}
-            Content::Image(_) | Content::Empty | Content::Message(_) => return,
+            Content::Image(_) | Content::Canvas(_) | Content::Empty | Content::Message(_) => return,
         }
         if !self.editable {
             return self.say(NOT_UTF8, cx);
@@ -1807,8 +1848,8 @@ impl Reader {
                 }
             }
             Content::Code { lang, text } => wrap(render::code(ctx, lang, text).into_any_element()),
-            // Shown as rows, by `rows_view`.
-            Content::Data(_) | Content::Table(_) => div().into_any_element(),
+            // Shown as rows, by `rows_view`, or on the board.
+            Content::Data(_) | Content::Table(_) | Content::Canvas(_) => div().into_any_element(),
             Content::Image(path) => wrap(render::image_file(path)),
             Content::Empty => notice(
                 "no-file",
@@ -2057,7 +2098,10 @@ impl Render for Reader {
             self.zoomed = self.zoom;
             self.list.remeasure();
         }
-        let page: AnyElement = if self.in_rows() {
+        let board = self.board.clone();
+        let page: AnyElement = if let Some(board) = &board {
+            board.clone().into_any_element()
+        } else if self.in_rows() {
             self.rows_view(&config, cx)
         } else {
             list(
@@ -2077,7 +2121,28 @@ impl Render for Reader {
             .child(
                 div()
                     .id("page")
-                    .when(!editing, |d| d.key_context("Reader"))
+                    .when(!editing, |d| {
+                        d.key_context(if board.is_some() {
+                            "Reader Canvas"
+                        } else {
+                            "Reader"
+                        })
+                    })
+                    .when_some(board, |d, board| {
+                        let (pressed, released) = (board.clone(), board);
+                        d.on_key_down(move |event, _, cx| {
+                            if event.keystroke.key == "space"
+                                && !event.keystroke.modifiers.modified()
+                            {
+                                pressed.update(cx, |board, cx| board.hold_space(true, cx));
+                            }
+                        })
+                        .on_key_up(move |event, _, cx| {
+                            if event.keystroke.key == "space" {
+                                released.update(cx, |board, cx| board.hold_space(false, cx));
+                            }
+                        })
+                    })
                     .track_focus(&self.focus)
                     .on_action(cx.listener(Self::line_down))
                     .on_action(cx.listener(Self::line_up))

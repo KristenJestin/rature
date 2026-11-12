@@ -29,8 +29,9 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 - **Release builds run at low priority, one at a time**: `nice -n 19 cargo build --release`. The
   machine is the maintainer's own, in use while you work: no parallel builds, no stress loops.
 - **`RATURE_TIMING=1`** prints the start-up timings on the standard error once the window has
-  shown its first frame (`src/timing.rs`). `tools/capture.sh` sets it and prints them: use it
-  rather than opening a window (see Testing).
+  shown its first frame (`src/timing.rs`), and on a canvas each frame's cost as it is painted
+  (`src/canvas_view.rs`). `tools/capture.sh` sets it and prints them: use it rather than opening
+  a window (see Testing).
 
 ## Where things live
 
@@ -49,10 +50,11 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 | `live.rs` | A block's Markdown edited where it is read: its marks faint in the text, the caret, the selection, the keys |
 | `table.rs` | A Markdown table edited in place, cell by cell, rows and columns added and deleted |
 | `list.rs` | A Markdown list edited in place, line by line beside its markers |
-| `formats.rs` | What a file is shown as: Markdown, data (JSON, YAML) as a folding tree, CSV as a table, an image, or code |
+| `formats.rs` | What a file is shown as: Markdown, data (JSON, YAML) as a folding tree, CSV as a table, an image, a canvas, or code |
 | `canvas.rs` | JSON Canvas 1.0 (Obsidian's `.canvas`), read and written without losing anything: unknown fields, key order and node order kept; a text's revision; where a new card goes, and its default size |
 | `canvas_ops.rs` | Operations on a canvas by id, replayed on the disk's canvas with a field-by-field three-way merge (the disk wins a conflict), and their inverses for undo |
 | `canvas_board.rs` | A canvas being edited: pending operations, undo and redo, each write the disk's text read again and the operations replayed on it, under a lock per canvas in the runtime folder; a new canvas made under the same lock |
+| `canvas_view.rs` | A canvas shown as a board, which the reader draws it on: its camera (pan, zoom around the pointer, kept per file), only the cards in sight built, at a detail that follows the zoom (the whole Markdown, a box and its title, rectangles) |
 | `format.rs` | Formatting on the user's own save (`Ctrl-s`), never on a change made from outside |
 | `load.rs` | Reading a file off the main thread: reading, parsing, formulas, link checks, the comparison; only the latest request's result is kept |
 | `cache.rs` | Results worked out off the main thread (a diagram, a code block's colours), keyed by their source: pending, done or failed |
@@ -83,7 +85,8 @@ Besides `src/`:
 - `tools/`:
   - `capture.sh`: the window captured into a PNG, in a nested headless Weston;
   - `screenshots.sh`: the README's images made again from the example, through `capture.sh`;
-  - `xkeys.py`: keys typed into `capture.sh`'s nested display;
+  - `xkeys.py`: keys typed, clicks, the wheel and drags into `capture.sh`'s nested display;
+  - `canvas-gen.sh`: canvases of any number of cards, for measuring the board;
   - `brand.sh`: the brand's PNGs from its SVGs;
   - `version.sh`, `changelog.sh`, `package.sh`: the version, the notes and the archive of a
     build (`docs/releases.md`);

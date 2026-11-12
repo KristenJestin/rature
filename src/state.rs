@@ -1,6 +1,6 @@
 //! What Rature keeps between runs, in `$XDG_STATE_HOME/rature`, never beside the files read:
-//! where each file was read up to, the files opened last, and each file as it was last marked
-//! read (`read/`), which "what changed" compares to. It is the user's alone (the folder 0700,
+//! where each file was read up to, where each canvas was looked at, the files opened last, and
+//! each file as it was last marked read (`read/`), which "what changed" compares to. It is the user's alone (the folder 0700,
 //! its files 0600: a copy of a private note stays private), and it does not grow for ever: what
 //! was not read for long is let go.
 //!
@@ -40,6 +40,10 @@ pub struct State {
     /// When each of them was last opened, in seconds since the epoch.
     #[serde(default)]
     pub opened_at: HashMap<PathBuf, u64>,
+    /// Per canvas, where its camera was left (the canvas's point at the board's top left corner,
+    /// and the zoom), and when, in seconds since the epoch.
+    #[serde(default)]
+    pub cameras: HashMap<PathBuf, ([f32; 3], u64)>,
 }
 
 impl gpui_kit::Global for State {}
@@ -57,6 +61,7 @@ impl State {
                 .unwrap_or_default()
         });
         state.prune_positions(now());
+        state.prune_cameras(now());
         state
     }
 
@@ -87,6 +92,33 @@ impl State {
         self.positions.insert(path.to_path_buf(), position);
         self.positioned_at.insert(path.to_path_buf(), now());
         self.prune_positions(now());
+    }
+
+    /// Keeps where the canvas at `path` was looked at.
+    pub fn set_camera(&mut self, path: &Path, camera: [f32; 3]) {
+        self.cameras.insert(path.to_path_buf(), (camera, now()));
+        self.prune_cameras(now());
+    }
+
+    pub fn camera(&self, path: &Path) -> Option<[f32; 3]> {
+        self.cameras.get(path).map(|(camera, _)| *camera)
+    }
+
+    /// As many cameras as positions at most, none older than `KEPT`, the oldest going first.
+    fn prune_cameras(&mut self, now: u64) {
+        let oldest = now.saturating_sub(KEPT.as_secs());
+        self.cameras.retain(|_, (_, at)| *at >= oldest);
+        if self.cameras.len() > POSITIONS {
+            let mut by_age: Vec<(u64, PathBuf)> = self
+                .cameras
+                .iter()
+                .map(|(path, (_, at))| (*at, path.clone()))
+                .collect();
+            by_age.sort();
+            for (_, path) in by_age.iter().take(self.cameras.len() - POSITIONS) {
+                self.cameras.remove(path);
+            }
+        }
     }
 
     /// No more than `POSITIONS` positions, none older than `KEPT`: those of files not read for
@@ -332,6 +364,36 @@ mod tests {
         state.prune_positions(now);
         assert_eq!(state.positions.len(), 1);
         assert!(state.positions.contains_key(Path::new("/fresh.md")));
+    }
+
+    #[test]
+    fn cameras_are_kept_per_canvas_bounded_and_the_oldest_go() {
+        let mut state = State::default();
+        state.set_camera(Path::new("/a.canvas"), [1., 2., 0.5]);
+        assert_eq!(state.camera(Path::new("/a.canvas")), Some([1., 2., 0.5]));
+        assert_eq!(state.camera(Path::new("/b.canvas")), None);
+        let day = 24 * 60 * 60;
+        let now = 1000 * day;
+        let mut state = State::default();
+        for ix in 0..POSITIONS + 5 {
+            let path = PathBuf::from(format!("/{ix}.canvas"));
+            state.cameras.insert(path, ([0., 0., 1.], now - ix as u64));
+        }
+        state
+            .cameras
+            .insert("/stale.canvas".into(), ([0., 0., 1.], now - 100 * day));
+        state.prune_cameras(now);
+        assert_eq!(state.cameras.len(), POSITIONS);
+        assert!(state.cameras.contains_key(Path::new("/0.canvas")));
+        assert!(!state.cameras.contains_key(Path::new("/stale.canvas")));
+        assert!(
+            !state
+                .cameras
+                .contains_key(&PathBuf::from(format!("/{}.canvas", POSITIONS + 4)))
+        );
+        // A state written before cameras were kept reads without them.
+        let old: State = serde_json::from_str(r#"{"positions":{},"recent":[]}"#).unwrap();
+        assert!(old.cameras.is_empty());
     }
 
     #[test]

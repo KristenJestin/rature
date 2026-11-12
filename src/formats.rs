@@ -1,9 +1,10 @@
 //! What a file is shown as: Markdown, data (JSON, YAML) as a tree that folds, a table (CSV), an
-//! image, or code.
+//! image, a canvas, or code.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::canvas_view::CanvasFile;
 use crate::document::{self, Document};
 use crate::{fsio, icons};
 use gpui_design_system::Icon;
@@ -21,6 +22,8 @@ pub enum Content {
     Data(Vec<Node>),
     Table(Vec<Vec<String>>),
     Image(PathBuf),
+    /// A JSON Canvas, shown as a board.
+    Canvas(Arc<CanvasFile>),
     /// No file open.
     Empty,
     /// Why the file is not shown.
@@ -158,6 +161,10 @@ fn read(path: &Path, ext: &str, text: String, ink: &str) -> Content {
         "md" | "markdown" | "mdx" | "mdown" => {
             Content::Markdown(Arc::new(document::parse(&text, ink, path.parent())))
         }
+        "canvas" => match CanvasFile::read(&text, ink, path.parent()) {
+            Some(file) => Content::Canvas(Arc::new(file)),
+            None => code("json", text),
+        },
         "json" => match serde_json::from_str::<serde_json::Value>(&text) {
             Ok(value) => Content::Data(vec![from_json(None, value)]),
             Err(_) => code("json", text),
@@ -264,6 +271,13 @@ mod tests {
             Content::Data(_)
         ));
         assert!(matches!(kind("a.json", "{broken"), Content::Code { .. }));
+        assert!(matches!(
+            kind("a.canvas", "{\"nodes\":[],\"edges\":[]}"),
+            Content::Canvas(_)
+        ));
+        assert!(
+            matches!(kind("a.canvas", "{broken"), Content::Code { lang, .. } if lang == "json")
+        );
         assert!(matches!(kind("a.yaml", "a:\n  b: 1\n"), Content::Data(_)));
         assert!(matches!(kind("a.rs", "fn main() {}"), Content::Code { lang, .. } if lang == "rs"));
         let Content::Table(rows) = kind("a.csv", "herb,grams\nbasil,120\n") else {

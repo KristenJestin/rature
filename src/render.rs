@@ -211,13 +211,11 @@ impl Drawn {
 /// zoom through `Ctx`, text and lines included: the text size and line height set around the
 /// child come from `Ctx::size` and `Ctx::line_height`, never in rems, or they would be zoomed
 /// twice.
-#[expect(dead_code, reason = "the canvas's board draws its cards in it (#9)")]
 pub struct Scaled {
     rem: Pixels,
     child: AnyElement,
 }
 
-#[expect(dead_code, reason = "the canvas's board draws its cards in it (#9)")]
 pub fn scaled(zoom: f32, child: impl IntoElement) -> Scaled {
     Scaled {
         rem: px(REM * zoom),
