@@ -4,9 +4,10 @@
 //! then, under the canvas's lock, against the canvas as the disk holds it: one after the other,
 //! each made into an operation of [`crate::canvas_ops`] and applied to the canvas the ones
 //! before it leave. All of them go through, or none: the first that cannot is named in the
-//! error, and nothing is written. The result is written once, by [`canvas_board::update`] (or
-//! [`canvas_board::create`]): the window's own write, under the same lock, so that the window
-//! and the server never lose each other's changes.
+//! error, and nothing is written. The result is written once, by [`canvas_board::update_in`] (or
+//! [`canvas_board::create_in`]): the window's own write, under the same lock, so that the window
+//! and the server never lose each other's changes; through the canvas's folder opened and
+//! checked, so that a folder swapped for a link meanwhile leads nowhere else.
 //!
 //! An operation names a node or an edge by its `id`, or by the `ref` an earlier operation of
 //! the call gave the one it added. It touches only the fields it names, set on the canvas as it
@@ -215,9 +216,11 @@ pub(crate) fn canvas_edit(
         .collect::<Result<Vec<_>, _>>()?;
 
     let real = folders.canvas_file(path)?;
+    let (folder, name) = folders.open_folder(&real, path)?;
     // What the last try found: the file is read again when it changed meanwhile.
     let mut found = None;
-    let update = canvas_board::update(&real, &canvas_board::runtime_locks(), |now| {
+    let locks = canvas_board::runtime_locks();
+    let update = canvas_board::update_in(&folder, name, &locks, |now| {
         let (result, text) = match edit_text(now, path, if_revision, &steps) {
             Ok((applied, text)) => (Ok(applied), text),
             Err(error) => (Err(error), None),
@@ -322,10 +325,11 @@ pub(crate) fn canvas_create(
     }
 
     let real = folders.new_canvas_file(path)?;
+    let (folder, name) = folders.open_folder(&real, path)?;
     let mut canvas = Canvas::default();
     let applied = apply(&mut canvas, &steps)?;
     let text = written(&canvas, path)?;
-    match canvas_board::create(&real, &canvas_board::runtime_locks(), &text) {
+    match canvas_board::create_in(&folder, name, &canvas_board::runtime_locks(), &text) {
         Ok(Update::Busy) => Err(busy(path)),
         Ok(_) => Ok(applied.output(&text)),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(mcp::exists(path)),

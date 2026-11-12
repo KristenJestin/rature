@@ -18,10 +18,11 @@
 //! The server reads and writes only inside its allowed folders: the folder it starts in and each
 //! `--allow-dir`, canonical, compared component by component; a path is canonicalised (its
 //! links followed) before it is compared, and the file opened is checked again. It writes only
-//! `.canvas` files, by the tools of `mcp_edit`.
+//! `.canvas` files, by the tools of `mcp_edit`, through their folder opened and checked again,
+//! so that a folder swapped for a link meanwhile leads nowhere else.
 
 use std::collections::HashSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, Read, Write};
@@ -31,6 +32,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value, json};
 
 use crate::canvas::{Canvas, Problem, revision};
+use crate::fsio;
 use crate::mcp_edit;
 
 pub const USAGE: &str = "usage: rature mcp [--allow-dir DIR]...
@@ -280,6 +282,33 @@ impl Folders {
             return Err(exists(asked));
         }
         Ok(real)
+    }
+
+    /// The folder of `real` (a canonical path inside the folders, which `asked` names) opened,
+    /// and `real`'s name in it: what a write goes through, so that a folder on the way swapped
+    /// for a link once it is opened leads nowhere else. What was opened is checked again.
+    pub(crate) fn open_folder<'a>(
+        &self,
+        real: &'a Path,
+        asked: &str,
+    ) -> Result<(File, &'a OsStr), ToolError> {
+        let (Some(folder), Some(name)) = (real.parent(), real.file_name()) else {
+            return Err(ToolError::invalid(format!(
+                "`path` must name a .canvas file, and {asked} does not."
+            )));
+        };
+        let cannot = |error: io::Error| ToolError::io_doing(asked, "written", &error);
+        let opened = File::open(folder).map_err(cannot)?;
+        // What was opened, rather than what the path led to a moment before: a folder on the
+        // way may have been swapped for a link since.
+        self.check(&fsio::folder_path(&opened).map_err(cannot)?, asked)?;
+        if !opened.metadata().map_err(cannot)?.is_dir() {
+            return Err(ToolError::invalid(format!(
+                "`path` must name a .canvas file in a folder, and {} is not a folder.",
+                folder.display()
+            )));
+        }
+        Ok((opened, name))
     }
 
     /// The text of the canvas file at `asked`, read only when it is a regular `.canvas` file
@@ -991,6 +1020,54 @@ mod tests {
         assert!(!folders.holds(Path::new("/a/bc/x.canvas")));
         assert!(!folders.holds(Path::new("/a")));
         assert!(!folders.holds(Path::new("/cd")));
+    }
+
+    /// A folder checked, then swapped for a link to one outside before the write: refused when
+    /// the swap comes before the folder is opened, and nothing written outside when it comes
+    /// after.
+    #[test]
+    fn a_folder_swapped_for_a_link_after_the_check_writes_nothing_outside() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("rature-mcp-swap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (work, elsewhere) = (root.join("work"), root.join("elsewhere"));
+        fs::create_dir_all(work.join("d")).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        let canvas = r#"{"nodes":[],"edges":[]}"#;
+        fs::write(work.join("d/a.canvas"), canvas).unwrap();
+        fs::write(elsewhere.join("a.canvas"), canvas).unwrap();
+        let folders = Folders::new(&work, &[]).unwrap();
+        let swap = || {
+            fs::rename(work.join("d"), work.join("d2")).unwrap();
+            symlink(&elsewhere, work.join("d")).unwrap();
+        };
+
+        let real = folders.canvas_file("d/a.canvas").unwrap();
+        swap();
+        let error = folders.open_folder(&real, "d/a.canvas").unwrap_err();
+        assert_eq!(error.code, "outside", "{error}");
+        fs::remove_file(work.join("d")).unwrap();
+        fs::rename(work.join("d2"), work.join("d")).unwrap();
+
+        let real = folders.canvas_file("d/a.canvas").unwrap();
+        let (opened, name) = folders.open_folder(&real, "d/a.canvas").unwrap();
+        swap();
+        let done = crate::canvas_board::update_in(&opened, name, &root.join("locks"), |now| {
+            Some(now.replace("[]}", "[],\"mine\":1}"))
+        })
+        .unwrap();
+        assert!(matches!(done, fsio::Update::Written { .. }), "{done:?}");
+        assert!(
+            fs::read_to_string(work.join("d2/a.canvas"))
+                .unwrap()
+                .contains("mine")
+        );
+        assert_eq!(
+            fs::read_to_string(elsewhere.join("a.canvas")).unwrap(),
+            canvas
+        );
+        assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 1);
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

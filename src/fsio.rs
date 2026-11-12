@@ -2,10 +2,12 @@
 //! old one), never over what another program wrote since the file was read, and through a link
 //! to the file it points to rather than in its place.
 
+use std::ffi::OsStr;
 use std::fs::{self, File, Metadata, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::io::AsRawFd;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -77,13 +79,45 @@ pub fn regular(path: &Path) -> io::Result<Metadata> {
 /// meanwhile, it is read again and `edit` asked again, so its change is kept; `edit` sees the
 /// latest text each time. A link is followed: the file it points to is written, the link stays.
 /// The file keeps its permissions. Text that is not UTF-8 is never written over.
-pub fn update(path: &Path, mut edit: impl FnMut(&str) -> Option<String>) -> io::Result<Update> {
+pub fn update(path: &Path, edit: impl FnMut(&str) -> Option<String>) -> io::Result<Update> {
     let target = fs::canonicalize(path)?;
+    replace(&target, None, edit)
+}
+
+/// [`update`] of the file `name` in the folder `folder` is open on, wherever that folder is now:
+/// it is read, written and renamed over through the folder opened, so that a folder on its way
+/// swapped for a link since it was opened (and checked) leads nowhere else. `name` is the file
+/// itself: a link there is refused, not followed.
+pub fn update_in(
+    folder: &File,
+    name: &OsStr,
+    edit: impl FnMut(&str) -> Option<String>,
+) -> io::Result<Update> {
+    replace(&in_folder(folder, name)?, Some(name), edit)
+}
+
+/// What [`update`] and [`update_in`] share. `exact`: the name of the file, when the one at
+/// `target` must be that file itself, not a link to one.
+fn replace(
+    target: &Path,
+    exact: Option<&OsStr>,
+    mut edit: impl FnMut(&str) -> Option<String>,
+) -> io::Result<Update> {
     for _ in 0..TRIES {
         // Checked before it is opened: opening a pipe waits for a writer.
-        regular(&target)?;
-        let mut file = File::open(&target)?;
+        let there = match exact {
+            None => {
+                regular(target)?;
+                None
+            }
+            Some(name) => Some(itself(target, name)?),
+        };
+        let mut file = File::open(target)?;
         let meta = file.metadata()?;
+        // Replaced between the look and the open: what was opened is not what was looked at.
+        if there.is_some_and(|there| (there.dev(), there.ino()) != (meta.dev(), meta.ino())) {
+            continue;
+        }
         let read = Stamp::of(&meta);
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
@@ -100,18 +134,67 @@ pub fn update(path: &Path, mut edit: impl FnMut(&str) -> Option<String>) -> io::
         let Some(after) = edit(&before) else {
             return Ok(Update::Left(before));
         };
-        let temp = Temp::write(&target, after.as_bytes(), Some(meta.permissions().mode()))?;
+        let temp = Temp::write(target, after.as_bytes(), Some(meta.permissions().mode()))?;
         // The last look before the rename: the file still holds what was read. Its content is
         // compared, not only its times: a clock tick can hold two writes of the same length.
         // What another program writes between this look and the rename is the one change that
         // can still be lost.
-        if !holds(&target, before.as_bytes()) {
+        if exact.is_some() && fs::symlink_metadata(target).is_ok_and(|m| m.is_symlink()) {
             continue;
         }
-        temp.rename_over(&target)?;
+        if !holds(target, before.as_bytes()) {
+            continue;
+        }
+        temp.rename_over(target)?;
         return Ok(Update::Written { before, after });
     }
     Ok(Update::Busy)
+}
+
+/// The metadata of the regular file at `target`, not a link to one; `name` names it in an error.
+fn itself(target: &Path, name: &OsStr) -> io::Result<Metadata> {
+    let meta = fs::symlink_metadata(target)?;
+    let what = if meta.is_symlink() {
+        Some("a link")
+    } else {
+        not_a_file(&meta)
+    };
+    match what {
+        None => Ok(meta),
+        Some(what) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is {what}", Path::new(name).display()),
+        )),
+    }
+}
+
+/// Where the folder `folder` is open on is now, by its path.
+pub fn folder_path(folder: &File) -> io::Result<PathBuf> {
+    fs::read_link(fd_path(folder))
+}
+
+fn fd_path(folder: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", folder.as_raw_fd()))
+}
+
+/// The path of `name` inside the folder `folder` is open on, through the open folder itself
+/// (`/proc/self/fd/N/name`): whatever names that folder now, it leads into it. `name` is one
+/// name, never a path.
+fn in_folder(folder: &File, name: &OsStr) -> io::Result<PathBuf> {
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(fd_path(folder).join(name)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a file's name", Path::new(name).display()),
+        )),
+    }
+}
+
+/// [`create`] of the file `name` in the folder `folder` is open on, wherever that folder is now
+/// (as [`update_in`] writes).
+pub fn create_in(folder: &File, name: &OsStr, bytes: &[u8]) -> io::Result<()> {
+    create(&in_folder(folder, name)?, bytes)
 }
 
 /// Writes a new file at `path`, whole, never over what is there: an `AlreadyExists` error when
@@ -451,6 +534,80 @@ mod tests {
         assert_eq!(fs::read_to_string(&file).unwrap(), "new");
         assert_eq!(fs::metadata(&file).unwrap().mode() & 0o777, 0o600);
         assert_eq!(folder.names(), ["state.json"]);
+    }
+
+    #[test]
+    fn a_write_in_an_open_folder_stays_in_it_when_the_folder_is_swapped_for_a_link() {
+        let folder = Folder::new("in");
+        let (mine, theirs) = (folder.0.join("d"), folder.0.join("e"));
+        fs::create_dir(&mine).unwrap();
+        fs::create_dir(&theirs).unwrap();
+        fs::write(mine.join("a.canvas"), "mine").unwrap();
+        fs::write(theirs.join("a.canvas"), "theirs").unwrap();
+        let opened = File::open(&mine).unwrap();
+        // Once it is opened (and checked), the folder is moved away and a link put in its place.
+        let moved = folder.0.join("d2");
+        fs::rename(&mine, &moved).unwrap();
+        std::os::unix::fs::symlink(&theirs, &mine).unwrap();
+        assert_eq!(
+            folder_path(&opened).unwrap(),
+            fs::canonicalize(&moved).unwrap()
+        );
+
+        let done = update_in(&opened, OsStr::new("a.canvas"), |now| {
+            Some(format!("{now}, edited"))
+        })
+        .unwrap();
+        assert_eq!(
+            done,
+            Update::Written {
+                before: "mine".into(),
+                after: "mine, edited".into()
+            }
+        );
+        create_in(&opened, OsStr::new("b.canvas"), b"new").unwrap();
+        assert_eq!(
+            fs::read_to_string(moved.join("a.canvas")).unwrap(),
+            "mine, edited"
+        );
+        assert_eq!(fs::read_to_string(moved.join("b.canvas")).unwrap(), "new");
+        // Nothing was written where the link leads, not even a temporary file.
+        assert_eq!(
+            fs::read_to_string(theirs.join("a.canvas")).unwrap(),
+            "theirs"
+        );
+        let names: Vec<_> = fs::read_dir(&theirs)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["a.canvas"]);
+        assert_eq!(fs::read_dir(&moved).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn a_write_in_an_open_folder_takes_the_file_itself_by_its_name() {
+        let folder = Folder::new("itself");
+        let theirs = folder.0.join("theirs.canvas");
+        fs::write(&theirs, "theirs").unwrap();
+        let mine = folder.0.join("d");
+        fs::create_dir(&mine).unwrap();
+        std::os::unix::fs::symlink(&theirs, mine.join("a.canvas")).unwrap();
+        let opened = File::open(&mine).unwrap();
+        // A link where the file should be is not followed.
+        let error =
+            update_in(&opened, OsStr::new("a.canvas"), |_| Some("mine".into())).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "a.canvas is a link");
+        assert_eq!(fs::read_to_string(&theirs).unwrap(), "theirs");
+        // A name is one name: never a way out of the folder.
+        for name in ["../theirs.canvas", "/tmp/x.canvas", "e/x.canvas", "..", ""] {
+            let error = update_in(&opened, OsStr::new(name), |_| Some("mine".into())).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{name}");
+            let error = create_in(&opened, OsStr::new(name), b"mine").unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{name}");
+        }
+        assert_eq!(fs::read_to_string(&theirs).unwrap(), "theirs");
+        assert_eq!(folder.names(), ["d", "theirs.canvas"]);
     }
 
     #[test]

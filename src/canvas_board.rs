@@ -12,7 +12,8 @@
 //! canvas at once. Against another program (Obsidian, an editor), `fsio::update`'s look just
 //! before its rename stays the only guard.
 
-use std::fs;
+use std::ffi::OsStr;
+use std::fs::{self, File};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -319,28 +320,33 @@ pub fn update(
     fsio::update(&path, edit)
 }
 
-/// Writes a new canvas at `path` ([`fsio::create`]: never over a file there, an
-/// `AlreadyExists` error then), under the lock its path has once made, so that it is not made
-/// while another Rature process writes a canvas there. `Busy` when another holds the lock past
-/// [`PATIENCE`]. Its folder must exist: none is made.
-pub fn create(path: &Path, locks: &Path, text: &str) -> io::Result<Update> {
-    let (Some(folder), Some(name)) = (path.parent(), path.file_name()) else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "a file is named by its folder and its name",
-        ));
-    };
-    let folder = if folder.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        folder
-    };
-    // The path the canvas will have, links resolved, as `update` names its lock.
-    let path = fs::canonicalize(folder)?.join(name);
+/// [`update`] of the canvas `name` in the folder `folder` is open on ([`fsio::update_in`]): a
+/// folder on its way swapped for a link since it was opened leads nowhere else. Its lock is
+/// named after the path the folder has now.
+pub fn update_in(
+    folder: &File,
+    name: &OsStr,
+    locks: &Path,
+    edit: impl FnMut(&str) -> Option<String>,
+) -> io::Result<Update> {
+    let path = fsio::folder_path(folder)?.join(name);
     let Some(_lock) = Lock::take(&lock_path(locks, &path), PATIENCE)? else {
         return Ok(Update::Busy);
     };
-    fsio::create(&path, text.as_bytes())?;
+    fsio::update_in(folder, name, edit)
+}
+
+/// Writes a new canvas `name` in the folder `folder` is open on ([`fsio::create_in`]: never over
+/// a file there, an `AlreadyExists` error then), under the lock its path has once made, so that
+/// it is not made while another Rature process writes a canvas there. `Busy` when another holds
+/// the lock past [`PATIENCE`]. No folder is made.
+pub fn create_in(folder: &File, name: &OsStr, locks: &Path, text: &str) -> io::Result<Update> {
+    // The path the canvas will have, links resolved, as `update` names its lock.
+    let path = fsio::folder_path(folder)?.join(name);
+    let Some(_lock) = Lock::take(&lock_path(locks, &path), PATIENCE)? else {
+        return Ok(Update::Busy);
+    };
+    fsio::create_in(folder, name, text.as_bytes())?;
     Ok(Update::Written {
         before: String::new(),
         after: text.into(),
@@ -805,10 +811,12 @@ mod tests {
     fn a_new_canvas_is_made_under_the_lock_and_never_over_a_file() {
         let folder = Folder::new("create");
         let new = folder.0.join("notes/new.canvas");
+        let notes = File::open(folder.0.join("notes")).unwrap();
+        let name = OsStr::new("new.canvas");
         let lock = lock_path(&folder.locks(), &new);
         let held = Lock::take(&lock, Duration::ZERO).unwrap().unwrap();
         assert_eq!(
-            create(&new, &folder.locks(), "{}").unwrap(),
+            create_in(&notes, name, &folder.locks(), "{}").unwrap(),
             Update::Busy,
             "another process writes there"
         );
@@ -816,7 +824,7 @@ mod tests {
         drop(held);
         let text = Canvas::default().write().unwrap();
         assert!(matches!(
-            create(&new, &folder.locks(), &text).unwrap(),
+            create_in(&notes, name, &folder.locks(), &text).unwrap(),
             Update::Written { .. }
         ));
         assert_eq!(fs::read_to_string(&new).unwrap(), text);
@@ -825,9 +833,42 @@ mod tests {
             lock_path(&folder.locks(), &fs::canonicalize(&new).unwrap()),
             lock
         );
-        let error = create(&folder.canvas(), &folder.locks(), &text).unwrap_err();
+        let error = create_in(&notes, OsStr::new("a.canvas"), &folder.locks(), &text).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(folder.text(), START);
+    }
+
+    #[test]
+    fn a_folder_swapped_for_a_link_once_opened_leads_nowhere_else() {
+        let folder = Folder::new("swap");
+        let notes = File::open(folder.0.join("notes")).unwrap();
+        // Another program moves the folder away, and puts a link to another one in its place.
+        let other = folder.0.join("other");
+        fs::create_dir(&other).unwrap();
+        fs::write(other.join("a.canvas"), START).unwrap();
+        fs::rename(folder.0.join("notes"), folder.0.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&other, folder.0.join("notes")).unwrap();
+
+        let mut seen = None;
+        let done = update_in(&notes, OsStr::new("a.canvas"), &folder.locks(), |now| {
+            seen = Some(now.to_owned());
+            Some(now.replace("\"A\"", "\"mine\""))
+        })
+        .unwrap();
+        assert!(matches!(done, Update::Written { .. }));
+        assert_eq!(seen.as_deref(), Some(START));
+        let moved = fs::read_to_string(folder.0.join("moved/a.canvas")).unwrap();
+        assert!(moved.contains("\"mine\""), "{moved}");
+        assert_eq!(fs::read_to_string(other.join("a.canvas")).unwrap(), START);
+        assert_eq!(fs::read_dir(&other).unwrap().count(), 1);
+        // Its lock is named after where the folder is now.
+        let moved = fs::canonicalize(folder.0.join("moved/a.canvas")).unwrap();
+        assert!(lock_path(&folder.locks(), &moved).exists());
+
+        let text = Canvas::default().write().unwrap();
+        create_in(&notes, OsStr::new("new.canvas"), &folder.locks(), &text).unwrap();
+        assert!(folder.0.join("moved/new.canvas").exists());
+        assert!(!other.join("new.canvas").exists());
     }
 
     /// Set in the processes the test below starts: the canvas they write, and their name.
