@@ -1,7 +1,7 @@
 # Releases
 
 Every branch that matters publishes its own build, with a version computed from its commits,
-never typed. CI makes the tags and the releases itself: no tag is pushed by hand. The model is
+never typed. CI makes the tags and the releases itself: no tag is pushed by hand. It follows
 Flottille's (KristenJestin/flottille, `docs/releases.md`).
 
 | Branch | Channel | Version (example) | Published as |
@@ -119,7 +119,7 @@ curl -fsSL https://raw.githubusercontent.com/KristenJestin/rature/dev/install.sh
 the line each release's notes give, of its own commit. From a clone, `./install.sh` does the
 same. No Rust and no root are needed: `curl`, `tar`, `sha256sum`, GNU `sort` (it compares
 versions) and `uname`, on Linux x86_64, all checked first. Its body is one function called on its
-last line, so a download cut short runs nothing. The model is Flottille's `install.sh`.
+last line, so a download cut short runs nothing. It follows Flottille's `install.sh`.
 
 - **Which release**, read from GitHub's API (`/releases/latest`, `/releases/tags/v<version>`,
   `/releases?per_page=100`) with `curl`, `sed`, `awk`, `tr` and `sort`, no `jq`:

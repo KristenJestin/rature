@@ -56,7 +56,7 @@ const SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
 const TTL_MS: u64 = 3_600_000;
 
 /// Past this many bytes of JSON, a `canvas_read` that did not ask for `text` gets a summary,
-/// marked `truncated`: a client keeps a tool's answer to some 25 000 tokens (Claude Code).
+/// marked `truncated`: some clients cut a tool's answer past about 25 000 tokens.
 const SUMMARY_PAST: usize = 50_000;
 
 /// The longest line read on stdin, its end included: past it, the line is skipped without being
@@ -71,7 +71,7 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const UNSUPPORTED_VERSION: i64 = -32022;
 
-/// What `initialize` and `server/discover` tell the model, the order of the calls first.
+/// What `initialize` and `server/discover` tell the client, the order of the calls first.
 const INSTRUCTIONS: &str = "Rature shows JSON Canvas files (.canvas) to the user: boards of cards (nodes of type text, file, link or group) joined by edges. The file is the only truth, and the user may be changing it in Rature meanwhile.
 - Read a canvas with canvas_read before working on it. Each node and edge has an `id`: name them by it, never by their place in the list.
 - Change it with canvas_edit: operations by id, applied in order, all or none. Each touches only the fields it names, replayed on the file as it is when it is written, so what the user changed elsewhere stays. Give `if_revision` (canvas_read's `revision`) to be refused if the file changed since.
@@ -852,7 +852,7 @@ pub(crate) fn path_schema(what: &str) -> Value {
 }
 
 /// `tools/call`: an unknown tool or a malformed request is a JSON-RPC error; a tool's failure
-/// is a result with `isError`, which the model reads.
+/// is a result with `isError`, which the client reads.
 fn tools_call(folders: &Folders, params: &Map<String, Value>) -> Result<Value, RpcError> {
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return Err(RpcError::new(
