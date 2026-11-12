@@ -3,12 +3,15 @@
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::ops::Range;
+use std::panic;
 use std::path::Path;
 use std::sync::Arc;
 
 /// The narrowest a CSV column gets.
 const CELL: f32 = 90.;
-/// GPUI's rem, which the reader leaves as it is: it does not follow the zoom.
+/// The narrowest a Markdown table's cell gets, at zoom 1.
+pub const TABLE_CELL: f32 = 90.;
+/// GPUI's rem: the reader leaves it as it is, a `Scaled` makes it follow the zoom.
 const REM: f32 = 16.;
 /// The page's line, in rems at zoom 1.
 pub const LINE: f32 = 1.6;
@@ -18,43 +21,53 @@ use gpui_kit::*;
 
 use crate::cache::{Cache, Slot};
 use crate::config::Config;
+use crate::diagram;
 use crate::diff::{Change, Word};
-use crate::document::{Alert, Block, Inline, Item, Marks, Picture};
+use crate::document::{self, Alert, Block, Inline, Item, Marks, Picture};
 use crate::formats::{Kind, Node, Value};
-use crate::highlight::Lines;
-use crate::reader::Reader;
+use crate::highlight::{self, Lines};
 use gpui_design_system::{Icon, Palette, icon};
 
-pub struct Ctx<'a, 'b> {
+/// The view a page is drawn in, the reader or a canvas's board: what a click on what is drawn
+/// asks of it.
+pub trait Host: Sized + 'static {
+    /// A link was clicked: the click on its block, which comes next, edits the block, or
+    /// follows the link with Ctrl held.
+    fn link_clicked(&mut self, link: String);
+    /// Follows a link, Ctrl-clicked.
+    fn follow(&mut self, link: &str, window: &mut Window, cx: &mut Context<Self>);
+    /// Puts `text` in the clipboard, and says so with `what`.
+    fn copy(&mut self, text: String, what: &str, cx: &mut Context<Self>);
+}
+
+pub struct Ctx<'a, 'b, H: Host> {
     pub theme: &'a Palette,
     pub config: &'a Config,
+    /// What the page is drawn at: text, lines and the sizes given in px follow it.
     pub zoom: f32,
-    pub drawings: &'a Cache<String, Picture>,
-    pub highlights: &'a Cache<(String, String), Option<Lines>>,
+    pub drawn: &'a Drawn,
     /// What the search looks for, lowercased.
     pub query: Option<&'a str>,
-    pub cx: &'a Context<'b, Reader>,
+    pub cx: &'a Context<'b, H>,
     /// The colour of links in this theme.
     pub link: Hsla,
     ids: Cell<u64>,
 }
 
-impl<'a, 'b> Ctx<'a, 'b> {
+impl<'a, 'b, H: Host> Ctx<'a, 'b, H> {
     pub fn new(
         theme: &'a Palette,
         config: &'a Config,
         zoom: f32,
-        drawings: &'a Cache<String, Picture>,
-        highlights: &'a Cache<(String, String), Option<Lines>>,
+        drawn: &'a Drawn,
         query: Option<&'a str>,
-        cx: &'a Context<'b, Reader>,
+        cx: &'a Context<'b, H>,
     ) -> Self {
         Self {
             theme,
             config,
             zoom,
-            drawings,
-            highlights,
+            drawn,
             query,
             cx,
             link: crate::kit::link(theme),
@@ -70,6 +83,208 @@ impl<'a, 'b> Ctx<'a, 'b> {
 
     pub fn size(&self, scale: f32) -> Pixels {
         px(self.config.font_size * self.zoom * scale)
+    }
+
+    /// `v` px at zoom 1, at the page's zoom: a length the rem does not carry, so that it
+    /// follows the zoom outside a `Scaled` as well as inside one.
+    pub fn px(&self, v: f32) -> Pixels {
+        px(v * self.zoom)
+    }
+
+    /// A line `rems_at_1` high at zoom 1, at the page's zoom.
+    pub fn line_height(&self, rems_at_1: f32) -> Pixels {
+        line_height(rems_at_1, self.zoom)
+    }
+}
+
+/// What is drawn off the main thread for the blocks a view shows, by what it is drawn from.
+#[derive(Default)]
+pub struct Drawn {
+    /// Mermaid diagrams, by their source.
+    pub diagrams: Cache<String, Picture>,
+    /// Code's colours, by its language and its text.
+    pub highlights: Cache<(String, String), Option<Lines>>,
+}
+
+/// What a view shows that is drawn off the main thread.
+#[derive(Default)]
+pub struct Wanted {
+    /// Diagrams' sources, in the order they are shown.
+    pub diagrams: Vec<String>,
+    /// Code, by its language and its text.
+    pub code: Vec<(String, String)>,
+}
+
+impl Wanted {
+    /// What these blocks show that is drawn off the main thread.
+    pub fn of(blocks: &[Block]) -> Self {
+        let mut wanted = Self::default();
+        document::diagrams(blocks, &mut wanted.diagrams);
+        document::code_blocks(blocks, &mut wanted.code);
+        wanted
+    }
+}
+
+impl Drawn {
+    pub fn clear(&mut self) {
+        self.diagrams.clear();
+        self.highlights.clear();
+    }
+
+    /// Here is what a view shows now: what is not drawn yet is started off the main thread,
+    /// the view told as each is done, and what it no longer shows is dropped. `before`, the
+    /// diagrams it showed until now: a new one shows the one that stood at its place meanwhile,
+    /// so the page does not jump. `of` finds this in the view.
+    pub fn fill<T: 'static>(
+        &mut self,
+        wanted: Wanted,
+        before: &[String],
+        of: fn(&mut T) -> &mut Drawn,
+        cx: &mut Context<T>,
+    ) {
+        let dark = is_dark(cx);
+        let colors = diagram::Colors {
+            font: cx.global::<Config>().font.clone(),
+            ..diagram::Colors::of(&gpui_design_system::theme::target_palette(cx))
+        };
+        let shown: Vec<Option<Picture>> = before
+            .iter()
+            .map(|s| self.diagrams.get(s).and_then(|slot| slot.shown().cloned()))
+            .collect();
+        let Wanted { diagrams, code } = wanted;
+        self.diagrams.retain(|source, _| diagrams.contains(source));
+        for (ix, source) in diagrams.into_iter().enumerate() {
+            if self.diagrams.contains_key(&source) {
+                continue;
+            }
+            let stand_in = shown.get(ix).cloned().flatten();
+            self.diagrams
+                .insert(source.clone(), Slot::Pending(stand_in));
+            let drawn = cx.background_executor().spawn({
+                let (source, colors) = (source.clone(), colors.clone());
+                async move { diagram::render(&source, &colors) }
+            });
+            cx.spawn(async move |this, cx| {
+                let slot = match drawn.await {
+                    Ok(picture) => Slot::Done(picture),
+                    Err(error) => Slot::Failed(error),
+                };
+                this.update(cx, |this, cx| {
+                    if let Some(place) = of(this).diagrams.get_mut(&source) {
+                        *place = slot;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+        // Code is shown plain meanwhile.
+        self.highlights.retain(|key, _| code.contains(key));
+        for key in code {
+            if self.highlights.contains_key(&key) {
+                continue;
+            }
+            self.highlights.insert(key.clone(), Slot::Pending(None));
+            let coloured = cx.background_executor().spawn({
+                let (lang, text) = key.clone();
+                async move { highlight::highlight(&lang, &text, dark) }
+            });
+            cx.spawn(async move |this, cx| {
+                let lines = coloured.await;
+                this.update(cx, |this, cx| {
+                    if let Some(place) = of(this).highlights.get_mut(&key) {
+                        *place = Slot::Done(lines);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+}
+
+/// Its child laid out and drawn with a rem `zoom` times GPUI's, so that every length in rems
+/// inside it (spacings, radii, the kit's own sizes) follows the zoom: GPUI has no transform
+/// for a subtree, a zoomed one is laid out again at its zoomed size. What is in px follows the
+/// zoom through `Ctx`, text and lines included: the text size and line height set around the
+/// child come from `Ctx::size` and `Ctx::line_height`, never in rems, or they would be zoomed
+/// twice.
+#[expect(dead_code, reason = "the canvas's board draws its cards in it (#9)")]
+pub struct Scaled {
+    rem: Pixels,
+    child: AnyElement,
+}
+
+#[expect(dead_code, reason = "the canvas's board draws its cards in it (#9)")]
+pub fn scaled(zoom: f32, child: impl IntoElement) -> Scaled {
+    Scaled {
+        rem: px(REM * zoom),
+        child: child.into_any_element(),
+    }
+}
+
+impl IntoElement for Scaled {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for Scaled {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        let child = &mut self.child;
+        let layout =
+            window.with_rem_size(Some(self.rem), |window| child.request_layout(window, cx));
+        (layout, ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let child = &mut self.child;
+        window.with_rem_size(Some(self.rem), |window| {
+            child.prepaint(window, cx);
+        });
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let child = &mut self.child;
+        window.with_rem_size(Some(self.rem), |window| child.paint(window, cx));
     }
 }
 
@@ -95,9 +310,11 @@ pub fn is_dark(cx: &App) -> bool {
     gpui_design_system::theme::target_palette(cx).bg.l < 0.5
 }
 
-/// A line `rems` high at zoom 1, as high as the zoom makes the text: the rem stays put.
-pub fn line_height(rems_at_1: f32, zoom: f32) -> Rems {
-    rems(rems_at_1 * zoom)
+/// A line `rems_at_1` rems high at zoom 1, as high as the zoom makes the text. In px, not in
+/// rems: inside a `Scaled`, whose rem already follows the zoom, a line in rems would be zoomed
+/// twice. Worked out as GPUI turns rems into px, so that a line is the same to the bit.
+pub fn line_height(rems_at_1: f32, zoom: f32) -> Pixels {
+    px(rems_at_1 * zoom * REM)
 }
 
 /// A heading's size, against the text's.
@@ -110,7 +327,7 @@ fn heading_scale(level: u8) -> f32 {
     }
 }
 
-pub fn block(ctx: &Ctx, block: &Block) -> AnyElement {
+pub fn block<H: Host>(ctx: &Ctx<H>, block: &Block) -> AnyElement {
     let t = ctx.theme;
     match block {
         Block::Heading(level, inlines) => {
@@ -120,14 +337,14 @@ pub fn block(ctx: &Ctx, block: &Block) -> AnyElement {
         Block::Code { lang, text } => {
             code(ctx, lang.as_deref().unwrap_or(""), text).into_any_element()
         }
-        Block::Picture(picture) => centered(picture_element(picture)),
-        Block::Diagram(source) => match ctx.drawings.get(source) {
+        Block::Picture(picture) => centered(picture_element(ctx, picture)),
+        Block::Diagram(source) => match ctx.drawn.diagrams.get(source) {
             Some(Slot::Failed(error)) => broken(ctx, source, error).into_any_element(),
             Some(slot) if slot.shown().is_some() => {
-                centered(picture_element(slot.shown().expect("checked")))
+                centered(picture_element(ctx, slot.shown().expect("checked")))
             }
             _ => div()
-                .h(px(120.))
+                .h(ctx.px(120.))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -191,6 +408,7 @@ pub fn block(ctx: &Ctx, block: &Block) -> AnyElement {
         Block::Table(rows) => grid(
             ctx.id("table"),
             ctx.theme,
+            ctx.px(TABLE_CELL),
             rows.iter()
                 .map(|row| {
                     row.iter()
@@ -212,7 +430,7 @@ pub fn block(ctx: &Ctx, block: &Block) -> AnyElement {
                 div()
                     .flex()
                     .gap_3()
-                    .child(div().w(px(110.)).flex_none().child(key.clone()))
+                    .child(div().w(ctx.px(110.)).flex_none().child(key.clone()))
                     .child(div().flex_1().text_color(t.text).child(value.clone()))
             }))
             .into_any_element(),
@@ -241,7 +459,7 @@ pub fn block(ctx: &Ctx, block: &Block) -> AnyElement {
     }
 }
 
-pub fn heading(ctx: &Ctx, level: u8, inner: Div) -> Div {
+pub fn heading<H: Host>(ctx: &Ctx<H>, level: u8, inner: Div) -> Div {
     inner
         .text_size(ctx.size(heading_scale(level)))
         .font_weight(FontWeight::BOLD)
@@ -256,7 +474,7 @@ fn centered(element: AnyElement) -> AnyElement {
         .into_any_element()
 }
 
-fn broken(ctx: &Ctx, source: &str, error: &str) -> Div {
+fn broken<H: Host>(ctx: &Ctx<H>, source: &str, error: &str) -> Div {
     div()
         .flex()
         .flex_col()
@@ -270,7 +488,7 @@ fn broken(ctx: &Ctx, source: &str, error: &str) -> Div {
         .child(code(ctx, "", source))
 }
 
-fn item(ctx: &Ctx, ordered: bool, number: usize, item: &Item) -> impl IntoElement {
+fn item<H: Host>(ctx: &Ctx<H>, ordered: bool, number: usize, item: &Item) -> impl IntoElement {
     let size = ctx.size(1.);
     bullet(
         size,
@@ -324,7 +542,8 @@ pub fn marker(
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(4.))
+            // 4 px for text 16 px high: it follows the zoom as the box does.
+            .rounded(size * 0.25)
             .border_1()
             .border_color(if done { t.ok } else { t.line2 })
             .when(done, |d| d.bg(t.ok))
@@ -348,7 +567,7 @@ pub fn marker(
 }
 
 /// Text wrapped to the column: laid out whole, or word by word when a formula sits in it.
-pub fn flow(ctx: &Ctx, inlines: &[Inline]) -> Div {
+pub fn flow<H: Host>(ctx: &Ctx<H>, inlines: &[Inline]) -> Div {
     if inlines
         .iter()
         .all(|inline| matches!(inline, Inline::Text(..)))
@@ -360,7 +579,7 @@ pub fn flow(ctx: &Ctx, inlines: &[Inline]) -> Div {
 
 /// Text with no formula in it, laid out whole as the block's editor lays it out: clicked to
 /// edit, it keeps its width to the pixel.
-fn text_flow(ctx: &Ctx, inlines: &[Inline]) -> AnyElement {
+fn text_flow<H: Host>(ctx: &Ctx<H>, inlines: &[Inline]) -> AnyElement {
     let t = ctx.theme;
     let mut text = String::new();
     let mut pieces = Vec::new();
@@ -435,24 +654,23 @@ fn text_flow(ctx: &Ctx, inlines: &[Inline]) -> AnyElement {
     if links.is_empty() {
         return styled.into_any_element();
     }
-    let reader = ctx.cx.entity().downgrade();
+    let host = ctx.cx.entity().downgrade();
     let (ranges, targets): (Vec<_>, Vec<_>) = links.into_iter().unzip();
     InteractiveText::new(ctx.id("text"), styled)
         .on_click(ranges, move |ix, _, cx| {
             // The block's own click edits it, or follows this with Ctrl held.
-            let link = targets[ix].clone();
-            reader
-                .update(cx, |this, _| this.clicked_link = Some(link.to_string()))
-                .ok();
+            let link = targets[ix].to_string();
+            host.update(cx, |this, _| this.link_clicked(link)).ok();
         })
         .into_any_element()
 }
 
 /// Text with formulas: laid out word by word, a formula kept on the line of what follows it.
-fn word_flow(ctx: &Ctx, inlines: &[Inline]) -> Div {
+fn word_flow<H: Host>(ctx: &Ctx<H>, inlines: &[Inline]) -> Div {
     let mut row = div().flex().flex_wrap().items_baseline();
     let size = f32::from(ctx.size(1.));
-    let line = f32::from(line_height(LINE, ctx.zoom).to_pixels(px(REM)));
+    // The page's line, as set around it: in or out of a `Scaled`, the same px.
+    let line = f32::from(ctx.line_height(LINE));
     let below = formula_drop(size, line);
     // A formula waits for what follows: punctuation right after it stays on its line.
     let mut formula: Option<Div> = None;
@@ -466,8 +684,8 @@ fn word_flow(ctx: &Ctx, inlines: &[Inline]) -> Div {
                     div().flex().items_baseline().child(
                         div()
                             .relative()
-                            .top(px(picture.depth - below))
-                            .child(picture_element(picture)),
+                            .top(ctx.px(picture.depth) - px(below))
+                            .child(picture_element(ctx, picture)),
                     ),
                 );
             }
@@ -504,7 +722,7 @@ fn formula_drop(size: f32, line: f32) -> f32 {
 }
 
 /// The words of a paragraph or a heading that changed, the old ones struck.
-pub fn changed_words(ctx: &Ctx, words: &[Word]) -> Div {
+pub fn changed_words<H: Host>(ctx: &Ctx<H>, words: &[Word]) -> Div {
     div()
         .flex()
         .flex_wrap()
@@ -512,7 +730,7 @@ pub fn changed_words(ctx: &Ctx, words: &[Word]) -> Div {
         .children(words.iter().map(|w| word(ctx, &w.text, &w.marks, w.change)))
 }
 
-fn word(ctx: &Ctx, text: &str, marks: &Marks, change: Change) -> AnyElement {
+fn word<H: Host>(ctx: &Ctx<H>, text: &str, marks: &Marks, change: Change) -> AnyElement {
     let t = ctx.theme;
     let hit = ctx
         .query
@@ -549,7 +767,7 @@ fn word(ctx: &Ctx, text: &str, marks: &Marks, change: Change) -> AnyElement {
                 .id(ctx.id("link"))
                 .on_click(
                     ctx.cx
-                        .listener(move |this, event: &ClickEvent, window, cx| {
+                        .listener(move |this: &mut H, event: &ClickEvent, window, cx| {
                             // A click edits, as anywhere else; ctrl-click follows.
                             if !event.modifiers().secondary() {
                                 return;
@@ -564,9 +782,10 @@ fn word(ctx: &Ctx, text: &str, marks: &Marks, change: Change) -> AnyElement {
     }
 }
 
-pub fn code(ctx: &Ctx, lang: &str, text: &str) -> Div {
+pub fn code<H: Host>(ctx: &Ctx<H>, lang: &str, text: &str) -> Div {
     let t = ctx.theme;
     let lines = ctx
+        .drawn
         .highlights
         .get(&(lang.to_string(), text.to_string()))
         .and_then(|slot| slot.shown())
@@ -585,7 +804,7 @@ pub fn code(ctx: &Ctx, lang: &str, text: &str) -> Div {
                 .p_4()
                 .font_family(ctx.config.code_font.clone())
                 .text_size(ctx.size(0.875))
-                .line_height(line_height(1.45, ctx.zoom))
+                .line_height(ctx.line_height(1.45))
                 .flex()
                 .flex_col()
                 .children(text.lines().enumerate().map(|(ix, line)| {
@@ -608,14 +827,18 @@ pub fn code(ctx: &Ctx, lang: &str, text: &str) -> Div {
                 .opacity(0.)
                 .group_hover(group, |s| s.opacity(1.))
                 .child("Copy")
-                .on_click(ctx.cx.listener(move |this, _: &ClickEvent, _, cx| {
+                .on_click(ctx.cx.listener(move |this: &mut H, _: &ClickEvent, _, cx| {
                     cx.stop_propagation();
                     this.copy(copied.clone(), "Code copied", cx)
                 })),
         )
 }
 
-fn code_line(ctx: &Ctx, line: &str, spans: Option<&[crate::highlight::Span]>) -> AnyElement {
+fn code_line<H: Host>(
+    ctx: &Ctx<H>,
+    line: &str,
+    spans: Option<&[crate::highlight::Span]>,
+) -> AnyElement {
     let hit = ctx
         .query
         .is_some_and(|q| !q.is_empty() && line.to_lowercase().contains(q));
@@ -647,8 +870,8 @@ fn code_line(ctx: &Ctx, line: &str, spans: Option<&[crate::highlight::Span]>) ->
         .into_any_element()
 }
 
-/// A table: its first row the header, the others under it.
-pub fn grid(id: ElementId, t: &Palette, rows: Vec<Vec<AnyElement>>) -> Stateful<Div> {
+/// A table: its first row the header, the others under it, no cell narrower than `cell`.
+pub fn grid(id: ElementId, t: &Palette, cell: Pixels, rows: Vec<Vec<AnyElement>>) -> Stateful<Div> {
     let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
     div().id(id).overflow_x_scroll().child(
         div()
@@ -668,7 +891,7 @@ pub fn grid(id: ElementId, t: &Palette, rows: Vec<Vec<AnyElement>>) -> Stateful<
                     .children(
                         cells
                             .into_iter()
-                            .map(|cell| div().flex_1().min_w(px(90.)).px_3().py_1().child(cell)),
+                            .map(|inner| div().flex_1().min_w(cell).px_3().py_1().child(inner)),
                     )
             })),
     )
@@ -677,7 +900,13 @@ pub fn grid(id: ElementId, t: &Palette, rows: Vec<Vec<AnyElement>>) -> Stateful<
 /// A row of a CSV file, `ix` of `count`, its first row the head: one line, its cells cut to
 /// their column, so that every row is as high and only those shown are built. `columns` the
 /// most cells a row has.
-pub fn table_row(ctx: &Ctx, row: &[String], ix: usize, count: usize, columns: usize) -> AnyElement {
+pub fn table_row<H: Host>(
+    ctx: &Ctx<H>,
+    row: &[String],
+    ix: usize,
+    count: usize,
+    columns: usize,
+) -> AnyElement {
     let t = ctx.theme;
     let cells = (0..columns).map(|column| {
         let cell = row.get(column).map_or("", String::as_str);
@@ -759,7 +988,7 @@ fn node_at<'a>(nodes: &'a [Node], path: &[usize]) -> Option<&'a Node> {
 /// A line of a JSON or YAML tree: a value, or a map or a list that folds by a click. One line
 /// each, in the code font, so that every line is as high.
 pub fn data_row(
-    ctx: &Ctx,
+    ctx: &Ctx<crate::reader::Reader>,
     nodes: &[Node],
     row: &DataRow,
     folded: &HashSet<Vec<usize>>,
@@ -844,16 +1073,17 @@ fn one_line(text: &str) -> String {
     }
 }
 
-pub fn picture_element(picture: &Picture) -> AnyElement {
+/// A formula or a diagram, drawn for zoom 1, at the page's zoom.
+pub fn picture_element<H: Host>(ctx: &Ctx<H>, picture: &Picture) -> AnyElement {
     img(picture.image.clone())
-        .w(px(picture.width))
-        .h(px(picture.height))
+        .w(ctx.px(picture.width))
+        .h(ctx.px(picture.height))
         .max_w_full()
         .into_any_element()
 }
 
 /// A block as it was, struck: what "what changed" shows of a removed block.
-pub fn ghost(ctx: &Ctx, block: &Block) -> AnyElement {
+pub fn ghost<H: Host>(ctx: &Ctx<H>, block: &Block) -> AnyElement {
     let t = ctx.theme;
     marked(
         ctx,
@@ -868,22 +1098,27 @@ pub fn ghost(ctx: &Ctx, block: &Block) -> AnyElement {
 
 /// A block that changed since the baseline: tinted, a bar at its left in the colour of what
 /// happened to it. The text stays where it would be unmarked.
-pub fn marked(ctx: &Ctx, ink: Hsla, tint: Hsla, content: impl IntoElement) -> AnyElement {
+pub fn marked<H: Host>(
+    ctx: &Ctx<H>,
+    ink: Hsla,
+    tint: Hsla,
+    content: impl IntoElement,
+) -> AnyElement {
     let t = ctx.theme;
     div()
         .relative()
-        .mx(px(-16.))
-        .px(px(16.))
-        .py(px(6.))
-        .rounded(px(8.))
+        .mx(ctx.px(-16.))
+        .px(ctx.px(16.))
+        .py(ctx.px(6.))
+        .rounded(ctx.px(8.))
         .bg(tint)
         .child(
             div()
                 .absolute()
                 .left_0()
-                .top(px(8.))
-                .bottom(px(8.))
-                .w(px(3.))
+                .top(ctx.px(8.))
+                .bottom(ctx.px(8.))
+                .w(ctx.px(3.))
                 .rounded_full()
                 .bg(ink),
         )
@@ -900,20 +1135,31 @@ pub fn image_file(path: &Path) -> AnyElement {
 mod tests {
     use super::{LINE, REM, data_lines, formula_drop, line_height, node_at, one_line};
     use crate::formats::{Kind, Node, Value};
-    use gpui_kit::{px, rems};
+    use gpui_kit::{DefiniteLength, px, rems};
     use std::collections::HashSet;
 
+    /// The line at `zoom`, where the rem is `rem`.
+    fn line_under(zoom: f32, rem: f32) -> f32 {
+        let line = DefiniteLength::from(line_height(LINE, zoom));
+        f32::from(line.to_pixels(px(16. * zoom).into(), px(rem)))
+    }
+
     fn line_px(zoom: f32) -> f32 {
-        f32::from(line_height(LINE, zoom).to_pixels(px(REM)))
+        line_under(zoom, REM)
     }
 
     #[test]
     fn the_line_grows_with_the_zoom_and_stays_put_at_zoom_1() {
         // At zoom 1, the line the page always had: 1.6 rem, 25.6 px.
-        assert_eq!(
-            line_height(LINE, 1.).to_pixels(px(REM)),
-            rems(1.6).to_pixels(px(REM))
-        );
+        assert_eq!(line_height(LINE, 1.), rems(1.6).to_pixels(px(REM)));
+        // At the reader's zooms, the same to the bit as the line in rems it was.
+        for zoom in [0.6, 1.1, 1.4641, 2.5] {
+            assert_eq!(
+                line_height(LINE, zoom),
+                rems(LINE * zoom).to_pixels(px(REM)),
+                "zoom {zoom}"
+            );
+        }
         assert_eq!(line_px(1.), 25.6);
         // At the reader's zooms, 0.6 to 2.5, the line stays 1.6 times the text, 16 px at zoom 1:
         // Noto Sans' glyphs, 1.362 em from top to bottom, fit in it.
@@ -923,6 +1169,14 @@ mod tests {
             assert!(line_px(zoom) > 1.362 * size, "zoom {zoom}");
         }
         assert!((line_px(2.5) - 64.).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_scaled_page_does_not_zoom_its_line_twice() {
+        // In a `Scaled`, the rem follows the zoom: the line stays as high as outside.
+        for zoom in [0.1, 0.5, 1., 2., 4.] {
+            assert_eq!(line_under(zoom, REM * zoom), line_px(zoom), "zoom {zoom}");
+        }
     }
 
     #[test]

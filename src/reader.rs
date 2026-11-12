@@ -14,25 +14,23 @@ use gpui_kit::base::input::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::cache::{Cache, Slot};
 use crate::config::{Config, Side};
 use crate::diff::{Changes, Mark};
-use crate::document::{self, Block, Document, Links, Picture};
+use crate::document::{self, Block, Document, Links};
 use crate::formats::{self, Content, Loaded};
 use crate::fsio::{self, Update};
 use crate::highlight::Highlighter;
-use crate::highlight::{self, Lines};
 use crate::icons;
 use crate::kit::focus_frame;
 use crate::list::{self, ListEdit};
 use crate::live::{Caret, Edge, LiveBlock, LiveEvent};
 use crate::load::{self, Against, Baseline, Done, Entrances, Generation, Old, fingerprint};
-use crate::render::{self, Ctx, DataRow};
+use crate::render::{self, Ctx, DataRow, Drawn, Host, Wanted};
 use crate::start::key_hint;
 use crate::state::{self, State};
 use crate::table::TableEdit;
 use crate::workspace::ToggleTree;
-use crate::{diagram, format, timing, watch};
+use crate::{format, timing, watch};
 use gpui_design_system::field::{field_style, follow_theme};
 use gpui_design_system::motion::{ENTER, MODAL};
 use gpui_design_system::toast::Toast;
@@ -250,10 +248,10 @@ pub struct Reader {
     /// The fingerprint of each top-level block, and which of them rise into place.
     prints: Vec<u64>,
     entrances: Entrances,
-    drawings: Cache<String, Picture>,
+    /// The diagrams and code's colours the file shows.
+    drawn: Drawn,
     /// The link under the last click, followed if Ctrl was held.
-    pub clicked_link: Option<String>,
-    highlights: Cache<(String, String), Option<Lines>>,
+    clicked_link: Option<String>,
     folded: HashSet<Vec<usize>>,
     /// The lines a JSON or YAML tree shows, its folds left out.
     data_lines: Rc<Vec<DataRow>>,
@@ -331,9 +329,8 @@ impl Reader {
             window: window.window_handle(),
             prints: Vec::new(),
             entrances: Entrances::new(now, ENTER),
-            drawings: Cache::new(),
+            drawn: Drawn::default(),
             clicked_link: None,
-            highlights: Cache::new(),
             folded: HashSet::new(),
             data_lines: Rc::default(),
             list: ListState::new(0, ListAlignment::Top, px(OVERDRAW)),
@@ -573,87 +570,27 @@ impl Reader {
         // Coloured again in the new theme's colours, what was typed written first.
         self.write_code(cx);
         self.code = None;
-        self.drawings.clear();
-        self.highlights.clear();
+        self.drawn.clear();
         // Only a file read is shown: read again, its formulas in the new ink.
         self.reload(cx);
     }
 
     fn set_content(&mut self, content: Content, prints: Vec<u64>, cx: &mut Context<Self>) {
-        let dark = render::is_dark(cx);
-        let colors = diagram::Colors {
-            font: cx.global::<Config>().font.clone(),
-            ..diagram::Colors::of(&gpui_design_system::theme::target_palette(cx))
+        // Diagrams and code's colours, drawn in the background.
+        let wanted = match &content {
+            Content::Markdown(doc) => Wanted::of(&doc.blocks),
+            Content::Code { lang, text } => Wanted {
+                code: vec![(lang.clone(), text.clone())],
+                ..Wanted::default()
+            },
+            _ => Wanted::default(),
         };
-        // Diagrams: each new one is drawn in the background, the one that stood at its place
-        // shown meanwhile so the page does not jump.
-        let (mut sources, mut before) = (Vec::new(), Vec::new());
-        if let Content::Markdown(doc) = &content {
-            document::diagrams(&doc.blocks, &mut sources);
-        }
+        let mut before = Vec::new();
         if let Content::Markdown(doc) = &self.content {
             document::diagrams(&doc.blocks, &mut before);
         }
-        let shown: Vec<Option<Picture>> = before
-            .iter()
-            .map(|s| self.drawings.get(s).and_then(|slot| slot.shown().cloned()))
-            .collect();
-        self.drawings.retain(|source, _| sources.contains(source));
-        for (ix, source) in sources.into_iter().enumerate() {
-            if self.drawings.contains_key(&source) {
-                continue;
-            }
-            let stand_in = shown.get(ix).cloned().flatten();
-            self.drawings
-                .insert(source.clone(), Slot::Pending(stand_in));
-            let drawn = cx.background_executor().spawn({
-                let (source, colors) = (source.clone(), colors.clone());
-                async move { diagram::render(&source, &colors) }
-            });
-            cx.spawn(async move |this, cx| {
-                let slot = match drawn.await {
-                    Ok(picture) => Slot::Done(picture),
-                    Err(error) => Slot::Failed(error),
-                };
-                this.update(cx, |this, cx| {
-                    if let Some(place) = this.drawings.get_mut(&source) {
-                        *place = slot;
-                        cx.notify();
-                    }
-                })
-                .ok();
-            })
-            .detach();
-        }
-        // Code: coloured in the background, shown plain meanwhile.
-        let mut code = Vec::new();
-        match &content {
-            Content::Markdown(doc) => document::code_blocks(&doc.blocks, &mut code),
-            Content::Code { lang, text } => code.push((lang.clone(), text.clone())),
-            _ => {}
-        }
-        self.highlights.retain(|key, _| code.contains(key));
-        for key in code {
-            if self.highlights.contains_key(&key) {
-                continue;
-            }
-            self.highlights.insert(key.clone(), Slot::Pending(None));
-            let coloured = cx.background_executor().spawn({
-                let (lang, text) = key.clone();
-                async move { highlight::highlight(&lang, &text, dark) }
-            });
-            cx.spawn(async move |this, cx| {
-                let lines = coloured.await;
-                this.update(cx, |this, cx| {
-                    if let Some(place) = this.highlights.get_mut(&key) {
-                        *place = Slot::Done(lines);
-                        cx.notify();
-                    }
-                })
-                .ok();
-            })
-            .detach();
-        }
+        self.drawn
+            .fill(wanted, &before, |this: &mut Self| &mut this.drawn, cx);
         self.data_lines = match &content {
             Content::Data(nodes) => Rc::new(render::data_lines(nodes, &self.folded)),
             _ => Rc::default(),
@@ -877,7 +814,7 @@ impl Reader {
 
     /// Follows a link: a page on the web, an anchor of this file, or another file (and its
     /// anchor), which the back key returns from.
-    pub fn follow(&mut self, link: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn follow_link(&mut self, link: &str, window: &mut Window, cx: &mut Context<Self>) {
         match document::target(link) {
             document::Target::Web => return cx.open_url(link.trim()),
             document::Target::Foreign => {
@@ -949,11 +886,6 @@ impl Reader {
             }
             self.open(path, Jump::Block(block, within), window, cx);
         }
-    }
-
-    pub fn copy(&mut self, text: String, what: &str, cx: &mut Context<Self>) {
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.say(what.to_string(), cx);
     }
 
     /// The result of what was asked, in a toast that leaves by itself.
@@ -1767,15 +1699,7 @@ impl Reader {
         // Not the list's own count: it is being laid out, its state borrowed.
         let count = self.items_count();
         let element = {
-            let ctx = Ctx::new(
-                &t,
-                &config,
-                self.zoom,
-                &self.drawings,
-                &self.highlights,
-                query.as_deref(),
-                cx,
-            );
+            let ctx = Ctx::new(&t, &config, self.zoom, &self.drawn, query.as_deref(), cx);
             self.item_element(&ctx, ix, rises, cx)
         };
         // The page's own margins: above its first item, below its last.
@@ -1790,7 +1714,13 @@ impl Reader {
             .into_any_element()
     }
 
-    fn item_element(&self, ctx: &Ctx, ix: usize, rises: bool, cx: &Context<Self>) -> AnyElement {
+    fn item_element(
+        &self,
+        ctx: &Ctx<Self>,
+        ix: usize,
+        rises: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let t = palette(cx);
         let column = cx.global::<Config>().column;
         let wrap = |element: AnyElement| -> AnyElement {
@@ -1955,15 +1885,7 @@ impl Reader {
         };
         let (t, config) = (palette(cx), cx.global::<Config>().clone());
         let query = (!self.query.is_empty()).then(|| self.query.clone());
-        let ctx = Ctx::new(
-            &t,
-            &config,
-            self.zoom,
-            &self.drawings,
-            &self.highlights,
-            query.as_deref(),
-            cx,
-        );
+        let ctx = Ctx::new(&t, &config, self.zoom, &self.drawn, query.as_deref(), cx);
         let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
         range
             .filter_map(|ix| {
@@ -1983,15 +1905,7 @@ impl Reader {
         };
         let (t, config) = (palette(cx), cx.global::<Config>().clone());
         let query = (!self.query.is_empty()).then(|| self.query.clone());
-        let ctx = Ctx::new(
-            &t,
-            &config,
-            self.zoom,
-            &self.drawings,
-            &self.highlights,
-            query.as_deref(),
-            cx,
-        );
+        let ctx = Ctx::new(&t, &config, self.zoom, &self.drawn, query.as_deref(), cx);
         range
             .filter_map(|ix| {
                 let row = self.data_lines.get(ix)?;
@@ -2003,7 +1917,7 @@ impl Reader {
     #[allow(clippy::too_many_arguments)]
     fn block_element(
         &self,
-        ctx: &Ctx,
+        ctx: &Ctx<Self>,
         doc: &Document,
         ix: usize,
         block: &Block,
@@ -2049,6 +1963,21 @@ impl Reader {
                 this.edit_block(ix, Caret::At(event.position()), window, cx);
             }))
             .into_any_element()
+    }
+}
+
+impl Host for Reader {
+    fn link_clicked(&mut self, link: String) {
+        self.clicked_link = Some(link);
+    }
+
+    fn follow(&mut self, link: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.follow_link(link, window, cx)
+    }
+
+    fn copy(&mut self, text: String, what: &str, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.say(what.to_string(), cx);
     }
 }
 

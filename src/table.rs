@@ -436,6 +436,9 @@ impl Render for TableEdit {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.current(window, cx);
         let p = palette(cx);
+        // As narrow as the table read, at the zoom the page's text is at.
+        let size = window.text_style().font_size.to_pixels(window.rem_size());
+        let zoom = f32::from(size) / cx.global::<crate::config::Config>().font_size;
         let rows = self
             .cells
             .iter()
@@ -457,7 +460,12 @@ impl Render for TableEdit {
             .on_action(cx.listener(Self::delete_row))
             .on_action(cx.listener(Self::delete_column))
             .relative()
-            .child(render::grid("table-edit".into(), &p, rows))
+            .child(render::grid(
+                "table-edit".into(),
+                &p,
+                px(render::TABLE_CELL * zoom),
+                rows,
+            ))
             .when(!self.closing, |d| {
                 d.child(div().absolute().top(px(-46.)).right_0().child(enter(
                     "table-tools",
