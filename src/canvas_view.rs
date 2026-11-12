@@ -1893,6 +1893,25 @@ impl CanvasView {
         cx.notify();
     }
 
+    /// The file read again is no canvas now: true when a card typed in or what is not written
+    /// yet keeps the board, rather than letting it go and that with it. It waits for the file to
+    /// be a canvas again, said once, and writes then.
+    pub fn wait_for_canvas(&mut self, cx: &mut Context<Self>) -> bool {
+        let pending = (self.edits.board.as_ref()).is_some_and(|board| !board.pending().is_empty());
+        if !pending && !self.typing() {
+            return false;
+        }
+        if !std::mem::replace(&mut self.edits.stalled, true) {
+            toast(
+                Toast::failure(
+                    "The canvas file is not valid now: your changes wait for it to be mended",
+                ),
+                cx,
+            );
+        }
+        true
+    }
+
     /// A write done: what did not go as Rature did it is said, the file as written shown.
     fn saved(&mut self, written: io::Result<Written>, cx: &mut Context<Self>) {
         self.edits.writing = false;

@@ -501,6 +501,15 @@ impl Reader {
                 false,
             ),
         };
+        // A canvas being edited read as no canvas, another program halfway through its write
+        // perhaps: what was not written yet keeps the board, and the next event tries again.
+        if !self.loading
+            && !matches!(content, Content::Canvas(_))
+            && let Some(board) = &self.board
+            && board.update(cx, |board, cx| board.wait_for_canvas(cx))
+        {
+            return;
+        }
         self.keep_typed_code(&content, cx);
         self.editable = editable;
         let opened = std::mem::take(&mut self.loading);
