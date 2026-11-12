@@ -155,6 +155,7 @@ fn main() {
             .detach();
         timing::time("keys bound", || {
             reader::bind_keys(cx);
+            canvas_view::bind_keys(cx);
             live::bind_keys(cx);
             list::bind_keys(cx);
             table::bind_keys(cx);

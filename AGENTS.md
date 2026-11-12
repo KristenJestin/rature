@@ -54,7 +54,7 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 | `canvas.rs` | JSON Canvas 1.0 (Obsidian's `.canvas`), read and written without losing anything: unknown fields, key order and node order kept; a text's revision; where a new card goes, and its default size |
 | `canvas_ops.rs` | Operations on a canvas by id, replayed on the disk's canvas with a field-by-field three-way merge (the disk wins a conflict), and their inverses for undo |
 | `canvas_board.rs` | A canvas being edited: pending operations, undo and redo, each write the disk's text read again and the operations replayed on it, under a lock per canvas in the runtime folder; a new canvas made under the same lock |
-| `canvas_view.rs` | A canvas shown as a board, which the reader draws it on: its camera (pan, zoom around the pointer, kept per file), only the cards in sight built, at a detail that follows the zoom (the whole Markdown, a box and its title, rectangles) |
+| `canvas_view.rs` | A canvas shown as a board, which the reader draws it on: its camera (pan, zoom around the pointer, kept per file), only the cards in sight built, at a detail that follows the zoom (the whole Markdown, a box and its title, rectangles); cards selected, moved, resized, nudged and deleted on it, through `canvas_board`, written off the main thread |
 | `format.rs` | Formatting on the user's own save (`Ctrl-s`), never on a change made from outside |
 | `load.rs` | Reading a file off the main thread: reading, parsing, formulas, link checks, the comparison; only the latest request's result is kept |
 | `cache.rs` | Results worked out off the main thread (a diagram, a code block's colours), keyed by their source: pending, done or failed |

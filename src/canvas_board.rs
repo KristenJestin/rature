@@ -57,6 +57,25 @@ pub enum Saved {
     Busy,
 }
 
+/// A write of the operations pending when it was asked for ([`Board::writing`]): run off the
+/// window's thread, since it may wait for the lock, then given back to [`Board::written`].
+#[derive(Debug)]
+pub struct Writing {
+    path: PathBuf,
+    locks: PathBuf,
+    ops: Vec<Op>,
+}
+
+/// What a [`Writing`] did.
+#[derive(Debug)]
+pub struct Written {
+    /// How many of the operations pending, the first ones, are written.
+    count: usize,
+    /// The file's text once they were replayed on it, when they were.
+    text: Option<String>,
+    saved: Saved,
+}
+
 impl Board {
     /// Opens the canvas at `path`, its locks in the user's runtime folder.
     pub fn open(path: &Path) -> io::Result<Self> {
@@ -65,13 +84,19 @@ impl Board {
 
     /// Opens the canvas at `path`, its locks in `locks`.
     pub fn open_with_locks(path: &Path, locks: PathBuf) -> io::Result<Self> {
+        let text = fs::read_to_string(fs::canonicalize(path)?)?;
+        Self::with_canvas(path, locks, Canvas::read(&text))
+    }
+
+    /// The canvas at `path` as `canvas` has it, read from the file already (by the window, off
+    /// its thread); its locks in `locks`.
+    pub fn with_canvas(path: &Path, locks: PathBuf, canvas: Canvas) -> io::Result<Self> {
         let path = fs::canonicalize(path)?;
         fsio::regular(&path)?;
-        let text = fs::read_to_string(&path)?;
         Ok(Self {
             path,
             locks,
-            canvas: Canvas::read(&text),
+            canvas,
             pending: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -155,7 +180,12 @@ impl Board {
     /// Takes the file's new text, read after another program wrote it: what the window shows is
     /// it, with the operations not yet written replayed on it.
     pub fn refresh(&mut self, text: &str) {
-        self.canvas = Canvas::read(text);
+        self.refreshed(Canvas::read(text));
+    }
+
+    /// As [`Board::refresh`], the file's new text read already.
+    pub fn refreshed(&mut self, canvas: Canvas) {
+        self.canvas = canvas;
         for op in &self.pending {
             op.apply(&mut self.canvas, &mut Report::default());
         }
@@ -165,16 +195,50 @@ impl Board {
     /// the lock. Blocks while another process writes the canvas (at most [`PATIENCE`]), and for
     /// a write: not on the window's thread.
     pub fn save(&mut self) -> io::Result<Saved> {
+        let written = self.writing().run()?;
+        Ok(self.written(written))
+    }
+
+    /// The write of the operations pending now, to [`Writing::run`] off the window's thread.
+    /// Those made meanwhile wait for the next one: none joins those being written.
+    pub fn writing(&mut self) -> Writing {
         self.joinable = false;
-        if self.pending.is_empty() {
-            return Ok(Saved::Done {
+        Writing {
+            path: self.path.clone(),
+            locks: self.locks.clone(),
+            ops: self.pending.clone(),
+        }
+    }
+
+    /// A write done: the operations it wrote are no more pending, and what the window shows is
+    /// the file as written with those made since replayed on it.
+    pub fn written(&mut self, written: Written) -> Saved {
+        if let Some(text) = written.text {
+            self.pending.drain(..written.count.min(self.pending.len()));
+            self.refresh(&text);
+        }
+        written.saved
+    }
+}
+
+impl Writing {
+    /// Replays the operations on the file's text as it is now, under the lock, and writes it.
+    /// Blocks while another process writes the canvas (at most [`PATIENCE`]).
+    pub fn run(self) -> io::Result<Written> {
+        let nothing = |saved| Written {
+            count: 0,
+            text: None,
+            saved,
+        };
+        if self.ops.is_empty() {
+            return Ok(nothing(Saved::Done {
                 written: false,
                 report: Report::default(),
-            });
+            }));
         }
         // What the last replay found: `update` may ask more than once.
         let mut found = Err(Vec::new());
-        let pending = &self.pending;
+        let pending = &self.ops;
         let update = update(&self.path, &self.locks, |now| {
             let mut disk = Canvas::read(now);
             let problems = disk.problems();
@@ -198,18 +262,18 @@ impl Board {
             }
         })?;
         let (text, written) = match update {
-            Update::Busy => return Ok(Saved::Busy),
+            Update::Busy => return Ok(nothing(Saved::Busy)),
             Update::Written { after, .. } => (after, true),
             Update::Left(text) => (text, false),
         };
-        match found {
-            Ok(report) => {
-                self.pending.clear();
-                self.canvas = Canvas::read(&text);
-                Ok(Saved::Done { written, report })
-            }
-            Err(problems) => Ok(Saved::Invalid(problems)),
-        }
+        Ok(match found {
+            Ok(report) => Written {
+                count: self.ops.len(),
+                text: Some(text),
+                saved: Saved::Done { written, report },
+            },
+            Err(problems) => nothing(Saved::Invalid(problems)),
+        })
     }
 }
 
@@ -384,6 +448,29 @@ mod tests {
         assert_eq!(disk.node("b").unwrap().text(), Some("theirs"));
         assert_eq!(board.canvas(), &disk, "the window shows the disk's canvas");
         assert!(board.pending().is_empty());
+    }
+
+    /// A write runs off the window's thread: what is done meanwhile is neither written nor
+    /// lost, nor joined to what is being written.
+    #[test]
+    fn an_edit_made_while_writing_waits_for_the_next_write() {
+        let folder = Folder::new("writing");
+        let mut board = folder.board();
+        let op = Op::move_node(board.canvas(), "a", 10., 0.).unwrap();
+        board.edit(op);
+        let writing = board.writing();
+        let op = Op::move_node(board.canvas(), "a", 20., 0.).unwrap();
+        board.edit(op);
+        let written = writing.run().unwrap();
+        assert!(done(board.written(written)).is_clean());
+        assert_eq!(rect(folder.disk().node("a").unwrap()).0, 10.);
+        assert_eq!(rect(board.canvas().node("a").unwrap()).0, 20.);
+        assert_eq!(board.pending().len(), 1);
+        assert!(done(board.save().unwrap()).is_clean());
+        assert_eq!(rect(folder.disk().node("a").unwrap()).0, 20.);
+        // Two moves, two writes: undone one at a time.
+        assert!(board.undo());
+        assert_eq!(rect(board.canvas().node("a").unwrap()).0, 10.);
     }
 
     /// Row 2: the disk changed a field Rature did not: the disk's is kept, nothing said.

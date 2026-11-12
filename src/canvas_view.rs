@@ -2,8 +2,13 @@
 //! pans and zooms. Only the cards in sight are built, at a detail that follows the zoom: the whole
 //! Markdown close up, a coloured box and its title further out, rectangles from afar. The reader
 //! keeps the file, its watcher, its bar, back and forward; the board draws it.
+//!
+//! Cards are selected, moved, resized, nudged and deleted on it, each change an operation of
+//! [`crate::canvas_ops`] done on a [`Board`] and written by it, off the window's thread.
 
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,6 +19,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::canvas::{Canvas, Color, NodeKind, Problem};
+use crate::canvas_board::{self, Board, Saved, Written};
+use crate::canvas_ops::{Op, Report};
 use crate::config::Config;
 use crate::document::{self, Document};
 use crate::reader::Reader;
@@ -41,6 +48,86 @@ const SETTLE: Duration = Duration::from_millis(150);
 const WHEEL_STEP: f32 = 50.;
 /// The lines GPUI counts for a notch of the wheel, on Linux: a notch is a step of zoom.
 const NOTCH: f32 = 3.;
+/// A handle's side, on screen, at every zoom.
+const HANDLE: f32 = 8.;
+/// How far from a corner, on screen, a press takes its handle.
+const REACH: f32 = 6.;
+/// How far the pointer goes, on screen, before a press is a drag rather than a click.
+const SLOP: f32 = 3.;
+/// The smallest a card is resized to, in the canvas's pixels (unless it was smaller).
+const MIN_SIZE: f32 = 40.;
+/// A nudge, and one with Shift, in the canvas's pixels.
+const NUDGE: f32 = 1.;
+const NUDGE_FAR: f32 = 10.;
+/// What an arrow pans with nothing selected, on screen: a line of the reader.
+const PAN_LINE: f32 = 64.;
+/// How long nudges rest before they are written, as the reader's autosave.
+const NUDGE_REST: Duration = Duration::from_millis(800);
+/// How long before a write kept from the canvas by another process is tried again.
+const RETRY: Duration = Duration::from_secs(1);
+
+actions!(
+    canvas,
+    [
+        NudgeLeft,
+        NudgeRight,
+        NudgeUp,
+        NudgeDown,
+        NudgeLeftFar,
+        NudgeRightFar,
+        NudgeUpFar,
+        NudgeDownFar,
+        DeleteSelection,
+        Undo,
+        Redo,
+    ]
+);
+
+/// The board's keys, in the reader's `Canvas` context; [`on_keys`] takes them.
+pub fn bind_keys(cx: &mut App) {
+    let at = Some("Canvas");
+    cx.bind_keys([
+        KeyBinding::new("left", NudgeLeft, at),
+        KeyBinding::new("right", NudgeRight, at),
+        KeyBinding::new("up", NudgeUp, at),
+        KeyBinding::new("down", NudgeDown, at),
+        KeyBinding::new("shift-left", NudgeLeftFar, at),
+        KeyBinding::new("shift-right", NudgeRightFar, at),
+        KeyBinding::new("shift-up", NudgeUpFar, at),
+        KeyBinding::new("shift-down", NudgeDownFar, at),
+        KeyBinding::new("delete", DeleteSelection, at),
+        KeyBinding::new("ctrl-z", Undo, at),
+        KeyBinding::new("ctrl-shift-z", Redo, at),
+    ]);
+}
+
+/// The board's keys on `element`, the one that holds the focus (the reader's page): the board
+/// itself is not on the way of the keys.
+pub fn on_keys<E: InteractiveElement>(element: E, board: &Entity<CanvasView>) -> E {
+    fn nudge<A: Action>(
+        board: &Entity<CanvasView>,
+        dx: f32,
+        dy: f32,
+    ) -> impl Fn(&A, &mut Window, &mut App) + 'static {
+        let board = board.clone();
+        move |_, _, cx| board.update(cx, |board, cx| board.nudge(dx, dy, cx))
+    }
+    let (deleted, undone, redone) = (board.clone(), board.clone(), board.clone());
+    element
+        .on_action(nudge::<NudgeLeft>(board, -NUDGE, 0.))
+        .on_action(nudge::<NudgeRight>(board, NUDGE, 0.))
+        .on_action(nudge::<NudgeUp>(board, 0., -NUDGE))
+        .on_action(nudge::<NudgeDown>(board, 0., NUDGE))
+        .on_action(nudge::<NudgeLeftFar>(board, -NUDGE_FAR, 0.))
+        .on_action(nudge::<NudgeRightFar>(board, NUDGE_FAR, 0.))
+        .on_action(nudge::<NudgeUpFar>(board, 0., -NUDGE_FAR))
+        .on_action(nudge::<NudgeDownFar>(board, 0., NUDGE_FAR))
+        .on_action(move |_: &DeleteSelection, _, cx| {
+            deleted.update(cx, |board, cx| board.delete(cx))
+        })
+        .on_action(move |_: &Undo, _, cx| undone.update(cx, |board, cx| board.undo(false, cx)))
+        .on_action(move |_: &Redo, _, cx| redone.update(cx, |board, cx| board.undo(true, cx)))
+}
 
 /// A place and a size, in the canvas's pixels or on screen.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -215,6 +302,7 @@ pub enum Tint {
 }
 
 /// What a card is, as the board draws it.
+#[derive(Clone)]
 pub enum CardKind {
     Text(Arc<Document>),
     Group,
@@ -226,9 +314,12 @@ pub enum CardKind {
     Other,
 }
 
+#[derive(Clone)]
 pub struct Card {
     /// The node's index in the canvas: its element's id.
     pub index: usize,
+    /// The node's id, empty when it has none: what it is selected and changed by.
+    pub id: String,
     pub area: Area,
     pub tint: Option<Tint>,
     pub kind: CardKind,
@@ -238,7 +329,10 @@ pub struct Card {
 }
 
 /// A canvas file, read off the main thread and ready to draw.
+#[derive(Clone)]
 pub struct CanvasFile {
+    /// The canvas as the file holds it: what its edits start from.
+    pub canvas: Arc<Canvas>,
     /// The cards with a place and a size, groups first, each kind in the canvas's order: a group
     /// lies below what it holds.
     pub cards: Vec<Card>,
@@ -293,6 +387,7 @@ impl CanvasFile {
                 };
                 Some(Card {
                     index,
+                    id: node.id().unwrap_or_default().to_string(),
                     area,
                     tint,
                     kind,
@@ -303,7 +398,11 @@ impl CanvasFile {
         // Stable: each kind keeps the canvas's order.
         cards.sort_by_key(|card| !matches!(card.kind, CardKind::Group));
         let all = cards.iter().map(|card| card.area).reduce(Area::union);
-        Some(Self { cards, all })
+        Some(Self {
+            canvas: Arc::new(canvas),
+            cards,
+            all,
+        })
     }
 
     /// What the text cards show that is drawn off the main thread.
@@ -316,16 +415,6 @@ impl CanvasFile {
             }
         }
         wanted
-    }
-
-    /// The topmost card under the canvas's point (`x`, `y`) that is not a group: what a press
-    /// there is on, rather than on empty space.
-    pub fn card_at(&self, x: f32, y: f32) -> Option<&Card> {
-        self.cards
-            .iter()
-            .rev()
-            .filter(|card| !matches!(card.kind, CardKind::Group))
-            .find(|card| card.area.contains(x, y))
     }
 }
 
@@ -386,12 +475,68 @@ pub struct CanvasView {
     /// A zoom gesture goes on: the light version is drawn until it settles.
     gesturing: bool,
     settle: Option<Task<()>>,
+    /// What is being edited, and its writes.
+    edits: Edits,
+}
+
+/// The selection, what the pointer holds, and the canvas as it is edited.
+struct Edits {
+    /// The canvas's file.
+    path: PathBuf,
+    /// The cards selected, by id, in the order they were.
+    selected: Vec<String>,
+    /// Cards, or a handle, held by the pointer until it is let go.
+    held: Option<Held>,
+    /// What a press does if it is let go before the pointer goes past [`SLOP`].
+    click: Option<Click>,
+    /// The canvas being edited, made at the first edit.
+    board: Option<Board>,
+    /// A write runs off the window's thread; `again` asks for another once it is done.
+    writing: bool,
+    again: bool,
+    /// The file was not a valid canvas at the last write: tried again once it is read again.
+    stalled: bool,
+    /// A write to come: nudges resting, a lock waited for.
+    later: Option<Task<()>>,
+}
+
+/// What the pointer holds.
+enum Held {
+    /// Cards, from where they were when pressed, moved by `by` in the canvas's pixels.
+    Moving {
+        from: Point<Pixels>,
+        start: Vec<(String, Area)>,
+        by: (f32, f32),
+        going: bool,
+    },
+    /// A card by a corner, its area `now`.
+    Resizing {
+        from: Point<Pixels>,
+        id: String,
+        start: Area,
+        corner: Corner,
+        now: Area,
+        going: bool,
+    },
+}
+
+struct Click {
+    at: Point<Pixels>,
+    pick: Pick,
+}
+
+/// What a click does to the selection.
+enum Pick {
+    Only(String),
+    Toggle(String),
+    Clear,
 }
 
 impl CanvasView {
     pub fn new(
         file: Arc<CanvasFile>,
         camera: Option<Camera>,
+        path: PathBuf,
         reader: WeakEntity<Reader>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -406,16 +551,29 @@ impl CanvasView {
             panning: None,
             gesturing: false,
             settle: None,
+            edits: Edits {
+                path,
+                selected: Vec::new(),
+                held: None,
+                click: None,
+                board: None,
+                writing: false,
+                again: false,
+                stalled: false,
+                later: None,
+            },
         };
         view.set_file(file, cx);
         view
     }
 
-    /// The canvas read again: the camera stays where it is.
+    /// The canvas read again: the camera stays where it is. What is not written yet is replayed
+    /// on it, and the cards held stay where the pointer has them.
     pub fn set_file(&mut self, file: Arc<CanvasFile>, cx: &mut Context<Self>) {
         self.drawn
             .fill(file.wanted(), &[], |this: &mut Self| &mut this.drawn, cx);
         self.file = file;
+        self.read_again(cx);
         cx.notify();
     }
 
@@ -492,18 +650,14 @@ impl CanvasView {
     }
 
     fn press(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let (Some(camera), Some(bounds)) = (self.camera, self.bounds) else {
-            return;
-        };
-        let (x, y) = local(event.position, bounds);
-        let (x, y) = camera.to_canvas(x, y);
-        if self.space || self.file.card_at(x, y).is_none() {
+        if self.space || self.press_selection(event, cx) {
             self.panning = Some(event.position);
             cx.notify();
         }
     }
 
     fn drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.drag_held(position, cx);
         let Some(from) = self.panning else {
             return;
         };
@@ -513,6 +667,7 @@ impl CanvasView {
     }
 
     fn release(&mut self, cx: &mut Context<Self>) {
+        self.release_held(cx);
         if self.panning.take().is_some() {
             cx.notify();
         }
@@ -682,6 +837,801 @@ impl CanvasView {
     }
 }
 
+/// The selection, and what is done to the cards: pressed, dragged, let go, keys, writes.
+impl CanvasView {
+    /// How high a group's label stands above it on screen, at the detail drawn.
+    fn label_line(&self, camera: Camera, cx: &App) -> f32 {
+        let size = match Detail::at(camera.zoom, self.gesturing) {
+            Detail::Full => {
+                let font = cx.global::<Config>().font_size;
+                TITLE.max(font * camera.text_zoom(font))
+            }
+            Detail::Light => TITLE,
+            Detail::Rects => return 0.,
+        };
+        size * 1.4
+    }
+
+    /// A press, Space not held: a handle or cards are held, or the selection waits for the
+    /// release to know whether it was a click. True when the press pans: on empty space, or on
+    /// the background of a group not selected.
+    fn press_selection(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) -> bool {
+        let (Some(camera), Some(bounds)) = (self.camera, self.bounds) else {
+            return false;
+        };
+        let (x, y) = local(event.position, bounds);
+        let label = self.label_line(camera, cx);
+        let (at, shift) = (event.position, event.modifiers.shift);
+        let edits = &mut self.edits;
+        edits.click = None;
+        let hit = hit(&self.file.cards, camera, label, edits.alone(), x, y);
+        let pick = |id| match shift {
+            true => Pick::Toggle(id),
+            false => Pick::Only(id),
+        };
+        match hit {
+            Hit::Handle(id, corner) => {
+                if let Some(card) = self.file.cards.iter().find(|card| card.id == id) {
+                    edits.held = Some(Held::Resizing {
+                        from: at,
+                        id,
+                        start: card.area,
+                        corner,
+                        now: card.area,
+                        going: false,
+                    });
+                }
+                false
+            }
+            Hit::Card(id) => {
+                if shift {
+                    if let Some(index) = edits.selected.iter().position(|s| *s == id) {
+                        edits.selected.remove(index);
+                        cx.notify();
+                        return false;
+                    }
+                    edits.selected.push(id);
+                } else if edits.selected.contains(&id) {
+                    // A drag moves the whole selection; a click selects this card alone.
+                    edits.click = Some(Click {
+                        at,
+                        pick: Pick::Only(id),
+                    });
+                } else {
+                    edits.selected = vec![id];
+                }
+                self.hold_selection(at);
+                cx.notify();
+                false
+            }
+            Hit::Group(id) if !shift && edits.selected.contains(&id) => {
+                edits.click = Some(Click {
+                    at,
+                    pick: Pick::Only(id),
+                });
+                self.hold_selection(at);
+                false
+            }
+            Hit::Group(id) => {
+                edits.click = Some(Click { at, pick: pick(id) });
+                true
+            }
+            Hit::Empty => {
+                edits.click = (!shift).then_some(Click {
+                    at,
+                    pick: Pick::Clear,
+                });
+                true
+            }
+        }
+    }
+
+    /// The selection held, with what its groups hold.
+    fn hold_selection(&mut self, at: Point<Pixels>) {
+        let start = carried(&self.file.cards, &self.edits.selected);
+        self.edits.held = (!start.is_empty()).then_some(Held::Moving {
+            from: at,
+            start,
+            by: (0., 0.),
+            going: false,
+        });
+    }
+
+    /// The pointer moved while pressed: past [`SLOP`], no more a click, and what it holds goes
+    /// with it.
+    fn drag_held(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let edits = &mut self.edits;
+        if let Some(click) = &edits.click
+            && far(position - click.at)
+        {
+            edits.click = None;
+        }
+        let Some(camera) = self.camera else {
+            return;
+        };
+        let (from, going) = match &mut edits.held {
+            Some(Held::Moving { from, going, .. } | Held::Resizing { from, going, .. }) => {
+                (*from, going)
+            }
+            None => return,
+        };
+        let delta = position - from;
+        if !*going && !far(delta) {
+            return;
+        }
+        *going = true;
+        let (dx, dy) = (
+            f32::from(delta.x) / camera.zoom,
+            f32::from(delta.y) / camera.zoom,
+        );
+        match &mut edits.held {
+            Some(Held::Moving { by, .. }) => *by = (dx, dy),
+            Some(Held::Resizing {
+                start, corner, now, ..
+            }) => *now = resized(*start, *corner, dx, dy),
+            None => {}
+        }
+        self.show_held();
+        cx.notify();
+    }
+
+    /// The pointer let go: a click selects, a drag is done and written.
+    fn release_held(&mut self, cx: &mut Context<Self>) {
+        let edits = &mut self.edits;
+        if let Some(click) = edits.click.take() {
+            match click.pick {
+                Pick::Only(id) => edits.selected = vec![id],
+                Pick::Toggle(id) => match edits.selected.iter().position(|s| *s == id) {
+                    Some(index) => {
+                        edits.selected.remove(index);
+                    }
+                    None => edits.selected.push(id),
+                },
+                Pick::Clear => edits.selected.clear(),
+            }
+            cx.notify();
+        }
+        let to: Vec<(String, Area)> = match edits.held.take() {
+            Some(Held::Moving {
+                start,
+                by,
+                going: true,
+                ..
+            }) => start
+                .into_iter()
+                .map(|(id, area)| (id, moved(area, by.0, by.1)))
+                .collect(),
+            Some(Held::Resizing {
+                id,
+                now,
+                going: true,
+                ..
+            }) => vec![(id, now)],
+            _ => return,
+        };
+        if self.edit(|canvas| placing(canvas, &to), cx) {
+            self.save(cx);
+        }
+    }
+
+    fn held_cursor(&self) -> Option<CursorStyle> {
+        match &self.edits.held {
+            Some(Held::Resizing { corner, .. }) => Some(match corner {
+                Corner::TopLeft | Corner::BottomRight => CursorStyle::ResizeUpLeftDownRight,
+                Corner::TopRight | Corner::BottomLeft => CursorStyle::ResizeUpRightDownLeft,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The selection outlined in the accent colour, and the handles of a card selected alone:
+    /// painted over the cards, in one element.
+    fn selection(&self, camera: Camera, p: &Palette) -> Option<AnyElement> {
+        let selected = &self.edits.selected;
+        if selected.is_empty() {
+            return None;
+        }
+        // The theme's accent, or its blue when the accent is grey: as links are.
+        let accent = crate::kit::link(p);
+        let outlines: Vec<Area> = self
+            .file
+            .cards
+            .iter()
+            .filter(|card| selected.contains(&card.id))
+            .map(|card| camera.on_screen(card.area))
+            .collect();
+        let handles: Vec<Area> = self
+            .edits
+            .alone()
+            .and_then(|id| self.file.cards.iter().find(|card| card.id == id))
+            .map(|card| camera.on_screen(card.area))
+            .filter(|area| handles_shown(*area))
+            .map(|area| Corner::ALL.map(|corner| handle(corner, area)).to_vec())
+            .unwrap_or_default();
+        let (fill, clear) = (p.bg, hsla(0., 0., 0., 0.));
+        let element = canvas(
+            |_, _, _| (),
+            move |bounds, (), window, _| {
+                let at = |area: Area| {
+                    Bounds::new(
+                        bounds.origin + point(px(area.x), px(area.y)),
+                        size(px(area.width), px(area.height)),
+                    )
+                };
+                for area in outlines {
+                    let around = Area {
+                        x: area.x - 2.,
+                        y: area.y - 2.,
+                        width: area.width + 4.,
+                        height: area.height + 4.,
+                    };
+                    window.paint_quad(quad(
+                        at(around),
+                        px(4.),
+                        clear,
+                        px(2.),
+                        accent,
+                        BorderStyle::Solid,
+                    ));
+                }
+                for area in handles {
+                    window.paint_quad(quad(
+                        at(area),
+                        px(2.),
+                        fill,
+                        px(1.5),
+                        accent,
+                        BorderStyle::Solid,
+                    ));
+                }
+            },
+        )
+        .absolute()
+        .size_full();
+        Some(element.into_any_element())
+    }
+
+    /// An arrow: the selection nudged by (`dx`, `dy`), written once the keys rest; with nothing
+    /// selected, the board pans a line.
+    fn nudge(&mut self, dx: f32, dy: f32, cx: &mut Context<Self>) {
+        if self.edits.selected.is_empty() {
+            let pan = |d: f32| if d == 0. { 0. } else { -d.signum() * PAN_LINE };
+            self.pan_by(pan(dx), pan(dy), cx);
+            return;
+        }
+        if self.edits.held.is_some() {
+            return;
+        }
+        let to: Vec<(String, Area)> = carried(&self.file.cards, &self.edits.selected)
+            .into_iter()
+            .map(|(id, area)| (id, moved(area, dx, dy)))
+            .collect();
+        if self.edit(|canvas| placing(canvas, &to), cx) {
+            self.save_later(NUDGE_REST, cx);
+        }
+    }
+
+    /// `Delete`: the selection deleted with its edges, and written.
+    fn delete(&mut self, cx: &mut Context<Self>) {
+        if self.edits.selected.is_empty() || self.edits.held.is_some() {
+            return;
+        }
+        let ids = std::mem::take(&mut self.edits.selected);
+        if self.edit(|canvas| deleting(canvas, &ids), cx) {
+            self.save(cx);
+        }
+    }
+
+    /// Undoes the last action, or does again the last undone, and writes it. A card a deletion
+    /// undone gives back is shown once the file is read again, as written.
+    fn undo(&mut self, redo: bool, cx: &mut Context<Self>) {
+        if self.edits.held.is_some() {
+            return;
+        }
+        let Some(board) = &mut self.edits.board else {
+            return;
+        };
+        let done = if redo { board.redo() } else { board.undo() };
+        if done {
+            self.show_board();
+            self.save(cx);
+            cx.notify();
+        }
+    }
+
+    /// Does the operations `make` makes against the canvas being edited, as one action. False
+    /// when there were none.
+    fn edit(&mut self, make: impl FnOnce(&Canvas) -> Vec<Op>, cx: &mut Context<Self>) -> bool {
+        self.open_board(cx);
+        let mut done = false;
+        if let Some(board) = &mut self.edits.board {
+            let mut ops = make(board.canvas());
+            done = !ops.is_empty();
+            // One operation alone may join the one before it: nudges one after the other.
+            match ops.len() {
+                0 => {}
+                1 => board.edit(ops.remove(0)),
+                _ => board.edit_all(ops),
+            }
+        }
+        self.show_board();
+        cx.notify();
+        done
+    }
+
+    /// The canvas being edited, from the file as it was read.
+    fn open_board(&mut self, cx: &mut Context<Self>) {
+        if self.edits.board.is_some() {
+            return;
+        }
+        let canvas = (*self.file.canvas).clone();
+        match Board::with_canvas(&self.edits.path, canvas_board::runtime_locks(), canvas) {
+            Ok(board) => self.edits.board = Some(board),
+            Err(error) => toast(
+                Toast::failure(format!("This canvas cannot be edited: {error}")),
+                cx,
+            ),
+        }
+    }
+
+    /// The file read again: what is not written yet replayed on it.
+    fn read_again(&mut self, cx: &mut Context<Self>) {
+        let Some(board) = &mut self.edits.board else {
+            self.show_held();
+            return;
+        };
+        board.refreshed((*self.file.canvas).clone());
+        self.show_board();
+        if std::mem::take(&mut self.edits.stalled) {
+            self.save(cx);
+        }
+    }
+
+    /// The cards where the canvas being edited has them (the file's, before any edit), those it
+    /// no longer has left out; the cards held where the pointer has them.
+    fn show_board(&mut self) {
+        let disk = self.file.canvas.clone();
+        let canvas = self.edits.board.as_ref().map_or(&*disk, Board::canvas);
+        let mut areas: HashMap<&str, Area> = HashMap::new();
+        for node in canvas.nodes() {
+            if let (Some(id), Some(rect)) = (node.id(), node.rect()) {
+                areas.entry(id).or_insert(Area {
+                    x: rect.x as f32,
+                    y: rect.y as f32,
+                    width: rect.width as f32,
+                    height: rect.height as f32,
+                });
+            }
+        }
+        let changes: Vec<(usize, Option<Area>)> = self
+            .file
+            .cards
+            .iter()
+            .enumerate()
+            .filter(|(_, card)| !card.id.is_empty())
+            .filter_map(|(index, card)| {
+                let now = areas.get(card.id.as_str()).copied();
+                (now != Some(card.area)).then_some((index, now))
+            })
+            .collect();
+        if !changes.is_empty() {
+            let file = Arc::make_mut(&mut self.file);
+            let mut gone = HashSet::new();
+            for (index, area) in changes {
+                match area {
+                    Some(area) => file.cards[index].area = area,
+                    None => {
+                        gone.insert(index);
+                    }
+                }
+            }
+            let mut index = 0;
+            file.cards.retain(|_| {
+                index += 1;
+                !gone.contains(&(index - 1))
+            });
+        }
+        self.show_held();
+    }
+
+    /// The cards held, where the pointer has them, whatever the file says meanwhile.
+    fn show_held(&mut self) {
+        let areas: Vec<(&str, Area)> = match &self.edits.held {
+            Some(Held::Moving {
+                start,
+                by,
+                going: true,
+                ..
+            }) => start
+                .iter()
+                .map(|(id, area)| (id.as_str(), moved(*area, by.0, by.1)))
+                .collect(),
+            Some(Held::Resizing {
+                id,
+                now,
+                going: true,
+                ..
+            }) => vec![(id.as_str(), *now)],
+            _ => return,
+        };
+        let file = Arc::make_mut(&mut self.file);
+        for (id, area) in areas {
+            if let Some(card) = file.cards.iter_mut().find(|card| card.id == id) {
+                card.area = area;
+            }
+        }
+    }
+
+    /// Writes what is not written yet, off the window's thread: the lock may keep it waiting.
+    fn save(&mut self, cx: &mut Context<Self>) {
+        let edits = &mut self.edits;
+        if edits.writing {
+            edits.again = true;
+            return;
+        }
+        let Some(board) = &mut edits.board else {
+            return;
+        };
+        if board.pending().is_empty() {
+            return;
+        }
+        let writing = board.writing();
+        edits.writing = true;
+        let work = cx.background_executor().spawn(async move { writing.run() });
+        // Not kept by the board: a write begun ends, even if the board is let go meanwhile.
+        cx.spawn(async move |this, cx| {
+            let written = work.await;
+            this.update(cx, |this, cx| this.saved(written, cx)).ok();
+        })
+        .detach();
+    }
+
+    fn save_later(&mut self, after: Duration, cx: &mut Context<Self>) {
+        self.edits.later = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(after).await;
+            this.update(cx, |this, cx| this.save(cx)).ok();
+        }));
+    }
+
+    /// The board is left (another file, back, the window closed, the file no more a canvas):
+    /// what is not written yet is written now, on this thread, since the window may be gone
+    /// before a write off it ends. It waits for the lock as long as a write does, at most.
+    /// What cannot be written is said, never dropped in silence.
+    pub fn put_down(&mut self, cx: &mut Context<Self>) {
+        self.edits.later = None;
+        let Some(saved) = self.edits.board.as_mut().and_then(write_now) else {
+            return;
+        };
+        match (lost(&saved), saved) {
+            (Some(message), _) => toast(Toast::failure(message), cx),
+            (None, Ok(Saved::Done { report, .. })) => tell(report, cx),
+            (None, _) => {}
+        }
+        self.show_board();
+        cx.notify();
+    }
+
+    /// A write done: what did not go as Rature did it is said, the file as written shown.
+    fn saved(&mut self, written: io::Result<Written>, cx: &mut Context<Self>) {
+        self.edits.writing = false;
+        let saved = match written {
+            Ok(written) => self
+                .edits
+                .board
+                .as_mut()
+                .map(|board| board.written(written)),
+            Err(error) => {
+                toast(
+                    Toast::failure(format!("The canvas cannot be written: {error}")),
+                    cx,
+                );
+                None
+            }
+        };
+        match saved {
+            Some(Saved::Done { report, .. }) => tell(report, cx),
+            Some(Saved::Invalid(problems)) => {
+                self.edits.stalled = true;
+                let why = problems
+                    .first()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                toast(
+                    Toast::failure(format!(
+                        "The canvas file is not valid now ({why}): your changes wait for it to be mended"
+                    )),
+                    cx,
+                );
+            }
+            Some(Saved::Busy) => self.save_later(RETRY, cx),
+            None => {}
+        }
+        self.show_board();
+        if std::mem::take(&mut self.edits.again) {
+            self.save(cx);
+        }
+        cx.notify();
+    }
+}
+
+impl Edits {
+    /// The card selected alone: the one with handles.
+    fn alone(&self) -> Option<&str> {
+        match self.selected.as_slice() {
+            [id] => Some(id),
+            _ => None,
+        }
+    }
+}
+
+/// What is not written yet of `board`, written now on this thread; `None` when there was
+/// nothing to write.
+fn write_now(board: &mut Board) -> Option<io::Result<Saved>> {
+    (!board.pending().is_empty()).then(|| board.save())
+}
+
+/// What a write made as the board is left says when it could not write: what was not written
+/// is lost then.
+fn lost(saved: &io::Result<Saved>) -> Option<String> {
+    let why = match saved {
+        Ok(Saved::Done { .. }) => return None,
+        Ok(Saved::Invalid(problems)) => format!(
+            "The canvas file is not valid now ({})",
+            problems
+                .first()
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        ),
+        Ok(Saved::Busy) => "Another program kept the canvas busy".into(),
+        Err(error) => format!("The canvas cannot be written: {error}"),
+    };
+    Some(format!("{why}: your last changes to it are not written"))
+}
+
+/// What a write could not do as Rature did it, said in a toast; the text typed that the disk
+/// did not take, on the clipboard.
+fn tell(report: Report, cx: &mut App) {
+    if report.is_clean() {
+        return;
+    }
+    let mut said: Vec<String> = report.conflicts.iter().map(ToString::to_string).collect();
+    if !report.clipboard.is_empty() {
+        cx.write_to_clipboard(ClipboardItem::new_string(report.clipboard.join("\n\n")));
+        said.push("what you typed is in the clipboard".into());
+    }
+    toast(Toast::failure(said.join("; ")), cx);
+}
+
+/// A corner of a card.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Corner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl Corner {
+    const ALL: [Self; 4] = [
+        Self::TopLeft,
+        Self::TopRight,
+        Self::BottomLeft,
+        Self::BottomRight,
+    ];
+
+    fn left(self) -> bool {
+        matches!(self, Self::TopLeft | Self::BottomLeft)
+    }
+
+    fn top(self) -> bool {
+        matches!(self, Self::TopLeft | Self::TopRight)
+    }
+
+    /// Where it is on `area`.
+    fn of(self, area: Area) -> (f32, f32) {
+        (
+            if self.left() {
+                area.x
+            } else {
+                area.x + area.width
+            },
+            if self.top() {
+                area.y
+            } else {
+                area.y + area.height
+            },
+        )
+    }
+}
+
+/// What a press on the board is on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Hit {
+    /// A handle of the card selected alone.
+    Handle(String, Corner),
+    /// A card, or a group's label.
+    Card(String),
+    /// A group's background: a drag there pans, unless the group is selected.
+    Group(String),
+    Empty,
+}
+
+/// What a press at the board's point (`x`, `y`) is on: a handle of the card selected alone
+/// (`alone`), the topmost card that is not a group, a group's label (`label` high on screen,
+/// above it), a group's background, or nothing. A card without an id is never selected.
+fn hit(cards: &[Card], camera: Camera, label: f32, alone: Option<&str>, x: f32, y: f32) -> Hit {
+    if let Some(id) = alone
+        && let Some(card) = cards.iter().find(|card| card.id == id)
+        && let Some(corner) = handle_at(camera.on_screen(card.area), x, y)
+    {
+        return Hit::Handle(id.into(), corner);
+    }
+    let (at_x, at_y) = camera.to_canvas(x, y);
+    let named = || cards.iter().rev().filter(|card| !card.id.is_empty());
+    let group = |card: &&Card| matches!(card.kind, CardKind::Group);
+    if let Some(card) = named()
+        .filter(|card| !group(card))
+        .find(|card| card.area.contains(at_x, at_y))
+    {
+        return Hit::Card(card.id.clone());
+    }
+    let labelled = |card: &&Card| {
+        let area = camera.on_screen(card.area);
+        let title = Area {
+            y: area.y - label,
+            height: label,
+            ..area
+        };
+        label > 0. && title.contains(x, y)
+    };
+    if let Some(card) = named().filter(group).find(labelled) {
+        return Hit::Card(card.id.clone());
+    }
+    named()
+        .filter(group)
+        .find(|card| card.area.contains(at_x, at_y))
+        .map_or(Hit::Empty, |card| Hit::Group(card.id.clone()))
+}
+
+/// Whether a card this large on screen has handles: a small one is all handles otherwise, and
+/// could not be moved.
+fn handles_shown(area: Area) -> bool {
+    area.width >= 3. * HANDLE && area.height >= 3. * HANDLE
+}
+
+/// The handle of a card at `area` on screen that the screen's point (`x`, `y`) is on.
+fn handle_at(area: Area, x: f32, y: f32) -> Option<Corner> {
+    if !handles_shown(area) {
+        return None;
+    }
+    Corner::ALL.into_iter().find(|corner| {
+        let (at_x, at_y) = corner.of(area);
+        (x - at_x).abs() <= REACH && (y - at_y).abs() <= REACH
+    })
+}
+
+/// The square of a handle, on screen.
+fn handle(corner: Corner, area: Area) -> Area {
+    let (x, y) = corner.of(area);
+    Area {
+        x: x - HANDLE / 2.,
+        y: y - HANDLE / 2.,
+        width: HANDLE,
+        height: HANDLE,
+    }
+}
+
+/// Whether the pointer went far enough from where it was pressed to drag.
+fn far(delta: Point<Pixels>) -> bool {
+    f32::from(delta.x).hypot(f32::from(delta.y)) > SLOP
+}
+
+/// The cards a drag of the cards `ids` moves, from where they are: them, and what lies wholly
+/// inside a group among them, each once.
+fn carried(cards: &[Card], ids: &[String]) -> Vec<(String, Area)> {
+    let within = |inner: Area, outer: Area| {
+        inner.x >= outer.x
+            && inner.y >= outer.y
+            && inner.x + inner.width <= outer.x + outer.width
+            && inner.y + inner.height <= outer.y + outer.height
+    };
+    let mut seen = HashSet::new();
+    let mut held = Vec::new();
+    for id in ids {
+        let Some(card) = cards.iter().find(|card| card.id == *id) else {
+            continue;
+        };
+        let inside: Vec<&Card> = match card.kind {
+            CardKind::Group => cards
+                .iter()
+                .filter(|inner| !inner.id.is_empty() && within(inner.area, card.area))
+                .collect(),
+            _ => Vec::new(),
+        };
+        for card in std::iter::once(card).chain(inside) {
+            if seen.insert(card.id.as_str()) {
+                held.push((card.id.clone(), card.area));
+            }
+        }
+    }
+    held
+}
+
+/// `area` moved by (`dx`, `dy`), its place rounded to the pixel as the file keeps it.
+fn moved(area: Area, dx: f32, dy: f32) -> Area {
+    Area {
+        x: (area.x + dx).round(),
+        y: (area.y + dy).round(),
+        ..area
+    }
+}
+
+/// `start` resized by its `corner` dragged by (`dx`, `dy`): the opposite corner stays, the
+/// edges dragged rounded to the pixel, never smaller than [`MIN_SIZE`] (or than it was).
+fn resized(start: Area, corner: Corner, dx: f32, dy: f32) -> Area {
+    let (least_width, least_height) = (MIN_SIZE.min(start.width), MIN_SIZE.min(start.height));
+    let (mut left, mut right) = (start.x, start.x + start.width);
+    let (mut top, mut bottom) = (start.y, start.y + start.height);
+    if corner.left() {
+        left = (left + dx).round().min(right - least_width);
+    } else {
+        right = (right + dx).round().max(left + least_width);
+    }
+    if corner.top() {
+        top = (top + dy).round().min(bottom - least_height);
+    } else {
+        bottom = (bottom + dy).round().max(top + least_height);
+    }
+    Area {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    }
+}
+
+/// The operations that put each node of `to` at its area, from where `canvas` has it: a move
+/// when its place changes, a resize when its size does.
+fn placing(canvas: &Canvas, to: &[(String, Area)]) -> Vec<Op> {
+    // A coordinate left as it was keeps the file's own number, which an f32 may not hold.
+    let keep = |now: f64, to: f32| {
+        if now as f32 == to { now } else { f64::from(to) }
+    };
+    let mut ops = Vec::new();
+    for (id, area) in to {
+        let Some(now) = canvas.node(id).and_then(|node| node.rect()) else {
+            continue;
+        };
+        ops.extend(Op::move_node(
+            canvas,
+            id,
+            keep(now.x, area.x),
+            keep(now.y, area.y),
+        ));
+        ops.extend(Op::resize_node(
+            canvas,
+            id,
+            keep(now.width, area.width),
+            keep(now.height, area.height),
+        ));
+    }
+    ops
+}
+
+/// The operations that delete the nodes `ids` of `canvas` with their edges, each made against
+/// the canvas the ones before it leave, as [`Board::edit_all`] wants them: an edge between two
+/// of them is deleted once.
+fn deleting(canvas: &Canvas, ids: &[String]) -> Vec<Op> {
+    let mut left = canvas.clone();
+    ids.iter()
+        .filter_map(|id| {
+            let op = Op::delete_node(&left, id)?;
+            op.apply(&mut left, &mut Report::default());
+            Some(op)
+        })
+        .collect()
+}
+
 /// `div` set at `area` of the board.
 fn placed(div: Stateful<Div>, area: Area) -> Stateful<Div> {
     div.absolute()
@@ -784,6 +1734,7 @@ impl Render for CanvasView {
             .when(self.space && self.panning.is_none(), |d| {
                 d.cursor(CursorStyle::OpenHand)
             })
+            .when_some(self.held_cursor(), |d, cursor| d.cursor(cursor))
             .child(tracker);
         let (Some(camera), Some(bounds)) = (self.camera, self.bounds) else {
             return board;
@@ -815,8 +1766,9 @@ impl Render for CanvasView {
             }
             Detail::Rects => board.child(Self::rects(&shown, camera, &p)),
         };
-        // A pan goes on wherever the pointer goes, over the board or not.
-        if self.panning.is_some() {
+        board = board.children(self.selection(camera, &p));
+        // A pan, or cards held, go on wherever the pointer goes, over the board or not.
+        if self.panning.is_some() || self.edits.held.is_some() {
             board = board.child(
                 canvas(
                     |_, _, _| (),
@@ -870,7 +1822,14 @@ impl Render for CanvasView {
 #[cfg(test)]
 mod tests {
     // Not the glob: GPUI's own `test` attribute would come with it.
-    use super::{Area, Camera, CanvasFile, Detail, MAX_ZOOM, MIN_ZOOM, ROOM, STEP, Tint, tint};
+    use super::{
+        Area, Camera, CanvasFile, Corner, Detail, HANDLE, Hit, MAX_ZOOM, MIN_SIZE, MIN_ZOOM, ROOM,
+        STEP, Tint, carried, deleting, handle_at, hit, moved, placing, resized, tint,
+    };
+    use super::{lost, write_now};
+    use crate::canvas::Canvas;
+    use crate::canvas_board::{Board, Saved};
+    use crate::canvas_ops::{Op, Report};
     use gpui_design_system::Palette;
 
     fn close(a: f32, b: f32) -> bool {
@@ -1046,9 +2005,267 @@ mod tests {
                 height: 650.
             })
         );
-        // The group is empty space; the card over it is not.
-        assert!(file.card_at(-20., -20.).is_none());
-        assert_eq!(file.card_at(10., 10.).map(|c| c.index), Some(0));
+        // The group's background is the group's, the card over it the card's.
+        let camera = Camera {
+            x: -100.,
+            y: -100.,
+            zoom: 1.,
+        };
+        let at = |x: f32, y: f32| hit(&file.cards, camera, 0., None, x + 100., y + 100.);
+        assert_eq!(at(-20., -20.), Hit::Group("g".into()));
+        assert_eq!(at(10., 10.), Hit::Card("a".into()));
+        assert_eq!(at(-80., -80.), Hit::Empty);
+    }
+
+    /// Cards `a` and `b`, an edge between them and one from `b` to `c`, and a group `g` holding
+    /// `a` alone.
+    const BOARD: &str = r##"{"nodes":[
+        {"id":"g","type":"group","label":"Group","x":-20,"y":-20,"width":300,"height":200},
+        {"id":"a","type":"text","text":"A","x":0,"y":0,"width":200,"height":100},
+        {"id":"b","type":"text","text":"B","x":400,"y":0,"width":200,"height":100},
+        {"id":"c","type":"text","text":"C","x":800,"y":0,"width":200,"height":100}
+    ],"edges":[
+        {"id":"ab","fromNode":"a","toNode":"b"},
+        {"id":"bc","fromNode":"b","toNode":"c"}
+    ]}"##;
+
+    fn board() -> (Canvas, CanvasFile) {
+        (
+            Canvas::read(BOARD),
+            CanvasFile::read(BOARD, "#000000", None).unwrap(),
+        )
+    }
+
+    fn ids(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    fn rect(canvas: &Canvas, id: &str) -> (f64, f64, f64, f64) {
+        let r = canvas.node(id).unwrap().rect().unwrap();
+        (r.x, r.y, r.width, r.height)
+    }
+
+    fn applied(canvas: &Canvas, ops: &[Op]) -> Canvas {
+        let mut canvas = canvas.clone();
+        let mut report = Report::default();
+        for op in ops {
+            op.apply(&mut canvas, &mut report);
+        }
+        assert!(report.is_clean());
+        canvas
+    }
+
+    /// The board left: what is pending is written at once; when the file is no more a valid
+    /// canvas, nothing is, and it is said.
+    #[test]
+    fn what_is_pending_is_written_when_the_board_is_left_or_said_lost() {
+        let folder = std::env::temp_dir().join(format!("rature-view-leave-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("a.canvas");
+        std::fs::write(&path, BOARD).unwrap();
+        let mut board = Board::open_with_locks(&path, folder.join("locks")).unwrap();
+        assert!(write_now(&mut board).is_none(), "nothing pending");
+        let nudge = |board: &mut Board, x: f32| {
+            let file = CanvasFile::read(BOARD, "#000000", None).unwrap();
+            let to: Vec<(String, Area)> = carried(&file.cards, &ids(&["b"]))
+                .into_iter()
+                .map(|(id, area)| (id, moved(area, x, 0.)))
+                .collect();
+            let ops = placing(board.canvas(), &to);
+            board.edit_all(ops);
+        };
+        nudge(&mut board, 1.);
+        let saved = write_now(&mut board).unwrap();
+        assert_eq!(lost(&saved), None);
+        assert!(matches!(saved, Ok(Saved::Done { written: true, .. })));
+        let read = || Canvas::read(&std::fs::read_to_string(&path).unwrap());
+        assert_eq!(rect(&read(), "b").0, 401.);
+        assert!(board.pending().is_empty());
+        // Another program leaves two nodes with one id: not a canvas to write.
+        let broken = BOARD.replace(r#""id":"c""#, r#""id":"a""#);
+        std::fs::write(&path, &broken).unwrap();
+        nudge(&mut board, 10.);
+        let saved = write_now(&mut board).unwrap();
+        assert!(matches!(saved, Ok(Saved::Invalid(_))));
+        let said = lost(&saved).unwrap();
+        assert!(
+            said.starts_with("The canvas file is not valid now (")
+                && said.ends_with("your last changes to it are not written"),
+            "{said}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a_drag_moves_each_card_held_once_rounded() {
+        let (canvas, file) = board();
+        let to: Vec<(String, Area)> = carried(&file.cards, &ids(&["b"]))
+            .into_iter()
+            .map(|(id, area)| (id, moved(area, 30.4, -10.6)))
+            .collect();
+        let ops = placing(&canvas, &to);
+        assert_eq!(ops, [Op::move_node(&canvas, "b", 430., -11.).unwrap()]);
+        assert_eq!(rect(&applied(&canvas, &ops), "b"), (430., -11., 200., 100.));
+        // Back where it was: nothing to write.
+        let back = carried(&file.cards, &ids(&["b"]));
+        assert!(placing(&canvas, &back).is_empty());
+        // Only what changes: a drag straight down sets `y` alone.
+        let down = [("b".to_string(), moved(back[0].1, 0., 25.))];
+        match placing(&canvas, &down).as_slice() {
+            [Op::Set { fields, .. }] => {
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].key, "y");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_group_carries_what_lies_inside_it() {
+        let (canvas, file) = board();
+        // `g` and `a`, once, though `a` is selected too; `b` lies outside.
+        let held = carried(&file.cards, &ids(&["g", "a"]));
+        let held: Vec<&str> = held.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(held, ["g", "a"]);
+        let to: Vec<(String, Area)> = carried(&file.cards, &ids(&["g"]))
+            .into_iter()
+            .map(|(id, area)| (id, moved(area, 100., 50.)))
+            .collect();
+        let moved = applied(&canvas, &placing(&canvas, &to));
+        assert_eq!(rect(&moved, "g"), (80., 30., 300., 200.));
+        assert_eq!(rect(&moved, "a"), (100., 50., 200., 100.));
+        assert_eq!(rect(&moved, "b"), (400., 0., 200., 100.));
+    }
+
+    #[test]
+    fn a_resize_from_each_corner_keeps_the_opposite_one() {
+        let (canvas, file) = board();
+        let start = carried(&file.cards, &ids(&["a"]))[0].1;
+        // Dragged 10 right and 20 down from each corner: (x, y, width, height).
+        let cases = [
+            (Corner::TopLeft, (10., 20., 190., 80.), 2),
+            (Corner::TopRight, (0., 20., 210., 80.), 2),
+            (Corner::BottomLeft, (10., 0., 190., 120.), 2),
+            (Corner::BottomRight, (0., 0., 210., 120.), 1),
+        ];
+        for (corner, expected, count) in cases {
+            let area = resized(start, corner, 10., 20.);
+            let ops = placing(&canvas, &[("a".into(), area)]);
+            // A move when the place changes, and the resize.
+            assert_eq!(ops.len(), count, "{corner:?}: {ops:?}");
+            assert_eq!(rect(&applied(&canvas, &ops), "a"), expected, "{corner:?}");
+            let right = |a: Area| (a.x + a.width, a.y + a.height);
+            match corner {
+                Corner::TopLeft => assert_eq!(right(area), right(start)),
+                Corner::BottomRight => assert_eq!((area.x, area.y), (start.x, start.y)),
+                _ => {}
+            }
+        }
+        // Never smaller than the least size, the opposite corner still in place.
+        let small = resized(start, Corner::TopLeft, 500., 500.);
+        assert_eq!((small.width, small.height), (MIN_SIZE, MIN_SIZE));
+        assert_eq!(
+            (small.x + small.width, small.y + small.height),
+            (200., 100.)
+        );
+    }
+
+    #[test]
+    fn a_nudge_moves_the_selection_by_one_or_ten() {
+        let (canvas, file) = board();
+        for (step, x) in [(1., 401.), (-10., 390.)] {
+            let to: Vec<(String, Area)> = carried(&file.cards, &ids(&["b", "c"]))
+                .into_iter()
+                .map(|(id, area)| (id, moved(area, step, 0.)))
+                .collect();
+            let ops = placing(&canvas, &to);
+            assert_eq!(ops.len(), 2);
+            let nudged = applied(&canvas, &ops);
+            assert_eq!(rect(&nudged, "b").0, x);
+            assert_eq!(rect(&nudged, "c").0, x + 400.);
+        }
+    }
+
+    #[test]
+    fn a_deletion_takes_the_edges_with_the_cards_and_is_undone_whole() {
+        let (canvas, _) = board();
+        let ops = deleting(&canvas, &ids(&["a", "b"]));
+        assert_eq!(ops.len(), 2);
+        // The edge between them goes with the first; the second takes `bc` alone.
+        match &ops[1] {
+            Op::DeleteNode { edges, .. } => assert_eq!(edges.len(), 1),
+            other => panic!("{other:?}"),
+        }
+        let deleted = applied(&canvas, &ops);
+        assert!(deleted.node("a").is_none() && deleted.node("b").is_none());
+        assert!(deleted.edges().is_empty());
+        let inverse: Vec<Op> = ops.iter().rev().map(Op::inverse).collect();
+        assert_eq!(applied(&deleted, &inverse), canvas);
+    }
+
+    #[test]
+    fn the_handles_are_the_same_size_on_screen_at_every_zoom() {
+        let card = Area {
+            x: 100.,
+            y: 50.,
+            width: 400.,
+            height: 300.,
+        };
+        for zoom in [0.25, 0.5, 1., 2., 4.] {
+            let camera = Camera { x: 0., y: 0., zoom };
+            let area = camera.on_screen(card);
+            let (right, bottom) = (area.x + area.width, area.y + area.height);
+            assert_eq!(
+                handle_at(area, area.x + 4., area.y - 4.),
+                Some(Corner::TopLeft)
+            );
+            assert_eq!(handle_at(area, right - 5., area.y), Some(Corner::TopRight));
+            assert_eq!(
+                handle_at(area, area.x, bottom + 6.),
+                Some(Corner::BottomLeft)
+            );
+            assert_eq!(handle_at(area, right, bottom), Some(Corner::BottomRight));
+            // Out of reach, whatever the zoom: 7 px off, or inside the card.
+            assert_eq!(handle_at(area, right + 7., bottom), None, "{zoom}");
+            assert_eq!(handle_at(area, area.x + 12., area.y + 12.), None, "{zoom}");
+        }
+        // From afar the card is too small for handles: a press on it holds it.
+        let far = Camera {
+            x: 0.,
+            y: 0.,
+            zoom: 0.05,
+        };
+        let area = far.on_screen(card);
+        assert!(area.width < 3. * HANDLE);
+        assert_eq!(handle_at(area, area.x, area.y), None);
+    }
+
+    #[test]
+    fn a_press_finds_the_handle_then_the_card_then_the_group() {
+        let (_, file) = board();
+        let camera = Camera {
+            x: -100.,
+            y: -100.,
+            zoom: 2.,
+        };
+        let screen = |x: f32, y: f32| camera.to_screen(x, y);
+        let at =
+            |alone: Option<&str>, (x, y): (f32, f32)| hit(&file.cards, camera, 20., alone, x, y);
+        // The corner of `a`: its handle when it is selected alone, else the card.
+        assert_eq!(
+            at(Some("a"), screen(200., 100.)),
+            Hit::Handle("a".into(), Corner::BottomRight)
+        );
+        assert_eq!(at(None, screen(200., 100.)), Hit::Card("a".into()));
+        assert_eq!(at(Some("b"), screen(200., 100.)), Hit::Card("a".into()));
+        // The group's background, and its label above it, 20 px high on screen.
+        assert_eq!(at(None, screen(250., 150.)), Hit::Group("g".into()));
+        let (x, y) = screen(0., -20.);
+        assert_eq!(at(None, (x, y - 10.)), Hit::Card("g".into()));
+        assert_eq!(at(None, (x, y - 25.)), Hit::Empty);
+        assert_eq!(at(None, screen(350., 50.)), Hit::Empty);
     }
 
     #[test]

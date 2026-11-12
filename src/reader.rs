@@ -14,7 +14,7 @@ use gpui_kit::base::input::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::canvas_view::{Camera, CanvasView};
+use crate::canvas_view::{self, Camera, CanvasView};
 use crate::config::{Config, Side};
 use crate::diff::{Changes, Mark};
 use crate::document::{self, Block, Document, Links};
@@ -86,9 +86,10 @@ pub fn bind_keys(cx: &mut App) {
     let at = Some("Reader");
     cx.bind_keys([
         KeyBinding::new("j", LineDown, at),
-        KeyBinding::new("down", LineDown, at),
+        // On a canvas, the arrows move the cards selected (`canvas_view::bind_keys`).
+        KeyBinding::new("down", LineDown, Some("Reader && !Canvas")),
         KeyBinding::new("k", LineUp, at),
-        KeyBinding::new("up", LineUp, at),
+        KeyBinding::new("up", LineUp, Some("Reader && !Canvas")),
         KeyBinding::new("ctrl-d", HalfPageDown, at),
         KeyBinding::new("ctrl-u", HalfPageUp, at),
         // On a canvas, Space held pans with a drag.
@@ -617,9 +618,16 @@ impl Reader {
                     .and_then(|path| cx.global::<State>().camera(path))
                     .and_then(Camera::from_kept);
                 let reader = cx.entity().downgrade();
-                Some(cx.new(|cx| CanvasView::new(file.clone(), camera, reader, cx)))
+                let path = self.path.clone().unwrap_or_default();
+                Some(cx.new(|cx| CanvasView::new(file.clone(), camera, path, reader, cx)))
             }
-            _ => None,
+            // No more a canvas (broken by another program, say): what was not written is tried,
+            // and said if it cannot be.
+            (_, Some(board)) => {
+                board.update(cx, |board, cx| board.put_down(cx));
+                None
+            }
+            (_, None) => None,
         };
         self.content = content;
         self.prints = prints;
@@ -730,6 +738,9 @@ impl Reader {
         };
         self.write_edit(cx);
         self.write_code(cx);
+        if let Some(board) = &self.board {
+            board.update(cx, |board, cx| board.put_down(cx));
+        }
         // Not read yet: where it was read up to stays as it was.
         if !self.loading {
             let position = self.position();
@@ -2129,6 +2140,7 @@ impl Render for Reader {
                         })
                     })
                     .when_some(board, |d, board| {
+                        let d = canvas_view::on_keys(d, &board);
                         let (pressed, released) = (board.clone(), board);
                         d.on_key_down(move |event, _, cx| {
                             if event.keystroke.key == "space"
