@@ -1,7 +1,12 @@
 mod cache;
-// The model of `.canvas` files: no window uses it before the canvas opens in one (#9).
+// The model of `.canvas` files, its operations and its writes: no window uses them before the
+// canvas opens in one (#9).
 #[allow(dead_code)]
 mod canvas;
+#[allow(dead_code)]
+mod canvas_board;
+#[allow(dead_code)]
+mod canvas_ops;
 mod config;
 mod diagram;
 mod diff;

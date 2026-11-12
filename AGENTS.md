@@ -49,6 +49,8 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 | `list.rs` | A Markdown list edited in place, line by line beside its markers |
 | `formats.rs` | What a file is shown as: Markdown, data (JSON, YAML) as a folding tree, CSV as a table, an image, or code |
 | `canvas.rs` | JSON Canvas 1.0 (Obsidian's `.canvas`), read and written without losing anything: unknown fields, key order and node order kept |
+| `canvas_ops.rs` | Operations on a canvas by id, replayed on the disk's canvas with a field-by-field three-way merge (the disk wins a conflict), and their inverses for undo |
+| `canvas_board.rs` | A canvas being edited: pending operations, undo and redo, each write the disk's text read again and the operations replayed on it, under a lock per canvas in the runtime folder; a text's revision |
 | `format.rs` | Formatting on the user's own save (`Ctrl-s`), never on a change made from outside |
 | `load.rs` | Reading a file off the main thread: reading, parsing, formulas, link checks, the comparison; only the latest request's result is kept |
 | `cache.rs` | Results worked out off the main thread (a diagram, a code block's colours), keyed by their source: pending, done or failed |
@@ -82,7 +84,9 @@ Besides `src/`:
   - `xkeys.py`: keys typed into `capture.sh`'s nested display;
   - `brand.sh`: the brand's PNGs from its SVGs;
   - `version.sh`, `changelog.sh`, `package.sh`: the version, the notes and the archive of a
-    build (`docs/releases.md`).
+    build (`docs/releases.md`);
+  - `test-install.sh`: `install.sh` run against fake releases from a local server, in temporary
+    `HOME` and XDG folders.
 - `.github/workflows/`: `ci.yml`, `release.yml`, `alpha-cleanup.yml` (`docs/releases.md`).
 
 ## Rules of the code

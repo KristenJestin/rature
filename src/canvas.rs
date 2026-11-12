@@ -16,6 +16,9 @@
 //!
 //! A canvas that is not valid (not JSON, a duplicate id, an edge to a node that is not there) is
 //! read as far as it can be, with what is wrong with it, and never written.
+//!
+//! Edited by operations on ids (`canvas_ops`), written by replaying them on the file's text as
+//! it is then (`canvas_board`).
 
 use std::collections::HashSet;
 use std::collections::hash_map::RandomState;
@@ -106,6 +109,15 @@ impl Canvas {
 
     pub fn edges(&self) -> &[Edge] {
         &self.edges
+    }
+
+    /// The nodes, for the operations (`canvas_ops`): their order is the z order, never sorted.
+    pub(crate) fn nodes_mut(&mut self) -> &mut Vec<Node> {
+        &mut self.nodes
+    }
+
+    pub(crate) fn edges_mut(&mut self) -> &mut Vec<Edge> {
+        &mut self.edges
     }
 
     /// The first node with this id.
@@ -446,6 +458,11 @@ impl Node {
         &self.fields
     }
 
+    /// The node's object, for the operations (`canvas_ops`).
+    pub(crate) fn fields_mut(&mut self) -> &mut Map<String, Value> {
+        &mut self.fields
+    }
+
     pub fn id(&self) -> Option<&str> {
         string(&self.fields, "id")
     }
@@ -545,6 +562,11 @@ impl Edge {
         &self.fields
     }
 
+    /// The edge's object, for the operations (`canvas_ops`).
+    pub(crate) fn fields_mut(&mut self) -> &mut Map<String, Value> {
+        &mut self.fields
+    }
+
     pub fn id(&self) -> Option<&str> {
         string(&self.fields, "id")
     }
@@ -612,7 +634,7 @@ fn end(text: &str) -> End<'_> {
 
 /// `value` rounded to the nearest integer (a half away from zero); past the integers JSON can
 /// hold here, the nearest of them, and 0 for a value that is not a number.
-fn integer(value: f64) -> Value {
+pub(crate) fn integer(value: f64) -> Value {
     Value::Number(Number::from(value.round() as i64))
 }
 

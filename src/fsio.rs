@@ -2,11 +2,12 @@
 //! old one), never over what another program wrote since the file was read, and through a link
 //! to the file it points to rather than in its place.
 
-use std::fs::{self, File, Metadata, OpenOptions};
+use std::fs::{self, File, Metadata, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// How many times a file that changes while it is being written is read again before giving up.
 const TRIES: usize = 3;
@@ -117,6 +118,48 @@ pub fn update(path: &Path, mut edit: impl FnMut(&str) -> Option<String>) -> io::
 fn holds(path: &Path, expected: &[u8]) -> bool {
     regular(path).is_ok_and(|meta| meta.len() == expected.len() as u64)
         && fs::read(path).is_ok_and(|bytes| bytes == expected)
+}
+
+/// A lock between processes, and between the threads of one, on a file of Rature's own: never
+/// one of the files it reads or writes for the user. Held until it is dropped, or the process
+/// ends.
+// Taken by the canvas's writes (`canvas_board`), which no window makes before #9.
+#[allow(dead_code)]
+pub struct Lock {
+    _file: File,
+}
+
+#[allow(dead_code)]
+impl Lock {
+    /// Takes the lock at `path`, made with its folder if need be (both its owner's alone),
+    /// waiting for whoever holds it at most `patience`: `None` past that.
+    pub fn take(path: &Path, patience: Duration) -> io::Result<Option<Self>> {
+        if let Some(folder) = path.parent() {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(folder)?;
+        }
+        // Each open is a lock of its own (`flock`): two threads of a process exclude each other.
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(path)?;
+        let deadline = Instant::now() + patience;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Some(Self { _file: file })),
+                Err(TryLockError::WouldBlock) => {}
+                Err(TryLockError::Error(error)) => return Err(error),
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 }
 
 /// Writes `bytes` to `path` whole, readable by its owner alone: what Rature keeps for itself.
@@ -328,6 +371,34 @@ mod tests {
             not_a_file(&fs::metadata("/dev/null").unwrap()),
             Some("a device")
         );
+    }
+
+    #[test]
+    fn a_lock_waits_for_its_holder_then_gives_up() {
+        let folder = Folder::new("lock");
+        let path = folder.0.join("locks").join("a.lock");
+        let held = Lock::take(&path, Duration::ZERO)
+            .unwrap()
+            .expect("nobody holds it");
+        assert_eq!(
+            fs::metadata(path.parent().unwrap()).unwrap().mode() & 0o777,
+            0o700
+        );
+        let started = Instant::now();
+        assert!(
+            Lock::take(&path, Duration::from_millis(50))
+                .unwrap()
+                .is_none(),
+            "held by another open file, even in this process"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        // Let go on another thread meanwhile: the one waiting gets it.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(held);
+        });
+        assert!(Lock::take(&path, Duration::from_secs(5)).unwrap().is_some());
+        releaser.join().unwrap();
     }
 
     #[test]
