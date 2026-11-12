@@ -146,10 +146,12 @@ impl Canvas {
     }
 
     /// Puts a node last: on top of the others.
+    #[cfg(test)]
     pub fn push_node(&mut self, node: Node) {
         self.nodes.push(node);
     }
 
+    #[cfg(test)]
     pub fn push_edge(&mut self, edge: Edge) {
         self.edges.push(edge);
     }
@@ -650,24 +652,16 @@ impl Node {
         string(&self.fields, "label")
     }
 
-    /// A group's background image.
-    pub fn background(&self) -> Option<&str> {
-        string(&self.fields, "background")
-    }
-
-    /// How a group's background image fills it: `cover`, `ratio` or `repeat`.
-    pub fn background_style(&self) -> Option<&str> {
-        string(&self.fields, "backgroundStyle")
-    }
-
     /// Moves the node. Each coordinate that changes is rounded to an integer; one that does
     /// not is left as the file has it.
+    #[cfg(test)]
     pub fn set_position(&mut self, x: f64, y: f64) {
         set_number(&mut self.fields, "x", x);
         set_number(&mut self.fields, "y", y);
     }
 
     /// Resizes the node, as [`Node::set_position`] moves it.
+    #[cfg(test)]
     pub fn set_size(&mut self, width: f64, height: f64) {
         set_number(&mut self.fields, "width", width);
         set_number(&mut self.fields, "height", height);
@@ -682,6 +676,7 @@ pub struct Edge {
 
 impl Edge {
     /// A new edge from one node to another, with the default ends.
+    #[cfg(test)]
     pub fn new(id: &str, from: &str, to: &str) -> Self {
         let mut fields = Map::new();
         fields.insert("id".into(), id.into());
@@ -793,6 +788,7 @@ pub(crate) fn integer(value: f64) -> Value {
 }
 
 /// Sets the number at `key`, in its place, rounded, unless it already holds `value`.
+#[cfg(test)]
 fn set_number(fields: &mut Map<String, Value>, key: &str, value: f64) {
     if fields.get(key).and_then(Value::as_f64) != Some(value) {
         fields.insert(key.into(), integer(value));
@@ -861,6 +857,7 @@ pub struct Changes {
 }
 
 impl Changes {
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
             && self.deleted_nodes.is_empty()

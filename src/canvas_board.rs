@@ -79,11 +79,13 @@ pub struct Written {
 
 impl Board {
     /// Opens the canvas at `path`, its locks in the user's runtime folder.
+    #[cfg(test)]
     pub fn open(path: &Path) -> io::Result<Self> {
         Self::open_with_locks(path, runtime_locks())
     }
 
     /// Opens the canvas at `path`, its locks in `locks`.
+    #[cfg(test)]
     pub fn open_with_locks(path: &Path, locks: PathBuf) -> io::Result<Self> {
         let text = fs::read_to_string(fs::canonicalize(path)?)?;
         Self::with_canvas(path, locks, Canvas::read(&text))
@@ -105,6 +107,7 @@ impl Board {
         })
     }
 
+    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path
     }

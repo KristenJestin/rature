@@ -1,14 +1,9 @@
 mod cache;
-// The model of `.canvas` files, its operations and its writes: `rature mcp` reads and writes with
-// them, the window reads with them, and nothing edits a canvas in the window before #14.
-#[allow(dead_code)]
 mod canvas;
-#[allow(dead_code)]
 mod canvas_board;
 mod canvas_changes;
 mod canvas_edges;
 mod canvas_files;
-#[allow(dead_code)]
 mod canvas_ops;
 mod canvas_view;
 mod config;

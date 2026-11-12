@@ -237,13 +237,10 @@ fn holds(path: &Path, expected: &[u8]) -> bool {
 /// A lock between processes, and between the threads of one, on a file of Rature's own: never
 /// one of the files it reads or writes for the user. Held until it is dropped, or the process
 /// ends.
-// Taken by the canvas's writes (`canvas_board`), which no window makes before #9.
-#[allow(dead_code)]
 pub struct Lock {
     _file: File,
 }
 
-#[allow(dead_code)]
 impl Lock {
     /// Takes the lock at `path`, made with its folder if need be (both its owner's alone),
     /// waiting for whoever holds it at most `patience`: `None` past that.
