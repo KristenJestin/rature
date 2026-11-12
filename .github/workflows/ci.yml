@@ -8,7 +8,9 @@ on:
   workflow_dispatch:
 
 # A push makes the runs of the same ref's older pushes useless: they are cancelled, so that the
-# queue holds only what is current. Not on dev and main, whose runs publish and always finish.
+# queue holds only what is current. Not on dev and main, whose runs publish: a run there is never
+# cancelled once it runs. One still waiting is, by GitHub, when a newer run of the ref is queued:
+# its commit gets no build, and the newer run publishes the branch's tip.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/dev' && github.ref != 'refs/heads/main' }}

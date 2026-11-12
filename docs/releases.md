@@ -77,8 +77,11 @@ fast-forward), and is then that very commit.
   and the first one after a release is `-beta.1`.
 - **An alpha names its branch**: each byte of the name but ASCII letters, digits and dashes is a
   dash, `feat/12-search` giving `alpha.feat-12-search.<n>`. CI and its cleanup follow that one
-  rule; `feat/a_b` and `feat/a-b` share their alphas. A force-push with fewer commits gives a
-  lower number.
+  rule; `feat/a_b` and `feat/a-b` share their alphas. A force-push numbers its alpha by the
+  commits it holds: with fewer than before, the number is lower, and `install.sh`, taking the
+  highest, installs a former alpha above it. When that version is already published (as many
+  commits as before, or as few as an earlier push), nothing is published: the release stays the
+  former commit's until a push gives a version not yet published.
 
 `tools/changelog.sh [--at <rev> | <range>]` lists the Angular commits since the last release,
 grouped (breaking changes, features, fixes, performance, other), `- **<scope>**: <subject>`, in
@@ -93,8 +96,9 @@ the commits' own language.
 ## What CI does
 
 `.github/workflows/ci.yml` runs on every pull request, on a push to `main`, `dev`, `feat/**`
-and `fix/**`, and by hand. A newer push cancels the older runs of its ref, but on `dev` and
-`main`.
+and `fix/**`, and by hand. A newer push cancels the older runs of its ref. On `dev` and `main`,
+whose runs publish, a run that started is never cancelled, but one still waiting is, by GitHub,
+when a newer one is queued: its commit gets no build, and the newer run publishes the tip.
 
 - **`verify`**: `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings` and
   `cargo test --locked`, on Rust 1.95. No test opens a window.
@@ -139,8 +143,8 @@ last line, so a download cut short runs nothing. It follows Flottille's `install
 - **Which release**, read from GitHub's API (`/releases/latest`, `/releases/tags/v<version>`,
   `/releases?per_page=100`) with `curl`, `sed`, `awk`, `tr` and `sort`, no `jq`:
   - stable (the default): the latest release;
-  - `--channel beta`: the `-beta.` pre-release **published last**, not the highest version; a
-    draft is never offered;
+  - `--channel beta`: the `-beta.` pre-release **published last** of the 100 newest releases,
+    not the highest version; a draft is never offered;
   - `--channel alpha --branch <name>`: the **highest version** among the branch's alphas,
     `*-alpha.<slug>.<n>` of the 100 newest releases, the slug made as CI makes it and matched
     whole, so `feat-a` never takes `feat-a-b`'s. A branch without one is said.
@@ -178,12 +182,13 @@ shell).
 
 ## What only a real push proves
 
-The version and changelog scripts are run on throwaway repositories, the archive is made from a
-binary, and `install.sh` runs against a fake API. What cannot run off GitHub is the workflows themselves: a `feat/` push publishing
-an alpha, a second one the next beside it; deleting the branch removing them; the first squash
-into `dev` publishing `0.1.0-beta.N`; the first `release` run moving `main` with the workflow's
-token, the pull request shown merged, `ci.yml` started on `main`, `v0.1.0` tagged on the commit
-released and marked latest, its binary starting without Rust; a run from another branch or of a
-commit not on `dev` moving nothing and saying why; GitHub's API answering as `install.sh` reads
-it, and the curl lines installing the stable, a beta and a branch's alpha on a machine without
-Rust, `rature --version` printing each one's version and channel.
+The version and changelog scripts were tried by hand on throwaway repositories, no test of them
+is committed; the archive is made from a binary, and `install.sh` runs against a fake API. What
+cannot run off GitHub is the workflows themselves: a `feat/` push publishing an alpha, a second
+one the next beside it; deleting the branch removing them; the first squash into `dev`
+publishing `0.1.0-beta.N`; the first `release` run moving `main` with the workflow's token, the
+pull request shown merged, `ci.yml` started on `main`, `v0.1.0` tagged on the commit released
+and marked latest, its binary starting without Rust; a run from another branch or of a commit
+not on `dev` moving nothing and saying why; GitHub's API answering as `install.sh` reads it, and
+the curl lines installing the stable, a beta and a branch's alpha on a machine without Rust,
+`rature --version` printing each one's version and channel.
