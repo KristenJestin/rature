@@ -229,6 +229,34 @@ pub fn update(
     fsio::update(&path, edit)
 }
 
+/// Writes a new canvas at `path` ([`fsio::create`]: never over a file there, an
+/// `AlreadyExists` error then), under the lock its path has once made, so that it is not made
+/// while another Rature process writes a canvas there. `Busy` when another holds the lock past
+/// [`PATIENCE`]. Its folder must exist: none is made.
+pub fn create(path: &Path, locks: &Path, text: &str) -> io::Result<Update> {
+    let (Some(folder), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a file is named by its folder and its name",
+        ));
+    };
+    let folder = if folder.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        folder
+    };
+    // The path the canvas will have, links resolved, as `update` names its lock.
+    let path = fs::canonicalize(folder)?.join(name);
+    let Some(_lock) = Lock::take(&lock_path(locks, &path), PATIENCE)? else {
+        return Ok(Update::Busy);
+    };
+    fsio::create(&path, text.as_bytes())?;
+    Ok(Update::Written {
+        before: String::new(),
+        after: text.into(),
+    })
+}
+
 /// The folder of the canvases' locks: `rature` in the user's runtime folder, beside the
 /// socket of the window (in a private folder of the temporary one when there is none).
 pub fn runtime_locks() -> PathBuf {
@@ -242,11 +270,6 @@ pub fn lock_path(locks: &Path, canvas: &Path) -> PathBuf {
         "canvas-{:016x}.lock",
         fnv(canvas.as_os_str().as_bytes())
     ))
-}
-
-/// What a canvas's text is known by: another text, another revision, but by chance.
-pub fn revision(text: &str) -> String {
-    format!("{:016x}", fnv(text.as_bytes()))
 }
 
 /// FNV-1a, 64 bits: the same from one build of Rature to the next, unlike `DefaultHasher`.
@@ -666,10 +689,32 @@ mod tests {
     }
 
     #[test]
-    fn a_revision_is_the_texts_and_lasts_from_one_build_to_the_next() {
-        assert_eq!(revision(""), "cbf29ce484222325");
-        assert_eq!(revision("a"), "af63dc4c8601ec8c");
-        assert_ne!(revision(START), revision(&START.replace('A', "B")));
+    fn a_new_canvas_is_made_under_the_lock_and_never_over_a_file() {
+        let folder = Folder::new("create");
+        let new = folder.0.join("notes/new.canvas");
+        let lock = lock_path(&folder.locks(), &new);
+        let held = Lock::take(&lock, Duration::ZERO).unwrap().unwrap();
+        assert_eq!(
+            create(&new, &folder.locks(), "{}").unwrap(),
+            Update::Busy,
+            "another process writes there"
+        );
+        assert!(!new.exists());
+        drop(held);
+        let text = Canvas::default().write().unwrap();
+        assert!(matches!(
+            create(&new, &folder.locks(), &text).unwrap(),
+            Update::Written { .. }
+        ));
+        assert_eq!(fs::read_to_string(&new).unwrap(), text);
+        // Its lock is the one its writes take.
+        assert_eq!(
+            lock_path(&folder.locks(), &fs::canonicalize(&new).unwrap()),
+            lock
+        );
+        let error = create(&folder.canvas(), &folder.locks(), &text).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(folder.text(), START);
     }
 
     /// Set in the processes the test below starts: the canvas they write, and their name.

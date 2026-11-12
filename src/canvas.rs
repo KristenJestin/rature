@@ -32,6 +32,18 @@ use serde_json::{Map, Number, Value};
 const NODES: &str = "nodes";
 const EDGES: &str = "edges";
 
+/// What a canvas's text is known by, the same from one process and one build to the next:
+/// another text, another revision. FNV-1a on 128 bits, in 32 hexadecimal digits: it tells one
+/// text from another, no more, and is no protection against a text made to collide.
+pub fn revision(text: &str) -> String {
+    const OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
+    const PRIME: u128 = 0x0000000001000000000000000000013B;
+    let hash = text.bytes().fold(OFFSET, |hash, byte| {
+        (hash ^ u128::from(byte)).wrapping_mul(PRIME)
+    });
+    format!("{hash:032x}")
+}
+
 /// A canvas: its nodes in z order, its edges, and the rest of its top-level object.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Canvas {
@@ -238,6 +250,111 @@ impl Canvas {
         out.push('}');
         Ok(out)
     }
+
+    /// Where a new card of this size goes when nobody says: right of `near` (or of all the
+    /// cards), level with its top, then moved down past each card it would meet, until it
+    /// meets none, with [`GAP`] around it. A coordinate is a whole number.
+    pub fn free_place(&self, width: f64, height: f64, near: Option<Rect>) -> (f64, f64) {
+        let cards: Vec<Rect> = self
+            .nodes
+            .iter()
+            .filter_map(Node::rect)
+            .filter(|r| {
+                [r.x, r.y, r.width, r.height].iter().all(|v| v.is_finite())
+                    && r.width >= 0.
+                    && r.height >= 0.
+            })
+            .collect();
+        let Some(anchor) = near.or_else(|| bounds(&cards)) else {
+            return (0., 0.);
+        };
+        let x = (anchor.x + anchor.width + GAP).round();
+        let mut y = anchor.y.round();
+        loop {
+            let card = Rect {
+                x,
+                y,
+                width,
+                height,
+            };
+            // Each turn goes below a card met: below the lowest of them, so it ends.
+            let lowest = cards
+                .iter()
+                .filter(|other| meets(&card, other))
+                .map(|other| other.y + other.height)
+                .fold(None, |low: Option<f64>, bottom| {
+                    Some(low.map_or(bottom, |low| low.max(bottom)))
+                });
+            match lowest {
+                Some(bottom) => y = (bottom + GAP).ceil(),
+                None => return (x, y),
+            }
+        }
+    }
+}
+
+/// The space Rature leaves between a card it places and the others.
+pub const GAP: f64 = 40.;
+
+/// The box around these cards.
+fn bounds(cards: &[Rect]) -> Option<Rect> {
+    let first = cards.first()?;
+    let (mut left, mut top) = (first.x, first.y);
+    let (mut right, mut bottom) = (first.x + first.width, first.y + first.height);
+    for card in cards {
+        left = left.min(card.x);
+        top = top.min(card.y);
+        right = right.max(card.x + card.width);
+        bottom = bottom.max(card.y + card.height);
+    }
+    Some(Rect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    })
+}
+
+/// Whether two cards are closer than [`GAP`], or overlap.
+fn meets(a: &Rect, b: &Rect) -> bool {
+    a.x < b.x + b.width + GAP
+        && b.x < a.x + a.width + GAP
+        && a.y < b.y + b.height + GAP
+        && b.y < a.y + a.height + GAP
+}
+
+/// The size of a new card when nobody says: Obsidian's for a file, a link or a group; for a
+/// text, wide enough for its longest line up to a limit, and tall enough for its lines as they
+/// wrap, up to a limit past which the card scrolls. Whole numbers.
+pub fn default_size(kind: NodeKind<'_>, text: Option<&str>) -> (f64, f64) {
+    /// About the width of a character, and the height of a line, of a card's text at its
+    /// default size; its padding, across and down.
+    const CHAR: f64 = 8.;
+    const LINE: f64 = 26.;
+    const ACROSS: f64 = 48.;
+    const DOWN: f64 = 34.;
+    match kind {
+        NodeKind::Text => {
+            let lines: Vec<usize> = text
+                .unwrap_or_default()
+                .lines()
+                .map(|line| line.chars().count())
+                .collect();
+            let longest = lines.iter().copied().max().unwrap_or(0) as f64;
+            let width = (longest * CHAR + ACROSS).clamp(250., 400.).round();
+            let per_line = ((width - ACROSS) / CHAR).floor().max(1.);
+            let rows: f64 = lines
+                .iter()
+                .map(|&chars| (chars as f64 / per_line).ceil().max(1.))
+                .sum::<f64>()
+                .max(1.);
+            (width, (rows * LINE + DOWN).clamp(60., 600.).round())
+        }
+        NodeKind::File => (400., 400.),
+        NodeKind::Link => (400., 300.),
+        NodeKind::Group => (400., 300.),
+        NodeKind::Other(_) => (250., 60.),
+    }
 }
 
 /// Takes the entries of the list at `key` out of `top`, leaving `null` in its place; what is
@@ -393,7 +510,7 @@ pub enum Color<'a> {
 }
 
 impl<'a> Color<'a> {
-    fn parse(text: &'a str) -> Self {
+    pub(crate) fn parse(text: &'a str) -> Self {
         if let [digit @ b'1'..=b'6'] = text.as_bytes() {
             return Self::Preset(digit - b'0');
         }
@@ -451,6 +568,11 @@ impl Node {
             node.fields.insert(key.into(), integer(value));
         }
         node
+    }
+
+    /// A node of this object: what it holds is not checked.
+    pub(crate) fn from_fields(fields: Map<String, Value>) -> Self {
+        Self { fields }
     }
 
     /// The node's object, as the file has it.
@@ -554,6 +676,11 @@ impl Edge {
         fields.insert("id".into(), id.into());
         fields.insert("fromNode".into(), from.into());
         fields.insert("toNode".into(), to.into());
+        Self { fields }
+    }
+
+    /// An edge of this object: what it holds is not checked.
+    pub(crate) fn from_fields(fields: Map<String, Value>) -> Self {
         Self { fields }
     }
 
@@ -919,6 +1046,18 @@ mod tests {
     }
 
     #[test]
+    fn the_revision_is_fnv1a_128_of_the_text() {
+        // The offset basis, for no byte; and the published value for "a".
+        assert_eq!(revision(""), "6c62272e07bb014262b821756295c58d");
+        assert_eq!(revision("a"), "d228cb696f1a8caf78912b704e4a8964");
+        assert_ne!(revision("{}"), revision("{ }"));
+        assert_ne!(
+            revision(SAMPLE),
+            revision(&SAMPLE.replace("Learn", "learn"))
+        );
+    }
+
+    #[test]
     fn colours_are_presets_or_hex() {
         assert_eq!(Color::parse("1"), Color::Preset(1));
         assert_eq!(Color::parse("#FF8000"), Color::Rgb([255, 128, 0]));
@@ -926,5 +1065,139 @@ mod tests {
         for other in ["7", "0", "#FF800", "#FF80000", "red", "#+F8000", "#éé"] {
             assert_eq!(Color::parse(other), Color::Other(other));
         }
+    }
+
+    /// Cards placed by Rature, at their default size, one after the other, right of a card
+    /// chosen at random or of all of them, on a canvas whose own cards overlap: none meets any
+    /// other card, and each keeps [`GAP`] from them.
+    #[test]
+    fn placed_cards_never_overlap_at_their_default_size() {
+        // A fixed sequence, the same at each run.
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = move |below: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % below
+        };
+        let mut canvas = Canvas::read(SAMPLE);
+        // Overlapping cards of the canvas's own, and one without a place (a plugin's).
+        for n in 0..30 {
+            let rect = Rect {
+                x: (next(1200) as f64) - 600.,
+                y: (next(1200) as f64) - 600.,
+                width: 50. + next(400) as f64,
+                height: 50. + next(400) as f64,
+            };
+            canvas.push_node(Node::new_text(&format!("own{n}"), "", rect));
+        }
+        let mut odd = Map::new();
+        odd.insert("id".into(), "odd".into());
+        odd.insert("type".into(), "shape".into());
+        canvas.push_node(Node::from_fields(odd));
+        let words = [
+            "a",
+            "word",
+            "a longer line of text, with some words in it",
+            "\n",
+        ];
+        let mut placed = Vec::new();
+        for n in 0..300 {
+            let text: String = (0..next(60))
+                .map(|_| words[next(words.len() as u64) as usize])
+                .collect::<Vec<_>>()
+                .join(" ");
+            let kind = [
+                NodeKind::Text,
+                NodeKind::File,
+                NodeKind::Link,
+                NodeKind::Group,
+            ][next(4) as usize];
+            let (width, height) = default_size(kind, Some(&text));
+            let near = match next(3) {
+                0 => None,
+                _ => {
+                    let nodes = canvas.nodes();
+                    nodes[next(nodes.len() as u64) as usize].rect()
+                }
+            };
+            let (x, y) = canvas.free_place(width, height, near);
+            assert_eq!((x.fract(), y.fract()), (0., 0.));
+            let rect = Rect {
+                x,
+                y,
+                width,
+                height,
+            };
+            for other in canvas.nodes().iter().filter_map(Node::rect) {
+                assert!(!meets(&rect, &other), "card {n} {rect:?} meets {other:?}");
+            }
+            canvas.push_node(Node::new_text(&format!("new{n}"), &text, rect));
+            placed.push(rect);
+        }
+        // Strictly apart, as the eye sees them.
+        for (i, a) in placed.iter().enumerate() {
+            for b in &placed[i + 1..] {
+                let overlap = a.x < b.x + b.width
+                    && b.x < a.x + a.width
+                    && a.y < b.y + b.height
+                    && b.y < a.y + a.height;
+                assert!(!overlap, "{a:?} overlaps {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_card_is_placed_right_of_its_neighbour_or_of_everything() {
+        assert_eq!(Canvas::default().free_place(250., 60., None), (0., 0.));
+        let mut canvas = Canvas::default();
+        let a = Rect {
+            x: 0.,
+            y: 0.,
+            width: 100.,
+            height: 50.,
+        };
+        canvas.push_node(Node::new_text("a", "", a));
+        canvas.push_node(Node::new_text(
+            "b",
+            "",
+            Rect {
+                x: 500.,
+                y: -300.,
+                width: 100.,
+                height: 50.,
+            },
+        ));
+        assert_eq!(canvas.free_place(250., 60., Some(a)), (140., 0.));
+        // Right of everything, level with the top.
+        assert_eq!(canvas.free_place(250., 60., None), (640., -300.));
+        // A card in the way: below it.
+        canvas.push_node(Node::new_text(
+            "c",
+            "",
+            Rect {
+                x: 150.,
+                y: -20.,
+                width: 100.,
+                height: 100.,
+            },
+        ));
+        assert_eq!(canvas.free_place(250., 60., Some(a)), (140., 120.));
+    }
+
+    #[test]
+    fn a_texts_default_size_follows_its_length() {
+        assert_eq!(default_size(NodeKind::Text, Some("")), (250., 60.));
+        assert_eq!(default_size(NodeKind::Text, Some("Short")), (250., 60.));
+        let (width, height) = default_size(NodeKind::Text, Some(&"word ".repeat(200)));
+        assert_eq!(width, 400.);
+        assert!(height > 300., "{height}");
+        let (_, five) = default_size(NodeKind::Text, Some("1\n2\n3\n4\n5"));
+        assert!(five > 60. && five < 200., "{five}");
+        assert_eq!(
+            default_size(NodeKind::Text, Some(&"line\n".repeat(500))).1,
+            600.
+        );
+        assert_eq!(default_size(NodeKind::File, None), (400., 400.));
     }
 }

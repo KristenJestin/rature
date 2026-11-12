@@ -15,9 +15,10 @@
 //! A request with the modern `_meta` is served as a modern one even after `initialize`: the
 //! specification lets a server serve both eras in one process.
 //!
-//! The server reads only inside its allowed folders: the folder it starts in and each
+//! The server reads and writes only inside its allowed folders: the folder it starts in and each
 //! `--allow-dir`, canonical, compared component by component; a path is canonicalised (its
-//! links followed) before it is compared, and the file opened is checked again.
+//! links followed) before it is compared, and the file opened is checked again. It writes only
+//! `.canvas` files, by the tools of `mcp_edit`.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -29,12 +30,14 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
-use crate::canvas::{Canvas, Problem};
+use crate::canvas::{Canvas, Problem, revision};
+use crate::mcp_edit;
 
 pub const USAGE: &str = "usage: rature mcp [--allow-dir DIR]...
 
-Serves MCP on stdin and stdout (one JSON-RPC message a line; logs on stderr), with the tool
-canvas_read. It reads only in the folder it starts in and in each DIR given.";
+Serves MCP on stdin and stdout (one JSON-RPC message a line; logs on stderr), with the tools
+canvas_read, canvas_edit and canvas_create. It reads and writes only in the folder it starts
+in and in each DIR given, and writes only .canvas files.";
 
 /// The modern version, served without a handshake.
 const MODERN: &str = "2026-07-28";
@@ -63,12 +66,16 @@ const UNSUPPORTED_VERSION: i64 = -32022;
 /// What `initialize` and `server/discover` tell the model, the order of the calls first.
 const INSTRUCTIONS: &str = "Rature shows JSON Canvas files (.canvas) to the user: boards of cards (nodes of type text, file, link or group) joined by edges. The file is the only truth, and the user may be changing it in Rature meanwhile.
 - Read a canvas with canvas_read before working on it. Each node and edge has an `id`: name them by it, never by their place in the list.
+- Change it with canvas_edit: operations by id, applied in order, all or none. Each touches only the fields it names, replayed on the file as it is when it is written, so what the user changed elsewhere stays. Give `if_revision` (canvas_read's `revision`) to be refused if the file changed since.
+- To correct words in a card, prefer `replace: {old, new}` to a whole `text`: it changes them only if they are in the text once, and keeps what the user typed around them.
+- Let Rature place new cards: leave out x and y (and the size), with `near` to put a card beside another; Rature puts it where it overlaps no card.
+- Make a new canvas with canvas_create; it never writes over a file.
 - The order of `nodes` is the drawing order: the first is drawn below the others.
 - `revision` is a hash of the file's text: another one means the file changed since.
 - A canvas too large to be given whole comes as a summary (each card's first line) with `truncated: true`: then read the cards you need with `ids`.
-- A canvas with flaws (a duplicate id, an edge to a missing node) comes with `problems`.
-- A path is relative to the folder the server started in, or absolute; it must be inside the folders the server may read.
-- An error ends with its code in brackets ([not_found], [invalid], [not_a_canvas], [outside], [io]) and says what to do.";
+- A canvas with flaws (a duplicate id, an edge to a missing node) comes with `problems`, and cannot be changed until it is mended.
+- A path is relative to the folder the server started in, or absolute; it must be inside the folders the server may use.
+- An error ends with its code in brackets ([not_found], [invalid], [not_a_canvas], [outside], [io], [stale], [busy], [exists]) and says what to do.";
 
 /// Runs the server on the arguments after `mcp`, until stdin ends; the process's exit code.
 pub fn main(args: impl Iterator<Item = OsString>) -> i32 {
@@ -98,7 +105,7 @@ pub fn main(args: impl Iterator<Item = OsString>) -> i32 {
         }
     };
     eprintln!(
-        "rature mcp: reading in {}",
+        "rature mcp: reading and writing in {}",
         folders
             .allowed
             .iter()
@@ -124,10 +131,10 @@ fn usage(what: &str) -> i32 {
     2
 }
 
-/// The folders the server reads in, canonical.
-struct Folders {
+/// The folders the server reads and writes in, canonical.
+pub(crate) struct Folders {
     /// Where a relative path starts: the folder the server started in.
-    start: PathBuf,
+    pub(crate) start: PathBuf,
     /// `start`, then each `--allow-dir`, each once.
     allowed: Vec<PathBuf>,
 }
@@ -171,7 +178,7 @@ impl Folders {
         Err(ToolError::new(
             "outside",
             format!(
-                "{asked}{} is outside the folders this server may read: {}. Give a path inside one of them, or start `rature mcp` again with `--allow-dir DIR` to add one.",
+                "{asked}{} is outside the folders this server may use: {}. Give a path inside one of them, or start `rature mcp` again with `--allow-dir DIR` to add one.",
                 leads(asked, real),
                 self.list()
             ),
@@ -190,8 +197,12 @@ impl Folders {
     /// inside the folders. A path that does not exist is placed by the deepest folder above it
     /// that does: outside, it is said to be; inside, the system's error is.
     fn resolve(&self, asked: &str) -> Result<PathBuf, ToolError> {
-        let path = self.start.join(asked);
-        match fs::canonicalize(&path) {
+        self.resolve_path(&self.start.join(asked), asked)
+    }
+
+    /// [`Folders::resolve`] of `path`, which `asked` names.
+    fn resolve_path(&self, path: &Path, asked: &str) -> Result<PathBuf, ToolError> {
+        match fs::canonicalize(path) {
             Ok(real) => {
                 self.check(&real, asked)?;
                 Ok(real)
@@ -209,11 +220,11 @@ impl Folders {
         }
     }
 
-    /// The text of the canvas file at `asked`, read only when it is a regular `.canvas` file
-    /// inside the folders.
-    fn read_canvas(&self, asked: &str) -> Result<String, ToolError> {
+    /// The canonical path of the canvas file at `asked`, when it is a regular `.canvas` file
+    /// inside the folders: the only kind of file the server reads as a canvas, or writes.
+    pub(crate) fn canvas_file(&self, asked: &str) -> Result<PathBuf, ToolError> {
         let real = self.resolve(asked)?;
-        if real.extension().and_then(|e| e.to_str()) != Some("canvas") {
+        if !is_canvas(&real) {
             return Err(ToolError::new(
                 "invalid",
                 format!(
@@ -227,6 +238,54 @@ impl Folders {
         if !meta.is_file() {
             return Err(not_a_file(asked, &meta));
         }
+        Ok(real)
+    }
+
+    /// The canonical path a new canvas at `asked` would have: a `.canvas` name in a folder that
+    /// exists inside the folders (none is made), where nothing is yet.
+    pub(crate) fn new_canvas_file(&self, asked: &str) -> Result<PathBuf, ToolError> {
+        let path = self.start.join(asked);
+        let (Some(folder), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(ToolError::invalid(format!(
+                "`path` must name a .canvas file, and {asked} does not."
+            )));
+        };
+        if !is_canvas(Path::new(name)) {
+            return Err(ToolError::invalid(format!(
+                "`path` must name a .canvas file, and {asked} does not."
+            )));
+        }
+        let folder = self.resolve_path(folder, asked).map_err(|error| {
+            if error.code != "io" {
+                return error;
+            }
+            ToolError::new(
+                "io",
+                format!(
+                    "The folder of {asked}, {}, cannot be used: {}. canvas_create makes no folder: give a path in a folder that exists.",
+                    folder.display(),
+                    error.cause
+                ),
+            )
+        })?;
+        if !folder.is_dir() {
+            return Err(ToolError::invalid(format!(
+                "`path` must name a .canvas file in a folder, and {} is not a folder.",
+                folder.display()
+            )));
+        }
+        let real = folder.join(name);
+        // A link is something there too, even one to nothing.
+        if fs::symlink_metadata(&real).is_ok() {
+            return Err(exists(asked));
+        }
+        Ok(real)
+    }
+
+    /// The text of the canvas file at `asked`, read only when it is a regular `.canvas` file
+    /// inside the folders.
+    fn read_canvas(&self, asked: &str) -> Result<String, ToolError> {
+        let real = self.canvas_file(asked)?;
         let mut file = File::open(&real).map_err(|error| ToolError::io(asked, &error))?;
         // What was opened, rather than what the path led to a moment before: a folder on the
         // way may have been swapped for a link since.
@@ -254,6 +313,19 @@ impl Folders {
     }
 }
 
+fn is_canvas(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("canvas")
+}
+
+pub(crate) fn exists(asked: &str) -> ToolError {
+    ToolError::new(
+        "exists",
+        format!(
+            "{asked} exists already: change it with canvas_edit (read it first with canvas_read), or give another path."
+        ),
+    )
+}
+
 fn leads(asked: &str, real: &Path) -> String {
     if Path::new(asked) == real {
         String::new()
@@ -276,28 +348,42 @@ fn not_a_file(asked: &str, meta: &fs::Metadata) -> ToolError {
 
 /// A tool's failure: one sentence saying what to do, and its code.
 #[derive(Debug)]
-struct ToolError {
-    code: &'static str,
+pub(crate) struct ToolError {
+    pub(crate) code: &'static str,
     message: String,
+    /// For an `io` error, the system's own words.
+    cause: String,
 }
 
 impl ToolError {
-    fn new(code: &'static str, message: String) -> Self {
-        Self { code, message }
+    pub(crate) fn new(code: &'static str, message: String) -> Self {
+        Self {
+            code,
+            message,
+            cause: String::new(),
+        }
     }
 
-    fn invalid(message: String) -> Self {
+    pub(crate) fn invalid(message: String) -> Self {
         Self::new("invalid", message)
     }
 
     fn io(asked: &str, error: &io::Error) -> Self {
+        Self::io_doing(asked, "read", error)
+    }
+
+    /// The system's error, met while doing this (`read`, `written`) to `asked`.
+    pub(crate) fn io_doing(asked: &str, doing: &str, error: &io::Error) -> Self {
         let hint = match error.kind() {
             io::ErrorKind::NotFound => {
                 " Check the path: it is relative to the folder the server started in, or absolute."
             }
             _ => "",
         };
-        Self::new("io", format!("{asked} cannot be read: {error}.{hint}"))
+        Self {
+            cause: error.to_string(),
+            ..Self::new("io", format!("{asked} cannot be {doing}: {error}.{hint}"))
+        }
     }
 }
 
@@ -575,7 +661,14 @@ fn tools_list(params: &Map<String, Value>) -> Result<Map<String, Value>, RpcErro
         ));
     }
     let mut result = Map::new();
-    result.insert("tools".into(), json!([canvas_read_tool()]));
+    result.insert(
+        "tools".into(),
+        json!([
+            canvas_read_tool(),
+            mcp_edit::canvas_edit_tool(),
+            mcp_edit::canvas_create_tool()
+        ]),
+    );
     Ok(result)
 }
 
@@ -587,10 +680,7 @@ fn canvas_read_tool() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "The .canvas file: relative to the folder the server started in, or absolute. It must be inside the folders the server may read.",
-                },
+                "path": path_schema("The .canvas file"),
                 "ids": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -651,6 +741,14 @@ fn canvas_read_tool() -> Value {
     })
 }
 
+/// The schema of a tool's `path`, `what` saying what it names.
+pub(crate) fn path_schema(what: &str) -> Value {
+    json!({
+        "type": "string",
+        "description": format!("{what}: relative to the folder the server started in, or absolute. It must be inside the folders the server may use."),
+    })
+}
+
 /// `tools/call`: an unknown tool or a malformed request is a JSON-RPC error; a tool's failure
 /// is a result with `isError`, which the model reads.
 fn tools_call(folders: &Folders, params: &Map<String, Value>) -> Result<Value, RpcError> {
@@ -673,6 +771,8 @@ fn tools_call(folders: &Folders, params: &Map<String, Value>) -> Result<Value, R
     };
     let outcome = match name {
         "canvas_read" => canvas_read(folders, arguments),
+        "canvas_edit" => mcp_edit::canvas_edit(folders, arguments),
+        "canvas_create" => mcp_edit::canvas_create(folders, arguments),
         _ => {
             return Err(RpcError::new(
                 INVALID_PARAMS,
@@ -693,29 +793,49 @@ fn tools_call(folders: &Folders, params: &Map<String, Value>) -> Result<Value, R
     })
 }
 
-fn canvas_read(folders: &Folders, arguments: &Map<String, Value>) -> Result<Value, ToolError> {
-    if let Some(key) = arguments
+/// Refuses an argument `tool` does not take; `takes` says those it does.
+pub(crate) fn only(
+    arguments: &Map<String, Value>,
+    tool: &str,
+    allowed: &[&str],
+    takes: &str,
+) -> Result<(), ToolError> {
+    match arguments
         .keys()
-        .find(|key| !["path", "ids", "text"].contains(&key.as_str()))
+        .find(|key| !allowed.contains(&key.as_str()))
     {
-        return Err(ToolError::invalid(format!(
-            "`{key}` is not an argument of canvas_read, which takes `path`, `ids` and `text`."
-        )));
+        Some(key) => Err(ToolError::invalid(format!(
+            "`{key}` is not an argument of {tool}, which takes {takes}."
+        ))),
+        None => Ok(()),
     }
-    let path = match arguments.get("path") {
-        Some(Value::String(path)) if !path.is_empty() => path.as_str(),
-        None | Some(Value::Null | Value::String(_)) => {
-            return Err(ToolError::invalid(format!(
-                "`path` is required: the .canvas file, relative to {} or absolute.",
-                folders.start.display()
-            )));
-        }
-        Some(other) => {
-            return Err(ToolError::invalid(format!(
-                "`path` must be a string, not {other}."
-            )));
-        }
-    };
+}
+
+/// The `path` argument, required.
+pub(crate) fn path_argument<'a>(
+    folders: &Folders,
+    arguments: &'a Map<String, Value>,
+) -> Result<&'a str, ToolError> {
+    match arguments.get("path") {
+        Some(Value::String(path)) if !path.is_empty() => Ok(path.as_str()),
+        None | Some(Value::Null | Value::String(_)) => Err(ToolError::invalid(format!(
+            "`path` is required: the .canvas file, relative to {} or absolute.",
+            folders.start.display()
+        ))),
+        Some(other) => Err(ToolError::invalid(format!(
+            "`path` must be a string, not {other}."
+        ))),
+    }
+}
+
+fn canvas_read(folders: &Folders, arguments: &Map<String, Value>) -> Result<Value, ToolError> {
+    only(
+        arguments,
+        "canvas_read",
+        &["path", "ids", "text"],
+        "`path`, `ids` and `text`",
+    )?;
+    let path = path_argument(folders, arguments)?;
     let ids: Option<Vec<&str>> = match arguments.get("ids") {
         None | Some(Value::Null) => None,
         Some(Value::Array(ids)) => Some(
@@ -855,29 +975,9 @@ fn first_line(text: &mut String) {
     }
 }
 
-/// A hash of a file's text, the same from one process and one build to the next: FNV-1a on
-/// 128 bits, in 32 hexadecimal digits. It tells one text from another, no more: it is no
-/// protection against a text made to collide.
-pub fn revision(text: &str) -> String {
-    const OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
-    const PRIME: u128 = 0x0000000001000000000000000000013B;
-    let hash = text.bytes().fold(OFFSET, |hash, byte| {
-        (hash ^ u128::from(byte)).wrapping_mul(PRIME)
-    });
-    format!("{hash:032x}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_revision_is_fnv1a_128() {
-        // The offset basis, for no byte; and the published value for "a".
-        assert_eq!(revision(""), "6c62272e07bb014262b821756295c58d");
-        assert_eq!(revision("a"), "d228cb696f1a8caf78912b704e4a8964");
-        assert_ne!(revision("{}"), revision("{ }"));
-    }
 
     #[test]
     fn a_folder_holds_its_own_paths_only() {

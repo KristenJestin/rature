@@ -39,7 +39,8 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 | File | What it is |
 |---|---|
 | `main.rs` | The entry: arguments (`--help`, `--version`, `mcp`), the hand-over to a running window, leaving the terminal, starting the window |
-| `mcp.rs` | `rature mcp`: an MCP server on stdin and stdout, both eras (2026-07-28 stateless, 2025-11-25 with `initialize`), reading canvases only inside its allowed folders; no window |
+| `mcp.rs` | `rature mcp`: an MCP server on stdin and stdout, both eras (2026-07-28 stateless, 2025-11-25 with `initialize`), `canvas_read`, reading and writing only inside its allowed folders; no window |
+| `mcp_edit.rs` | `canvas_edit` and `canvas_create`: a call's operations checked, then applied all or none on the disk's canvas under its lock, written once through `canvas_board` |
 | `instance.rs` | One window per user: a second `rature` hands its file to the running one over a socket in the runtime folder, and exits |
 | `workspace.rs` | The window: the reader, a folder's tree beside it, and the picker over them |
 | `reader.rs` | The file being read: what it shows, where the reading stands, what changed, the search inside it, the block being edited |
@@ -49,9 +50,9 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 | `table.rs` | A Markdown table edited in place, cell by cell, rows and columns added and deleted |
 | `list.rs` | A Markdown list edited in place, line by line beside its markers |
 | `formats.rs` | What a file is shown as: Markdown, data (JSON, YAML) as a folding tree, CSV as a table, an image, or code |
-| `canvas.rs` | JSON Canvas 1.0 (Obsidian's `.canvas`), read and written without losing anything: unknown fields, key order and node order kept |
+| `canvas.rs` | JSON Canvas 1.0 (Obsidian's `.canvas`), read and written without losing anything: unknown fields, key order and node order kept; a text's revision; where a new card goes, and its default size |
 | `canvas_ops.rs` | Operations on a canvas by id, replayed on the disk's canvas with a field-by-field three-way merge (the disk wins a conflict), and their inverses for undo |
-| `canvas_board.rs` | A canvas being edited: pending operations, undo and redo, each write the disk's text read again and the operations replayed on it, under a lock per canvas in the runtime folder; a text's revision |
+| `canvas_board.rs` | A canvas being edited: pending operations, undo and redo, each write the disk's text read again and the operations replayed on it, under a lock per canvas in the runtime folder; a new canvas made under the same lock |
 | `format.rs` | Formatting on the user's own save (`Ctrl-s`), never on a change made from outside |
 | `load.rs` | Reading a file off the main thread: reading, parsing, formulas, link checks, the comparison; only the latest request's result is kept |
 | `cache.rs` | Results worked out off the main thread (a diagram, a code block's colours), keyed by their source: pending, done or failed |

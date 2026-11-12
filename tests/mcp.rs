@@ -307,9 +307,9 @@ fn the_legacy_era_initializes_pings_and_lists_its_tool() {
     let list = result(&answers, 2);
     assert!(list.get("ttlMs").is_none());
     let tools = list["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 1);
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["canvas_read", "canvas_edit", "canvas_create"]);
     let tool = &tools[0];
-    assert_eq!(tool["name"], "canvas_read");
     assert_eq!(tool["inputSchema"]["type"], "object");
     assert_eq!(tool["inputSchema"]["required"], json!(["path"]));
     assert_eq!(
@@ -793,4 +793,991 @@ fn the_server_ends_when_stdin_does() {
     let (out, _, status) = place.run(&[], &[]);
     assert!(status.success());
     assert_eq!(out, "");
+}
+
+// canvas_edit and canvas_create.
+
+impl Place {
+    /// A tool's result, called in the modern era.
+    fn call(&self, args: &[&str], tool: &str, arguments: Value) -> Value {
+        let answers = self.session(
+            args,
+            &[modern(
+                1,
+                "tools/call",
+                json!({"name": tool, "arguments": arguments}),
+            )],
+        );
+        assert_eq!(answers.len(), 1, "{answers:?}");
+        result(&answers, 1).clone()
+    }
+
+    /// The structured output of a call that worked.
+    fn done(&self, tool: &str, arguments: Value) -> Value {
+        let result = self.call(&[], tool, arguments);
+        assert_eq!(result["isError"], false, "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(text).unwrap(),
+            result["structuredContent"]
+        );
+        let output = result["structuredContent"].clone();
+        for key in ["revision", "created", "changed", "deleted"] {
+            assert!(output.get(key).is_some(), "{key}: {output}");
+        }
+        output
+    }
+
+    fn edit(&self, path: &str, ops: Value) -> Value {
+        self.done("canvas_edit", json!({"path": path, "ops": ops}))
+    }
+
+    /// The text of a call that failed, which ends with `[code]`.
+    fn refused_with(&self, args: &[&str], tool: &str, arguments: Value, code: &str) -> String {
+        let result = self.call(args, tool, arguments);
+        assert_eq!(result["isError"], true, "{result}");
+        assert!(result.get("structuredContent").is_none(), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap().to_owned();
+        assert!(text.ends_with(&format!(" [{code}]")), "{text}");
+        text
+    }
+
+    fn refused(&self, tool: &str, arguments: Value, code: &str) -> String {
+        self.refused_with(&[], tool, arguments, code)
+    }
+
+    /// `canvas_edit` refused: the file is left byte for byte.
+    fn edit_refused(&self, path: &str, ops: Value, code: &str) -> String {
+        let file = self.work().join(path);
+        let before = fs::read(&file).unwrap();
+        let text = self.refused("canvas_edit", json!({"path": path, "ops": ops}), code);
+        assert_eq!(fs::read(&file).unwrap(), before, "written: {text}");
+        text
+    }
+
+    /// The canvas at `relative` in `work`, as JSON.
+    fn canvas(&self, relative: &str) -> Value {
+        serde_json::from_str(&fs::read_to_string(self.work().join(relative)).unwrap()).unwrap()
+    }
+}
+
+/// The node or edge with this id.
+fn by_id<'a>(list: &'a Value, id: &str) -> &'a Value {
+    list.as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == id)
+        .unwrap_or_else(|| panic!("no {id} in {list}"))
+}
+
+fn created<'a>(output: &'a Value, name: &str) -> &'a str {
+    output["created"][name]
+        .as_str()
+        .unwrap_or_else(|| panic!("{name} not created: {output}"))
+}
+
+/// The cards of a canvas: none overlaps another.
+fn assert_apart(canvas: &Value) {
+    let rects: Vec<(f64, f64, f64, f64, &str)> = canvas["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| {
+            let f = |k: &str| n[k].as_f64().unwrap();
+            (
+                f("x"),
+                f("y"),
+                f("width"),
+                f("height"),
+                n["id"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    for (i, a) in rects.iter().enumerate() {
+        for b in &rects[i + 1..] {
+            let overlap = a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3;
+            assert!(!overlap, "{} overlaps {}: {canvas}", a.4, b.4);
+        }
+    }
+}
+
+const THREE: &str = r#"{"nodes":[{"id":"a","type":"text","text":"Alpha beta","x":0,"y":0,"width":250,"height":60,"zz":1},{"id":"f","type":"file","file":"notes.md","x":300,"y":0,"width":400,"height":400},{"id":"g","type":"group","label":"G","x":-50,"y":-50,"width":800,"height":500}],"edges":[{"id":"af","fromNode":"a","toNode":"f"},{"id":"ag","fromNode":"a","toNode":"g","label":"in"}],"meta":{"by":"test"}}"#;
+
+#[test]
+fn the_writing_tools_are_listed_with_their_hints() {
+    let place = Place::new("write-list");
+    let answers = place.session(&[], &[modern(1, "tools/list", json!({}))]);
+    let tools = result(&answers, 1)["tools"].as_array().unwrap().clone();
+    let edit = &tools[1];
+    assert_eq!(edit["name"], "canvas_edit");
+    assert_eq!(edit["inputSchema"]["required"], json!(["path", "ops"]));
+    assert_eq!(
+        edit["annotations"],
+        json!({"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false})
+    );
+    let create = &tools[2];
+    assert_eq!(create["name"], "canvas_create");
+    assert_eq!(create["annotations"]["destructiveHint"], false);
+    assert_eq!(create["annotations"]["readOnlyHint"], false);
+    for tool in [edit, create] {
+        assert_eq!(
+            tool["outputSchema"]["required"],
+            json!(["revision", "created", "changed", "deleted"])
+        );
+    }
+    let answers = place.session(&[], &[modern(2, "server/discover", json!({}))]);
+    let instructions = result(&answers, 2)["instructions"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for says in [
+        "canvas_edit",
+        "replace",
+        "Let Rature place",
+        "[stale]",
+        "[busy]",
+        "[exists]",
+    ] {
+        assert!(instructions.contains(says), "{says}");
+    }
+}
+
+#[test]
+fn add_node_adds_each_type_of_card_and_add_edge_joins_them_by_ref() {
+    let place = Place::new("add");
+    place.write("work/a.canvas", THREE);
+    let output = place.edit(
+        "a.canvas",
+        json!([
+            {"op": "add_node", "ref": "t", "type": "text", "text": "# New\n\nA card.", "color": "4"},
+            {"op": "add_node", "ref": "file", "type": "file", "file": "notes.md", "subpath": "#Part", "near": "t"},
+            {"op": "add_node", "ref": "l", "type": "link", "url": "https://example.org", "x": 2000.4, "y": -10, "width": 300, "height": 200},
+            {"op": "add_node", "type": "group", "label": "Later"},
+            {"op": "add_edge", "ref": "e", "from": "t", "to": "a", "fromSide": "left", "toSide": "right", "toEnd": "none", "label": "see", "color": "#00FF80"},
+            {"op": "add_edge", "from": "file", "to": "l"}
+        ]),
+    );
+    let t = created(&output, "t");
+    let file = created(&output, "file");
+    let l = created(&output, "l");
+    let group = created(&output, "ops[3]");
+    let e = created(&output, "e");
+    let fl = created(&output, "ops[5]");
+    for id in [t, file, l, group, e, fl] {
+        assert_eq!(id.len(), 16, "{id}");
+    }
+    assert_eq!(output["changed"], json!([]));
+    assert_eq!(output["deleted"], json!([]));
+
+    let canvas = place.canvas("a.canvas");
+    let card = by_id(&canvas["nodes"], t);
+    assert_eq!(card["type"], "text");
+    assert_eq!(card["text"], "# New\n\nA card.");
+    assert_eq!(card["color"], "4");
+    // Right of all the cards: the group reaches 750.
+    assert!(card["x"].as_f64().unwrap() >= 750., "{card}");
+    let keys: Vec<&str> = card
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        ["id", "type", "text", "x", "y", "width", "height", "color"]
+    );
+    let file_card = by_id(&canvas["nodes"], file);
+    assert_eq!(file_card["file"], "notes.md");
+    assert_eq!(file_card["subpath"], "#Part");
+    // Right of its neighbour.
+    assert!(
+        file_card["x"].as_f64().unwrap()
+            > card["x"].as_f64().unwrap() + card["width"].as_f64().unwrap()
+    );
+    let link = by_id(&canvas["nodes"], l);
+    assert_eq!(link["url"], "https://example.org");
+    assert_eq!(
+        (link["x"].clone(), link["y"].clone()),
+        (json!(2000), json!(-10))
+    );
+    assert_eq!(
+        (link["width"].clone(), link["height"].clone()),
+        (json!(300), json!(200))
+    );
+    assert_eq!(by_id(&canvas["nodes"], group)["label"], "Later");
+    let edge = by_id(&canvas["edges"], e);
+    assert_eq!(
+        edge,
+        &json!({"id": e, "fromNode": t, "fromSide": "left", "toNode": "a", "toSide": "right", "toEnd": "none", "color": "#00FF80", "label": "see"})
+    );
+    assert_eq!(
+        by_id(&canvas["edges"], fl),
+        &json!({"id": fl, "fromNode": file, "toNode": l})
+    );
+    // New cards on top, in order; what Rature does not know kept.
+    let ids: Vec<&str> = ids(&canvas["nodes"]);
+    assert_eq!(ids, ["a", "f", "g", t, file, l, group]);
+    assert_eq!(canvas["meta"], json!({"by": "test"}));
+    assert_eq!(by_id(&canvas["nodes"], "a")["zz"], 1);
+    // The revision given is the file's, as canvas_read gives it.
+    let read = place.output(&[], json!({"path": "a.canvas"}));
+    assert_eq!(read["revision"], output["revision"]);
+    // Written as Rature writes a canvas: one card a line.
+    let text = fs::read_to_string(place.work().join("a.canvas")).unwrap();
+    assert!(
+        text.starts_with("{\n\t\"nodes\":[\n\t\t{\"id\":\"a\""),
+        "{text}"
+    );
+}
+
+#[test]
+fn canvas_edit_is_served_in_the_legacy_era_too() {
+    let place = Place::new("edit-legacy");
+    place.write("work/a.canvas", THREE);
+    let answers = place.session(
+        &[],
+        &[
+            initialize("2025-11-25"),
+            initialized(),
+            legacy(
+                1,
+                "tools/call",
+                json!({"name": "canvas_edit", "arguments": {"path": "a.canvas", "ops": [{"op": "update_node", "id": "a", "x": 5}]}}),
+            ),
+        ],
+    );
+    let result = result(&answers, 1);
+    assert_eq!(result["isError"], false, "{result}");
+    assert_eq!(result["structuredContent"]["changed"], json!(["a"]));
+    assert_eq!(by_id(&place.canvas("a.canvas")["nodes"], "a")["x"], 5);
+}
+
+#[test]
+fn update_node_sets_only_the_fields_it_names() {
+    let place = Place::new("update");
+    place.write("work/a.canvas", THREE);
+    let output = place.edit(
+        "a.canvas",
+        json!([
+            {"op": "update_node", "id": "a", "x": 10.6, "color": "#ABCDEF"},
+            {"op": "update_node", "id": "f", "width": 420, "height": 380, "file": "other.md", "subpath": "#Top"},
+            {"op": "update_node", "id": "g", "label": null, "y": -60},
+            // Nothing changes: not said to be changed.
+            {"op": "update_node", "id": "a", "text": "Alpha beta"}
+        ]),
+    );
+    assert_eq!(output["changed"], json!(["a", "f", "g"]));
+    let canvas = place.canvas("a.canvas");
+    let a = by_id(&canvas["nodes"], "a");
+    assert_eq!((a["x"].clone(), a["y"].clone()), (json!(11), json!(0)));
+    assert_eq!(a["color"], "#ABCDEF");
+    assert_eq!(a["text"], "Alpha beta");
+    assert_eq!(a["zz"], 1);
+    let f = by_id(&canvas["nodes"], "f");
+    assert_eq!(
+        (f["width"].clone(), f["height"].clone()),
+        (json!(420), json!(380))
+    );
+    assert_eq!(
+        (f["file"].clone(), f["subpath"].clone()),
+        (json!("other.md"), json!("#Top"))
+    );
+    let g = by_id(&canvas["nodes"], "g");
+    assert!(g.get("label").is_none(), "{g}");
+    assert_eq!(g["y"], -60);
+    // The colour removed.
+    let output = place.edit(
+        "a.canvas",
+        json!([{"op": "update_node", "id": "a", "color": null}]),
+    );
+    assert_eq!(output["changed"], json!(["a"]));
+    assert!(
+        by_id(&place.canvas("a.canvas")["nodes"], "a")
+            .get("color")
+            .is_none()
+    );
+
+    // A link card's address, a text card's text.
+    place.write("work/b.canvas", r#"{"nodes":[{"id":"l","type":"link","url":"https://a.example","x":0,"y":0,"width":400,"height":300},{"id":"t","type":"text","text":"x","x":500,"y":0,"width":250,"height":60}],"edges":[]}"#);
+    place.edit(
+        "b.canvas",
+        json!([
+            {"op": "update_node", "id": "l", "url": "https://b.example"},
+            {"op": "update_node", "id": "t", "text": "y"}
+        ]),
+    );
+    let canvas = place.canvas("b.canvas");
+    assert_eq!(by_id(&canvas["nodes"], "l")["url"], "https://b.example");
+    assert_eq!(by_id(&canvas["nodes"], "t")["text"], "y");
+
+    // A field of another type of card.
+    for (op, says) in [
+        (
+            json!({"op": "update_node", "id": "a", "url": "https://x.example"}),
+            "`url` is a field of a link card, and a is a text card",
+        ),
+        (
+            json!({"op": "update_node", "id": "f", "text": "x"}),
+            "`text` is a field of a text card",
+        ),
+        (
+            json!({"op": "update_node", "id": "a", "label": "x"}),
+            "group card",
+        ),
+        (
+            json!({"op": "update_node", "id": "g", "replace": {"old": "G", "new": "H"}}),
+            "`replace` changes a text card's text",
+        ),
+    ] {
+        let text = place.edit_refused("a.canvas", json!([op]), "invalid");
+        assert!(text.contains(says), "{text}");
+        assert!(text.starts_with("ops[0] (update_node): "), "{text}");
+    }
+}
+
+#[test]
+fn replace_changes_words_only_when_they_are_there_once() {
+    let place = Place::new("replace");
+    place.write("work/a.canvas", THREE);
+    let output = place.edit(
+        "a.canvas",
+        json!([{"op": "update_node", "id": "a", "replace": {"old": "beta", "new": "gamma"}}]),
+    );
+    assert_eq!(output["changed"], json!(["a"]));
+    assert_eq!(
+        by_id(&place.canvas("a.canvas")["nodes"], "a")["text"],
+        "Alpha gamma"
+    );
+    // Not there any more: the user changed it.
+    let text = place.edit_refused(
+        "a.canvas",
+        json!([{"op": "update_node", "id": "a", "replace": {"old": "beta", "new": "delta"}}]),
+        "not_found",
+    );
+    assert!(text.contains("is not in the text of a"), "{text}");
+    // There twice, or more.
+    let text = place.edit_refused(
+        "a.canvas",
+        json!([{"op": "update_node", "id": "a", "replace": {"old": "a", "new": "o"}}]),
+        "invalid",
+    );
+    assert!(text.contains("more than once"), "{text}");
+    let text = place.edit_refused(
+        "a.canvas",
+        json!([{"op": "update_node", "id": "a", "text": "x", "replace": {"old": "Alpha", "new": "o"}}]),
+        "invalid",
+    );
+    assert!(text.contains("not both"), "{text}");
+    // `new` empty deletes the words.
+    place.edit(
+        "a.canvas",
+        json!([{"op": "update_node", "id": "a", "replace": {"old": " gamma", "new": ""}}]),
+    );
+    assert_eq!(
+        by_id(&place.canvas("a.canvas")["nodes"], "a")["text"],
+        "Alpha"
+    );
+}
+
+#[test]
+fn delete_node_takes_its_edges_and_delete_edge_one_edge() {
+    let place = Place::new("delete");
+    place.write("work/a.canvas", THREE);
+    let output = place.edit(
+        "a.canvas",
+        json!([
+            {"op": "update_node", "id": "g", "x": 0},
+            {"op": "delete_node", "id": "g"}
+        ]),
+    );
+    assert_eq!(output["deleted"], json!(["g", "ag"]));
+    assert_eq!(output["changed"], json!([]), "changed, then deleted");
+    let canvas = place.canvas("a.canvas");
+    assert_eq!(ids(&canvas["nodes"]), ["a", "f"]);
+    assert_eq!(ids(&canvas["edges"]), ["af"]);
+    let output = place.edit("a.canvas", json!([{"op": "delete_edge", "id": "af"}]));
+    assert_eq!(output["deleted"], json!(["af"]));
+    let canvas = place.canvas("a.canvas");
+    assert_eq!(ids(&canvas["nodes"]), ["a", "f"]);
+    assert_eq!(canvas["edges"], json!([]));
+    // Deleted: not found after.
+    let text = place.edit_refused(
+        "a.canvas",
+        json!([{"op": "delete_node", "id": "g"}]),
+        "not_found",
+    );
+    assert!(text.contains("no node has the id g"), "{text}");
+    let text = place.edit_refused(
+        "a.canvas",
+        json!([{"op": "delete_edge", "id": "af"}]),
+        "not_found",
+    );
+    assert!(text.contains("no edge has the id af"), "{text}");
+    // A node is not an edge, nor the other way.
+    let text = place.edit_refused(
+        "a.canvas",
+        json!([{"op": "delete_edge", "id": "a"}]),
+        "invalid",
+    );
+    assert!(text.contains("a node, and takes an edge"), "{text}");
+}
+
+#[test]
+fn update_edge_sets_its_fields_and_never_an_end_to_no_node() {
+    let place = Place::new("update-edge");
+    place.write("work/a.canvas", THREE);
+    let output = place.edit(
+        "a.canvas",
+        json!([
+            {"op": "add_node", "ref": "n", "type": "text", "text": "N"},
+            {"op": "update_edge", "id": "af", "to": "n", "fromEnd": "arrow", "color": "2"},
+            {"op": "update_edge", "id": "ag", "label": null, "from": "f"}
+        ]),
+    );
+    let n = created(&output, "n");
+    assert_eq!(output["changed"], json!(["af", "ag"]));
+    let canvas = place.canvas("a.canvas");
+    assert_eq!(
+        by_id(&canvas["edges"], "af"),
+        &json!({"id": "af", "fromNode": "a", "toNode": n, "fromEnd": "arrow", "color": "2"})
+    );
+    assert_eq!(
+        by_id(&canvas["edges"], "ag"),
+        &json!({"id": "ag", "fromNode": "f", "toNode": "g"})
+    );
+    // An end to no node, or to an edge: refused, nothing written.
+    let text = place.edit_refused(
+        "a.canvas",
+        json!([{"op": "update_edge", "id": "af", "to": "zzz"}]),
+        "not_found",
+    );
+    assert!(text.contains("`to`: no node has the id zzz"), "{text}");
+    let text = place.edit_refused(
+        "a.canvas",
+        json!([{"op": "update_edge", "id": "af", "from": "ag"}]),
+        "invalid",
+    );
+    assert!(text.contains("an edge, and takes a node"), "{text}");
+    let text = place.edit_refused(
+        "a.canvas",
+        json!([{"op": "update_edge", "id": "af", "from": null}]),
+        "invalid",
+    );
+    assert!(text.contains("cannot be removed"), "{text}");
+    let text = place.edit_refused(
+        "a.canvas",
+        json!([{"op": "add_edge", "from": "a", "to": "nope"}]),
+        "not_found",
+    );
+    assert!(text.contains("nope"), "{text}");
+    // A node deleted earlier in the call is no end.
+    let text = place.edit_refused(
+        "a.canvas",
+        json!([{"op": "delete_node", "id": "f"}, {"op": "add_edge", "from": "a", "to": "f"}]),
+        "not_found",
+    );
+    assert!(text.starts_with("ops[1] (add_edge): "), "{text}");
+}
+
+#[test]
+fn to_front_and_to_back_change_the_drawing_order() {
+    let place = Place::new("order");
+    place.write("work/a.canvas", THREE);
+    let output = place.edit(
+        "a.canvas",
+        json!([
+            {"op": "to_back", "id": "g"},
+            {"op": "to_front", "id": "a"},
+            // There already: nothing to say.
+            {"op": "to_front", "id": "a"}
+        ]),
+    );
+    assert_eq!(output["changed"], json!(["g", "a"]));
+    assert_eq!(ids(&place.canvas("a.canvas")["nodes"]), ["g", "f", "a"]);
+    let text = place.edit_refused(
+        "a.canvas",
+        json!([{"op": "to_front", "id": "af"}]),
+        "invalid",
+    );
+    assert!(text.contains("an edge, and takes a node"), "{text}");
+}
+
+#[test]
+fn the_operations_go_all_or_none_and_the_error_names_the_one_that_failed() {
+    let place = Place::new("atomic");
+    place.write("work/a.canvas", THREE);
+    let text = place.edit_refused(
+        "a.canvas",
+        json!([
+            {"op": "add_node", "type": "text", "text": "kept?"},
+            {"op": "update_node", "id": "a", "x": 99},
+            {"op": "update_node", "id": "missing", "x": 1}
+        ]),
+        "not_found",
+    );
+    assert!(text.starts_with("ops[2] (update_node): "), "{text}");
+    assert!(text.contains("Nothing was applied."), "{text}");
+    assert!(text.contains("canvas_read"), "{text}");
+}
+
+#[test]
+fn invalid_operations_say_what_is_allowed_before_the_file_is_read() {
+    let place = Place::new("edit-invalid");
+    place.write("work/a.canvas", THREE);
+    place.write("work/notes.md", "# Notes\n");
+    for (arguments, says) in [
+        (json!({"path": "a.canvas"}), "`ops` is required"),
+        (json!({"path": "a.canvas", "ops": []}), "`ops` is empty"),
+        (
+            json!({"path": "a.canvas", "ops": {}}),
+            "`ops` must be a list",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [], "force": true}),
+            "`force` is not an argument of canvas_edit",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "x"}], "if_revision": 3}),
+            "`if_revision` must be a string",
+        ),
+        (
+            json!({"path": "notes.md", "ops": [{"op": "to_back", "id": "a"}]}),
+            ".canvas file",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [1]}),
+            "ops[0]: an operation must be an object",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "move"}]}),
+            "`op` must be one of add_node",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"id": "a"}]}),
+            "not nothing",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "add_node", "text": "x"}]}),
+            "`type` is required",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "add_node", "type": "shape"}]}),
+            "`type` must be one of text, file, link, group",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "add_node", "type": "text"}]}),
+            "`text` is required",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "add_node", "type": "file"}]}),
+            "`file` is required",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "add_node", "type": "link"}]}),
+            "`url` is required",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "add_node", "type": "text", "text": "x", "url": "u"}]}),
+            "`url` is a field of a link card",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "add_node", "type": "file", "file": "a.md", "subpath": "Part"}]}),
+            "`subpath` must begin with #",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "add_node", "type": "text", "text": "x", "x": 1}]}),
+            "both `x` and `y`",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "add_node", "type": "text", "text": "x", "x": 1, "y": 1, "near": "a"}]}),
+            "`near` places a card",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "add_node", "type": "text", "text": "x", "width": 0}]}),
+            "`width` must be 1 or more",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "add_node", "type": "text", "text": "x", "x": "1", "y": 1}]}),
+            "`x` must be a number",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "add_node", "type": "text", "text": "x", "color": "red"}]}),
+            "`color` must be \"1\" to \"6\"",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "add_node", "type": "text", "text": "x", "ref": "a b"}]}),
+            "`ref` must be 1 to 64",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "add_node", "type": "text", "text": "x", "ref": "r"}, {"op": "add_edge", "ref": "r", "from": "a", "to": "f"}]}),
+            "the ref r is given twice",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "add_edge", "from": "a", "to": "f", "toSide": "up"}]}),
+            "`toSide` must be one of top, right, bottom, left",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "add_edge", "from": "a", "to": "f", "toEnd": "dot"}]}),
+            "`toEnd` must be one of none, arrow",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "add_edge", "from": "a"}]}),
+            "`to` is required",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "update_node", "id": "a"}]}),
+            "nothing to change",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "update_node", "id": "a", "x": null}]}),
+            "`x` must be a number",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "update_node", "id": "a", "text": null}]}),
+            "`text` cannot be removed",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "update_node", "id": "a", "replace": {"old": "a"}}]}),
+            "`new` is required",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "update_node", "id": "a", "replace": "a"}]}),
+            "`replace` must be an object",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "update_node", "id": "a", "x": 1, "from": "a"}]}),
+            "`from` is not a field of update_node",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "update_edge", "id": "af"}]}),
+            "nothing to change",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "delete_node"}]}),
+            "`id` is required",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "delete_node", "id": "a", "x": 1}]}),
+            "`x` is not a field of delete_node",
+        ),
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "to_back", "id": ""}]}),
+            "`id` must not be empty",
+        ),
+        // Checked against the canvas: a ref that is an id already.
+        (
+            json!({"path": "a.canvas", "ops": [{"op": "add_node", "type": "text", "text": "x", "ref": "a"}]}),
+            "the ref a is the id of a node",
+        ),
+    ] {
+        let text = place.refused("canvas_edit", arguments.clone(), "invalid");
+        assert!(text.contains(says), "{arguments}: {text}");
+    }
+    assert_eq!(
+        fs::read_to_string(place.work().join("a.canvas")).unwrap(),
+        THREE
+    );
+}
+
+#[test]
+fn if_revision_refuses_a_canvas_changed_since_as_stale() {
+    let place = Place::new("stale");
+    place.write("work/a.canvas", THREE);
+    let revision = place.output(&[], json!({"path": "a.canvas"}))["revision"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let op = json!([{"op": "update_node", "id": "a", "x": 1}]);
+    let output = place.done(
+        "canvas_edit",
+        json!({"path": "a.canvas", "ops": op, "if_revision": revision}),
+    );
+    let now = output["revision"].as_str().unwrap().to_owned();
+    assert_ne!(now, revision);
+    // The revision read before that write is stale now.
+    let before = fs::read(place.work().join("a.canvas")).unwrap();
+    let text = place.refused(
+        "canvas_edit",
+        json!({"path": "a.canvas", "ops": [{"op": "update_node", "id": "a", "x": 2}], "if_revision": revision}),
+        "stale",
+    );
+    assert!(text.contains(&now), "the current revision: {text}");
+    assert!(text.contains("Nothing was applied"), "{text}");
+    assert_eq!(fs::read(place.work().join("a.canvas")).unwrap(), before);
+}
+
+/// The lock a canvas's writes take: `canvas-<FNV-1a 64 of its canonical path>.lock` in the
+/// runtime folder's `rature`.
+fn lock_of(place: &Place, canvas: &Path) -> PathBuf {
+    let hash = canvas
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, &byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    place
+        .root
+        .join("xdg/runtime/rature")
+        .join(format!("canvas-{hash:016x}.lock"))
+}
+
+#[test]
+fn a_canvas_another_process_is_writing_is_busy() {
+    let place = Place::new("busy");
+    let file = place.write("work/a.canvas", THREE);
+    let lock = lock_of(&place, &file);
+    fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    let held = fs::File::create(&lock).unwrap();
+    held.lock().unwrap();
+    // A new canvas's lock is its path's.
+    let new = fs::File::create(lock_of(&place, &place.work().join("new.canvas"))).unwrap();
+    new.lock().unwrap();
+    let started = Instant::now();
+    let text = place.edit_refused(
+        "a.canvas",
+        json!([{"op": "update_node", "id": "a", "x": 1}]),
+        "busy",
+    );
+    assert!(started.elapsed() >= Duration::from_secs(2), "waited for it");
+    assert!(text.contains("Try again"), "{text}");
+    let text = place.refused("canvas_create", json!({"path": "new.canvas"}), "busy");
+    assert!(text.contains("new.canvas"), "{text}");
+    assert!(!place.work().join("new.canvas").exists());
+    drop((held, new));
+    place.edit(
+        "a.canvas",
+        json!([{"op": "update_node", "id": "a", "x": 1}]),
+    );
+    place.done("canvas_create", json!({"path": "new.canvas"}));
+}
+
+#[test]
+fn a_canvas_with_flaws_or_not_json_is_never_written() {
+    let place = Place::new("edit-broken");
+    place.write(
+        "work/twice.canvas",
+        r#"{"nodes":[{"id":"a","type":"text","text":"x"},{"id":"a","type":"text","text":"y"}],"edges":[]}"#,
+    );
+    let text = place.edit_refused(
+        "twice.canvas",
+        json!([{"op": "add_node", "type": "text", "text": "z"}]),
+        "not_a_canvas",
+    );
+    assert!(text.contains("the node id a is already"), "{text}");
+    place.write("work/broken.canvas", "{\"nodes\":[");
+    let text = place.edit_refused(
+        "broken.canvas",
+        json!([{"op": "add_node", "type": "text", "text": "z"}]),
+        "not_a_canvas",
+    );
+    assert!(text.contains("not JSON"), "{text}");
+    fs::write(
+        place.work().join("latin1.canvas"),
+        b"{\"nodes\":[],\"x\":\"\xe9\"}",
+    )
+    .unwrap();
+    let text = place.edit_refused(
+        "latin1.canvas",
+        json!([{"op": "add_node", "type": "text", "text": "z"}]),
+        "not_a_canvas",
+    );
+    assert!(text.contains("UTF-8"), "{text}");
+}
+
+#[test]
+fn the_writing_tools_stay_in_the_allowed_folders() {
+    let place = Place::new("write-outside");
+    let out = place.write("elsewhere/out.canvas", THREE);
+    std::os::unix::fs::symlink(&out, place.work().join("link.canvas")).unwrap();
+    std::os::unix::fs::symlink(place.elsewhere(), place.work().join("linked")).unwrap();
+    let op = json!([{"op": "update_node", "id": "a", "x": 1}]);
+    for path in [
+        out.to_str().unwrap(),
+        "../elsewhere/out.canvas",
+        "link.canvas",
+        "linked/out.canvas",
+    ] {
+        let text = place.refused("canvas_edit", json!({"path": path, "ops": op}), "outside");
+        assert!(text.contains("--allow-dir"), "{path}: {text}");
+    }
+    for path in [
+        "../elsewhere/new.canvas",
+        "linked/new.canvas",
+        "../elsewhere/none/new.canvas",
+    ] {
+        place.refused("canvas_create", json!({"path": path}), "outside");
+    }
+    assert_eq!(fs::read_to_string(&out).unwrap(), THREE);
+    assert!(!place.elsewhere().join("new.canvas").exists());
+    // Allowed, it is written, through the link too.
+    let elsewhere = place.elsewhere();
+    let allow = ["--allow-dir", elsewhere.to_str().unwrap()];
+    let result = place.call(
+        &allow,
+        "canvas_edit",
+        json!({"path": "link.canvas", "ops": op}),
+    );
+    assert_eq!(result["isError"], false, "{result}");
+    assert!(
+        fs::symlink_metadata(place.work().join("link.canvas"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_ne!(fs::read_to_string(&out).unwrap(), THREE);
+    let result = place.call(
+        &allow,
+        "canvas_create",
+        json!({"path": "linked/new.canvas"}),
+    );
+    assert_eq!(result["isError"], false, "{result}");
+    assert!(place.elsewhere().join("new.canvas").is_file());
+}
+
+#[test]
+fn canvas_create_makes_a_canvas_with_its_cards_placed_apart() {
+    let place = Place::new("create");
+    let output = place.done(
+        "canvas_create",
+        json!({
+            "path": "plan.canvas",
+            "nodes": [
+                {"ref": "idea", "type": "text", "text": "# Idea\n\nSomething worth a card of its own, with a few lines of text to make it taller than the others."},
+                {"ref": "why", "type": "text", "text": "Why", "near": "idea"},
+                {"ref": "how", "type": "text", "text": "How", "near": "idea"},
+                {"ref": "doc", "type": "file", "file": "notes.md"},
+                {"op": "add_node", "type": "link", "url": "https://example.org", "near": "why"}
+            ],
+            "edges": [
+                {"ref": "e1", "from": "idea", "to": "why"},
+                {"from": "idea", "to": "how", "toSide": "left"}
+            ]
+        }),
+    );
+    assert_eq!(output["changed"], json!([]));
+    assert_eq!(output["deleted"], json!([]));
+    let created: Vec<&str> = output["created"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        created,
+        ["idea", "why", "how", "doc", "nodes[4]", "e1", "edges[1]"]
+    );
+    let canvas = place.canvas("plan.canvas");
+    assert_eq!(canvas["nodes"].as_array().unwrap().len(), 5);
+    assert_eq!(canvas["edges"].as_array().unwrap().len(), 2);
+    assert_apart(&canvas);
+    let idea = by_id(
+        &canvas["nodes"],
+        output["created"]["idea"].as_str().unwrap(),
+    );
+    assert_eq!((idea["x"].clone(), idea["y"].clone()), (json!(0), json!(0)));
+    let read = place.output(&[], json!({"path": "plan.canvas"}));
+    assert_eq!(read["revision"], output["revision"]);
+    assert!(read.get("problems").is_none());
+
+    // An empty one.
+    let output = place.done("canvas_create", json!({"path": "empty.canvas"}));
+    assert_eq!(output["created"], json!({}));
+    assert_eq!(
+        fs::read_to_string(place.work().join("empty.canvas")).unwrap(),
+        "{\n\t\"nodes\":[],\n\t\"edges\":[]\n}"
+    );
+}
+
+#[test]
+fn canvas_create_never_writes_over_a_file_nor_makes_a_folder() {
+    let place = Place::new("create-refused");
+    place.write("work/a.canvas", THREE);
+    let text = place.refused("canvas_create", json!({"path": "a.canvas"}), "exists");
+    assert!(text.contains("canvas_edit"), "{text}");
+    std::os::unix::fs::symlink("nowhere.canvas", place.work().join("dangling.canvas")).unwrap();
+    place.refused(
+        "canvas_create",
+        json!({"path": "dangling.canvas"}),
+        "exists",
+    );
+    assert!(!place.work().join("nowhere.canvas").exists());
+    assert_eq!(
+        fs::read_to_string(place.work().join("a.canvas")).unwrap(),
+        THREE
+    );
+
+    let text = place.refused("canvas_create", json!({"path": "new/plan.canvas"}), "io");
+    assert!(text.contains("makes no folder"), "{text}");
+    assert!(!place.work().join("new").exists());
+
+    for (arguments, says) in [
+        (json!({"path": "plan.md"}), ".canvas file"),
+        (json!({"path": "a.canvas/x.canvas"}), "not a folder"),
+        (
+            json!({"path": "p.canvas", "nodes": {}}),
+            "`nodes` must be a list",
+        ),
+        (
+            json!({"path": "p.canvas", "nodes": [{"op": "update_node", "id": "a"}]}),
+            "nodes[0]: an entry of `nodes` is an add_node",
+        ),
+        (
+            json!({"path": "p.canvas", "nodes": [{"type": "text"}]}),
+            "nodes[0]: `text` is required",
+        ),
+        (
+            json!({"path": "p.canvas", "edges": [{"from": "x", "to": "y", "bend": 1}]}),
+            "edges[0]: `bend` is not a field of add_edge",
+        ),
+        (
+            json!({"path": "p.canvas", "ops": []}),
+            "`ops` is not an argument of canvas_create",
+        ),
+    ] {
+        let text = place.refused("canvas_create", arguments.clone(), "invalid");
+        assert!(text.contains(says), "{arguments}: {text}");
+    }
+    let text = place.refused(
+        "canvas_create",
+        json!({"path": "p.canvas", "nodes": [{"ref": "a", "type": "text", "text": "A"}], "edges": [{"from": "a", "to": "b"}]}),
+        "not_found",
+    );
+    assert!(text.starts_with("edges[0]: `to`"), "{text}");
+    assert!(!place.work().join("p.canvas").exists());
+}
+
+#[test]
+fn cards_placed_by_rature_through_canvas_edit_never_overlap() {
+    let place = Place::new("placement");
+    place.write("work/a.canvas", SAMPLE);
+    let texts = [
+        "Short",
+        "A card with a longer line of text, long enough to be wrapped once or twice.",
+        "# Title\n\n- one\n- two\n- three\n- four",
+        "",
+    ];
+    // In several calls, as a client adds cards one after the other.
+    for round in 0..4 {
+        let mut ops = Vec::new();
+        for (n, text) in texts.iter().enumerate() {
+            let mut op =
+                json!({"op": "add_node", "ref": format!("c{n}"), "type": "text", "text": text});
+            match (round + n) % 3 {
+                0 => op["near"] = json!("59e896bc8da20699"),
+                1 if n > 0 => op["near"] = json!(format!("c{}", n - 1)),
+                _ => {}
+            }
+            ops.push(op);
+        }
+        ops.push(json!({"op": "add_node", "type": "file", "file": "readme.md", "near": "8132d4d894c80022"}));
+        ops.push(json!({"op": "add_node", "type": "group", "label": "Later", "near": "754a8ef995f366bc"}));
+        place.edit("a.canvas", Value::Array(ops));
+    }
+    let canvas = place.canvas("a.canvas");
+    assert_eq!(canvas["nodes"].as_array().unwrap().len(), 5 + 4 * 6);
+    // The sample's own cards do not overlap, but its group holds three: leave them out.
+    let mut placed = canvas.clone();
+    placed["nodes"] = canvas["nodes"].as_array().unwrap()[1..].to_vec().into();
+    assert_apart(&placed);
 }

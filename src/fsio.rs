@@ -114,6 +114,37 @@ pub fn update(path: &Path, mut edit: impl FnMut(&str) -> Option<String>) -> io::
     Ok(Update::Busy)
 }
 
+/// Writes a new file at `path`, whole, never over what is there: an `AlreadyExists` error when
+/// anything is (a link too, even one to nothing). Its folder must exist. The file gets the
+/// permissions a new file gets (the umask's).
+pub fn create(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let temp = Temp::write(path, bytes, None)?;
+    // A hard link is made only where nothing is: the whole file appears at once, or nothing.
+    match fs::hard_link(temp.path(), path) {
+        Ok(()) => {}
+        // A file system without hard links (FAT, some FUSE ones): the file is made where
+        // nothing is, and written; a reader may see it empty a moment.
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::Unsupported | io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            drop(temp);
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o666)
+                .open(path)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+        }
+        Err(error) => return Err(error),
+    }
+    sync_folder(path);
+    Ok(())
+}
+
 /// Whether the regular file at `path` holds `expected`, and nothing else.
 fn holds(path: &Path, expected: &[u8]) -> bool {
     regular(path).is_ok_and(|meta| meta.len() == expected.len() as u64)
@@ -171,6 +202,7 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 struct Temp(Option<PathBuf>);
 
 impl Temp {
+    /// `mode`: the permissions to give it; `None`, those of a new file (the umask's).
     fn write(beside: &Path, bytes: &[u8], mode: Option<u32>) -> io::Result<Self> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let folder = beside.parent().unwrap_or(Path::new("."));
@@ -186,7 +218,7 @@ impl Temp {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o600)
+            .mode(if mode.is_some() { 0o600 } else { 0o666 })
             .open(&path)?;
         let temp = Self(Some(path));
         file.write_all(bytes)?;
@@ -198,19 +230,27 @@ impl Temp {
         Ok(temp)
     }
 
+    fn path(&self) -> &Path {
+        self.0.as_deref().expect("a temp file not yet renamed")
+    }
+
     fn rename_over(mut self, target: &Path) -> io::Result<()> {
         let path = self.0.take().expect("a temp file not yet renamed");
         if let Err(error) = fs::rename(&path, target) {
             let _ = fs::remove_file(&path);
             return Err(error);
         }
-        // The rename itself is kept through a crash once its folder is.
-        if let Some(folder) = target.parent()
-            && let Ok(folder) = File::open(folder)
-        {
-            let _ = folder.sync_all();
-        }
+        sync_folder(target);
         Ok(())
+    }
+}
+
+/// A rename or a new link is kept through a crash once its folder is.
+fn sync_folder(file: &Path) {
+    if let Some(folder) = file.parent()
+        && let Ok(folder) = File::open(folder)
+    {
+        let _ = folder.sync_all();
     }
 }
 
@@ -411,5 +451,35 @@ mod tests {
         assert_eq!(fs::read_to_string(&file).unwrap(), "new");
         assert_eq!(fs::metadata(&file).unwrap().mode() & 0o777, 0o600);
         assert_eq!(folder.names(), ["state.json"]);
+    }
+
+    #[test]
+    fn a_new_file_is_made_whole_and_never_over_another() {
+        let folder = Folder::new("create");
+        let file = folder.0.join("a.canvas");
+        create(&file, b"new").unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "new");
+        // The permissions of any new file in that folder, the umask's.
+        let other = folder.0.join("other");
+        fs::write(&other, "").unwrap();
+        assert_eq!(
+            fs::metadata(&file).unwrap().mode() & 0o777,
+            fs::metadata(&other).unwrap().mode() & 0o777
+        );
+        fs::remove_file(&other).unwrap();
+
+        let error = create(&file, b"again").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&file).unwrap(), "new");
+        // A link to nothing is something there too.
+        let link = folder.0.join("b.canvas");
+        std::os::unix::fs::symlink("nowhere", &link).unwrap();
+        let error = create(&link, b"x").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(!folder.0.join("nowhere").exists());
+        // No folder is made.
+        let error = create(&folder.0.join("none/c.canvas"), b"x").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(folder.names(), ["a.canvas", "b.canvas"]);
     }
 }

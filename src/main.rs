@@ -1,6 +1,6 @@
 mod cache;
-// The model of `.canvas` files, its operations and its writes: `rature mcp` reads with them, and
-// no window uses them before the canvas opens in one (#9).
+// The model of `.canvas` files, its operations and its writes: `rature mcp` reads and writes with
+// them, and no window uses them before the canvas opens in one (#9).
 #[allow(dead_code)]
 mod canvas;
 #[allow(dead_code)]
@@ -23,6 +23,7 @@ mod live;
 mod load;
 mod math;
 mod mcp;
+mod mcp_edit;
 mod picker;
 mod reader;
 mod render;
@@ -53,8 +54,8 @@ Reads Markdown (and JSON, YAML, CSV, images, code) and follows its changes.
 `rt` is the same. Keys: see the README, or `f` `s` `o` `t` `Ctrl-f` `]c` `m` `i` `e` `q` in the
 window.
 
-`rature mcp` serves MCP on stdin and stdout, to read canvases (`rature mcp --help`): no window
-opens. A file named `mcp` opens as `./mcp`.";
+`rature mcp` serves MCP on stdin and stdout, to read, lay out and make canvases (`rature mcp
+--help`): no window opens. A file named `mcp` opens as `./mcp`.";
 
 /// What `--version` prints: the version, the channel and the commit (`build.rs`).
 fn version() -> String {
