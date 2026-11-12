@@ -3125,8 +3125,10 @@ impl CanvasView {
         }
         let label = self.label_line(camera, cx);
         match hit(cards, camera, label, self.edits.alone(), x, y) {
-            Hit::Handle(id, _) | Hit::Card(id) | Hit::Group(id) => Some(id),
-            Hit::Empty => None,
+            Hit::Handle(id, _) | Hit::Card(id) => Some(id),
+            // Where no card is, the outer half of a handle of one.
+            Hit::Group(id) => handle_beside(cards, camera, x, y).or(Some(id)),
+            Hit::Empty => handle_beside(cards, camera, x, y),
         }
     }
 
@@ -3303,7 +3305,12 @@ fn link_at(
 ) -> Option<(String, edges::Side)> {
     let hovered = hovered.filter(|id| !id.is_empty())?;
     let card = cards.iter().find(|card| card.id == hovered)?;
-    let area = camera.on_screen(card.area);
+    let side = side_at(camera.on_screen(card.area), x, y)?;
+    Some((card.id.clone(), side))
+}
+
+/// The side of a card at `area` on screen whose handle the screen's point (`x`, `y`) is on.
+fn side_at(area: Area, x: f32, y: f32) -> Option<edges::Side> {
     if !handles_shown(area) {
         return None;
     }
@@ -3311,7 +3318,17 @@ fn link_at(
     edges::Side::ALL
         .into_iter()
         .find(|side| side.middle(edge_rect(area)).distance(at) <= REACH)
-        .map(|side| (card.id.clone(), side))
+}
+
+/// The topmost card one of whose sides' handles the board's point (`x`, `y`) is on: half of a
+/// handle lies outside its card, where a pointer coming from outside finds it first.
+fn handle_beside(cards: &[Card], camera: Camera, x: f32, y: f32) -> Option<String> {
+    cards
+        .iter()
+        .rev()
+        .filter(|card| !card.id.is_empty())
+        .find(|card| side_at(camera.on_screen(card.area), x, y).is_some())
+        .map(|card| card.id.clone())
 }
 
 /// The card an edge drawn from the card `from` reaches when let go at the board's point (`x`,
@@ -4098,8 +4115,8 @@ mod tests {
     // Not the glob: GPUI's own `test` attribute would come with it.
     use super::{
         Area, Camera, CanvasFile, Corner, Detail, HANDLE, Hit, MAX_ZOOM, MIN_SIZE, MIN_ZOOM, ROOM,
-        STEP, Tint, carried, deleting, edge_id, handle_at, hit, moved, placing, rebased, resized,
-        tint, typing_ops,
+        STEP, Tint, carried, deleting, edge_id, handle_at, handle_beside, hit, moved, placing,
+        rebased, resized, tint, typing_ops,
     };
     use super::{lost, write_now};
     use crate::canvas::Canvas;
@@ -4482,6 +4499,24 @@ mod tests {
         let disk = Canvas::read(&std::fs::read_to_string(&path).unwrap());
         assert_eq!(text(&disk), "theirs");
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The outer half of a side's handle lies outside its card: a pointer coming from outside
+    /// finds the card there, on empty space or on a group's background.
+    #[test]
+    fn a_sides_handle_is_found_from_outside_its_card() {
+        let (_, file) = board();
+        let camera = Camera {
+            x: 0.,
+            y: 0.,
+            zoom: 1.,
+        };
+        // `a`'s left side, 0 to 100 high: 4 px out of it, on the group's background.
+        let beside = |x: f32, y: f32| handle_beside(&file.cards, camera, x, y);
+        assert_eq!(beside(-4., 50.).as_deref(), Some("a"));
+        // `b`'s left side, at 400, from empty space.
+        assert_eq!(beside(396., 50.).as_deref(), Some("b"));
+        assert_eq!(beside(300., 50.), None);
     }
 
     /// A press may come before the frame after an edge was deleted: the place the frame before
