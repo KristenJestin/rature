@@ -92,31 +92,48 @@ you read it. Keyboard first, no webview.
 
 ## Install
 
+Rature is installed from a built release: no Rust, no build, no root.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/KristenJestin/rature/main/install.sh | sh
+```
+
+Until the first stable release, take the script from `dev` (`…/rature/dev/install.sh`), or the
+line a release's notes give. The same script runs from a clone as `./install.sh`.
+
 Requirements:
 
-- Linux.
-- A Rust toolchain, 1.95 or later.
+- Linux x86_64, with `curl`, `tar`, `sha256sum` and GNU `sort`.
+- The window's system libraries: fontconfig, freetype, xkbcommon (and xkbcommon-x11),
+  wayland-client or libxcb, and a Vulkan loader with a driver.
 - Optional: [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) to search a folder, and
   `nvim` with `xdg-terminal-exec` for the `e` key.
 
-From a clone:
+It downloads the release's archive, checks its SHA-256 sum (a wrong one installs nothing),
+installs it as `~/.local/bin/rature`, with `rt` as a link to it, and adds Rature to the
+application launcher (its desktop entry and icon go to `$XDG_DATA_HOME`). Then it prints
+`rature --version`. Run it again to update; a window already open keeps the former version until
+it is closed.
+
+Three channels (see [docs/releases.md](docs/releases.md)):
 
 ```sh
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/KristenJestin/rature/main/install.sh | sh                          # stable
+curl -fsSL https://raw.githubusercontent.com/KristenJestin/rature/dev/install.sh | sh -s -- --channel beta       # dev's last build
+curl -fsSL https://raw.githubusercontent.com/KristenJestin/rature/dev/install.sh | sh -s -- --channel alpha --branch feat/12-search
 ```
-
-It builds a release binary and installs it as `~/.local/bin/rature`, with `rt` as a link to it,
-and adds Rature to the application launcher (its desktop entry and icon go to
-`$XDG_DATA_HOME`). No root is needed. Run it again to update.
 
 | Option | |
 |---|---|
+| `--channel stable\|beta\|alpha` | the channel, `stable` by default |
+| `--branch <name>` | the branch whose alpha to install; required by `alpha` |
+| `--version X.Y.Z[-pre]` | that release exactly, of any channel; not with `--channel` or `--branch` |
 | `--no-rt` | install without the `rt` link |
 | `--uninstall` | remove what it installed; config and state are kept |
 | `--help` | show the options |
 
-If `~/.local/bin/rt` already exists and is not Rature's link, the install stops and leaves it
-alone: remove it, or use `--no-rt`.
+If `~/.local/bin/rt` already exists and is not Rature's link, the install stops before
+downloading anything and leaves it alone: remove it, or use `--no-rt`.
 
 ## Usage
 
@@ -230,10 +247,24 @@ and folders, and a snapshot of each file as you last read it, which "what change
 
 ## Development
 
+Building from source needs a Rust toolchain, 1.95 or later, and the window's system libraries
+with their headers:
+
 ```sh
 cargo test
-cargo build --release
+cargo build --release              # target/release/rature
 ```
+
+To use your build in place of the installed one, copy it beside it then rename it over it (a
+running window keeps its own file), after `./install.sh` once for `rt` and the launcher's entry:
+
+```sh
+install -m 0755 target/release/rature ~/.local/bin/.rature.new && mv -f ~/.local/bin/.rature.new ~/.local/bin/rature
+```
+
+[`tools/test-install.sh`](tools/test-install.sh) runs `install.sh` against fake releases served
+on `127.0.0.1` (it needs `python3`), in a temporary home: never GitHub, never your `~/.local`.
+`TEST_SH=dash tools/test-install.sh` runs it under another shell.
 
 CI checks every push and pull request, and publishes a build of `main` (stable), `dev` (beta)
 and each `feat/` or `fix/` branch (alpha): see [docs/releases.md](docs/releases.md).

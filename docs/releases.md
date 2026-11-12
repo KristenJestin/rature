@@ -106,12 +106,67 @@ one folder `rature-<version>/` with `rature`, `LICENSE`, `LICENSE-fonts.txt` and
 desktop entry and the icons of `packaging/linux`), the same bytes from the same files. Its
 `.sha256` beside it is read by `sha256sum --check`. Linux x86_64 only.
 
+## Installing
+
+```
+curl -fsSL https://raw.githubusercontent.com/KristenJestin/rature/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/KristenJestin/rature/dev/install.sh | sh -s -- --channel beta
+curl -fsSL https://raw.githubusercontent.com/KristenJestin/rature/dev/install.sh | sh -s -- --channel alpha --branch feat/12-search
+curl -fsSL https://raw.githubusercontent.com/KristenJestin/rature/dev/install.sh | sh -s -- --version 0.2.0-beta.12
+```
+
+`main` has an `install.sh` once the first stable release is out; until then take `dev`'s, or
+the line each release's notes give, of its own commit. From a clone, `./install.sh` does the
+same. No Rust and no root are needed: `curl`, `tar`, `sha256sum`, GNU `sort` (it compares
+versions) and `uname`, on Linux x86_64, all checked first. Its body is one function called on its
+last line, so a download cut short runs nothing. The model is Flottille's `install.sh`.
+
+- **Which release**, read from GitHub's API (`/releases/latest`, `/releases/tags/v<version>`,
+  `/releases?per_page=100`) with `curl`, `sed`, `awk`, `tr` and `sort`, no `jq`:
+  - stable (the default): the latest release;
+  - `--channel beta`: the `-beta.` pre-release **published last**, not the highest version; a
+    draft is never offered;
+  - `--channel alpha --branch <name>`: the **highest version** among the branch's alphas,
+    `*-alpha.<slug>.<n>` of the 100 newest releases, the slug made as CI makes it and matched
+    whole, so `feat-a` never takes `feat-a-b`'s. A branch without one is said.
+  - `--version X.Y.Z[-pre]`: that release exactly, of any channel, checked as a version before it
+    goes into an address, and refused with `--channel` or `--branch`. One that is not there is
+    said with up to five close versions.
+
+  `--branch` goes with `--channel alpha` only. An option without its value, or an unknown one,
+  exits 2. A release that is not there (404), the network failing and GitHub failing are said
+  apart.
+- **The sum first**: the archive and its `.sha256` go to a `mktemp -d` folder removed on exit,
+  and `sha256sum --check` runs before anything is installed: a mismatch installs nothing.
+- **Installed**: the binary is written beside (`~/.local/bin/.rature.new`), then renamed over
+  `rature`, so a window already open keeps its own file, and the former version until it is
+  closed. `rt` is a relative link to it, never replacing an `rt` that is not Rature's: that is
+  checked before the download, and the install stops (`--no-rt` installs without the link). The
+  desktop entry and the icon go from the archive's `share/` to `$XDG_DATA_HOME`
+  (`~/.local/share` by default), the entry's `Exec=` naming the binary's real path, quoted and
+  escaped as the Desktop Entry spec says when it holds another character than letters, digits
+  and `/._+-`. The launcher's files failing is said, not undone.
+- **Then** `~/.local/bin/rature --version` is run and printed. A binary that does not answer (a
+  system library missing) stays installed, and that is said. It also says when `~/.local/bin` is
+  not in `PATH`.
+- **`--uninstall`** needs no clone, no archive and no network: it removes `rature`, `rt` when it
+  is Rature's link, `applications/rature.desktop` and `icons/hicolor/scalable/apps/rature.svg`,
+  and keeps the config and the state.
+
+`RATURE_RELEASES` names another root of the API than
+`https://api.github.com/repos/KristenJestin/rature`, for tests: `tools/test-install.sh` serves
+fake releases and archives on `127.0.0.1` (with `python3`) and runs `install.sh` in a temporary
+`HOME`, `XDG_DATA_HOME` and `TMPDIR`, under `dash` when it is installed (`TEST_SH` names another
+shell).
+
 ## What only a real push proves
 
-The version and changelog scripts are run on throwaway repositories, and the archive is made
-from a binary. What cannot run off GitHub is the workflows themselves: a `feat/` push publishing
+The version and changelog scripts are run on throwaway repositories, the archive is made from a
+binary, and `install.sh` runs against a fake API. What cannot run off GitHub is the workflows themselves: a `feat/` push publishing
 an alpha, a second one the next beside it; deleting the branch removing them; the first squash
 into `dev` publishing `0.1.0-beta.N`; the first `release` run moving `main` with the workflow's
 token, the pull request shown merged, `ci.yml` started on `main`, `v0.1.0` tagged on the commit
 released and marked latest, its binary starting without Rust; a run from another branch or of a
-commit not on `dev` moving nothing and saying why.
+commit not on `dev` moving nothing and saying why; GitHub's API answering as `install.sh` reads
+it, and the curl lines installing the stable, a beta and a branch's alpha on a machine without
+Rust, `rature --version` printing each one's version and channel.
