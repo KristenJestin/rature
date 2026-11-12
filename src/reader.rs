@@ -788,8 +788,9 @@ impl Reader {
             let position = self.position();
             cx.global_mut::<State>().set_position(&path, position);
         }
-        if let Some(camera) = self.board.as_ref().and_then(|b| b.read(cx).camera()) {
-            cx.global_mut::<State>().set_camera(&path, camera.kept());
+        let camera = self.board.as_ref().and_then(|b| b.read(cx).camera());
+        if let Some(kept) = camera.and_then(|camera| camera.kept()) {
+            cx.global_mut::<State>().set_camera(&path, kept);
         }
         // A canvas left: what it showed, and what Rature just wrote of it, is read.
         if let (Some(board), Some(_)) = (&self.board, &self.canvas_changes) {

@@ -94,8 +94,12 @@ impl State {
         self.prune_positions(now());
     }
 
-    /// Keeps where the canvas at `path` was looked at.
+    /// Keeps where the canvas at `path` was looked at; never a camera at infinity, which JSON
+    /// writes `null`: the state would no more be read, and everything it keeps lost.
     pub fn set_camera(&mut self, path: &Path, camera: [f32; 3]) {
+        if !camera.iter().all(|v| v.is_finite()) {
+            return;
+        }
         self.cameras.insert(path.to_path_buf(), (camera, now()));
         self.prune_cameras(now());
     }
@@ -372,6 +376,13 @@ mod tests {
         state.set_camera(Path::new("/a.canvas"), [1., 2., 0.5]);
         assert_eq!(state.camera(Path::new("/a.canvas")), Some([1., 2., 0.5]));
         assert_eq!(state.camera(Path::new("/b.canvas")), None);
+        // Not kept at infinity: written `null`, the state would not be read again.
+        state.set_camera(Path::new("/a.canvas"), [f32::INFINITY, 2., 0.5]);
+        state.set_camera(Path::new("/c.canvas"), [0., f32::NAN, 1.]);
+        assert_eq!(state.camera(Path::new("/a.canvas")), Some([1., 2., 0.5]));
+        assert_eq!(state.camera(Path::new("/c.canvas")), None);
+        let written = serde_json::to_string(&state).unwrap();
+        assert!(serde_json::from_str::<State>(&written).is_ok(), "{written}");
         let day = 24 * 60 * 60;
         let now = 1000 * day;
         let mut state = State::default();

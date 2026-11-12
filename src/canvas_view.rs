@@ -225,11 +225,30 @@ impl Camera {
         let zoom = (room(width) / all.width.max(1.))
             .min(room(height) / all.height.max(1.))
             .clamp(MIN_ZOOM, 1.);
-        Self {
+        let framed = Self {
             x: all.x + all.width / 2. - width / (2. * zoom),
             y: all.y + all.height / 2. - height / (2. * zoom),
             zoom,
+        };
+        // Cards further apart than an `f32` holds: the origin rather than nowhere.
+        if framed.is_finite() {
+            framed
+        } else {
+            Self::origin(width, height)
         }
+    }
+
+    /// The canvas's origin in the middle of a board `width` by `height`, at zoom 1.
+    pub fn origin(width: f32, height: f32) -> Self {
+        Self {
+            x: -width / 2.,
+            y: -height / 2.,
+            zoom: 1.,
+        }
+    }
+
+    fn is_finite(&self) -> bool {
+        self.x.is_finite() && self.y.is_finite() && self.zoom.is_finite()
     }
 
     /// The point of the board over the canvas's point (`x`, `y`).
@@ -298,17 +317,18 @@ impl Camera {
         size / font_size
     }
 
-    /// As the state keeps it.
-    pub fn kept(&self) -> [f32; 3] {
-        [self.x, self.y, self.zoom]
+    /// As the state keeps it; `None` for a camera no board could have, never kept: JSON has no
+    /// infinity, and the state would no more be read.
+    pub fn kept(&self) -> Option<[f32; 3]> {
+        self.is_finite().then_some([self.x, self.y, self.zoom])
     }
 
     /// As the state kept it; `None` for a camera no board could have.
     pub fn from_kept([x, y, zoom]: [f32; 3]) -> Option<Self> {
-        (x.is_finite() && y.is_finite() && zoom.is_finite()).then(|| Self {
-            x,
-            y,
+        let camera = Self { x, y, zoom };
+        camera.is_finite().then(|| Self {
             zoom: zoom.clamp(MIN_ZOOM, MAX_ZOOM),
+            ..camera
         })
     }
 }
@@ -516,12 +536,12 @@ fn node_rects(canvas: &Canvas) -> HashMap<&str, edges::Rect> {
         .nodes()
         .iter()
         .filter_map(|node| {
-            let rect = node.rect()?;
+            let a = board_area(node.rect()?)?;
             let rect = edges::Rect {
-                x: rect.x as f32,
-                y: rect.y as f32,
-                width: rect.width as f32,
-                height: rect.height as f32,
+                x: a.x,
+                y: a.y,
+                width: a.width,
+                height: a.height,
             };
             Some((node.id()?, rect))
         })
@@ -574,13 +594,7 @@ fn card(
     folder: Option<&Path>,
     parse: impl FnOnce(&str) -> Document,
 ) -> Option<Card> {
-    let rect = node.rect()?;
-    let area = Area {
-        x: rect.x as f32,
-        y: rect.y as f32,
-        width: rect.width as f32,
-        height: rect.height as f32,
-    };
+    let area = board_area(node.rect()?)?;
     let tint = match node.color() {
         Some(Color::Preset(n)) => Some(Tint::Preset(n)),
         Some(Color::Rgb(rgb)) => Some(Tint::Rgb(rgb)),
@@ -623,6 +637,23 @@ fn card(
         kind,
         title,
     })
+}
+
+/// A node's place and size as the board draws them: `None` when one of them, or its far side,
+/// is past what an `f32` holds (`"x": 1e39`), the node left off the board as one without a
+/// place; the camera would follow it to infinity.
+pub(crate) fn board_area(rect: Rect) -> Option<Area> {
+    let area = Area {
+        x: rect.x as f32,
+        y: rect.y as f32,
+        width: rect.width as f32,
+        height: rect.height as f32,
+    };
+    let (right, bottom) = (area.x + area.width, area.y + area.height);
+    [area.x, area.y, area.width, area.height, right, bottom]
+        .iter()
+        .all(|v| v.is_finite())
+        .then_some(area)
 }
 
 /// A text card's title: its first heading, else its first line that says something.
@@ -954,11 +985,7 @@ impl CanvasView {
             let (width, height) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
             self.camera = Some(match self.file.all {
                 Some(all) => Camera::framing(all, width, height),
-                None => Camera {
-                    x: -width / 2.,
-                    y: -height / 2.,
-                    zoom: 1.,
-                },
+                None => Camera::origin(width, height),
             });
         }
         true
@@ -1734,13 +1761,8 @@ impl CanvasView {
         let canvas = self.edits.board.as_ref().map_or(&*disk, Board::canvas);
         let mut areas: HashMap<&str, Area> = HashMap::new();
         for node in canvas.nodes() {
-            if let (Some(id), Some(rect)) = (node.id(), node.rect()) {
-                areas.entry(id).or_insert(Area {
-                    x: rect.x as f32,
-                    y: rect.y as f32,
-                    width: rect.width as f32,
-                    height: rect.height as f32,
-                });
+            if let (Some(id), Some(area)) = (node.id(), node.rect().and_then(board_area)) {
+                areas.entry(id).or_insert(area);
             }
         }
         let changes: Vec<(usize, Option<Area>)> = self
@@ -4158,9 +4180,43 @@ mod tests {
             y: -4.5,
             zoom: 0.3,
         };
-        assert_eq!(Camera::from_kept(camera.kept()), Some(camera));
+        assert_eq!(Camera::from_kept(camera.kept().unwrap()), Some(camera));
         assert_eq!(Camera::from_kept([0., 0., 40.]).unwrap().zoom, MAX_ZOOM);
         assert_eq!(Camera::from_kept([f32::NAN, 0., 1.]), None);
+        // Never kept: it would be written `null`, and the whole state lost.
+        let lost = Camera {
+            x: f32::INFINITY,
+            ..camera
+        };
+        assert_eq!(lost.kept(), None);
+    }
+
+    /// A coordinate past what an `f32` holds leaves its card off the board, as one without a
+    /// place, and the rest framed; cards further apart than that frame the origin.
+    #[test]
+    fn a_card_out_of_an_f32s_reach_is_left_off_the_board() {
+        let text = r##"{"nodes":[
+            {"id":"a","type":"text","text":"A","x":0,"y":0,"width":100,"height":50},
+            {"id":"far","type":"text","text":"Far","x":1e39,"y":0,"width":100,"height":50},
+            {"id":"wide","type":"text","text":"Wide","x":3e38,"y":0,"width":3e38,"height":50}
+        ],"edges":[
+            {"id":"af","fromNode":"a","toNode":"far"}
+        ]}"##;
+        let file = CanvasFile::read(text, "#000000", None).unwrap();
+        let ids: Vec<&str> = file.cards.iter().map(|card| card.id.as_str()).collect();
+        assert_eq!(ids, ["a"]);
+        assert!(file.edges.is_empty(), "no edge to a card left off");
+        let all = file.all.unwrap();
+        assert!(all.x.is_finite() && all.width.is_finite());
+        assert!(Camera::framing(all, 800., 600.).kept().is_some());
+        let apart = r##"{"nodes":[
+            {"id":"l","type":"text","text":"L","x":-3e38,"y":0,"width":100,"height":50},
+            {"id":"r","type":"text","text":"R","x":3e38,"y":0,"width":100,"height":50}
+        ],"edges":[]}"##;
+        let file = CanvasFile::read(apart, "#000000", None).unwrap();
+        assert_eq!(file.cards.len(), 2);
+        let framed = Camera::framing(file.all.unwrap(), 800., 600.);
+        assert_eq!(framed, Camera::origin(800., 600.));
     }
 
     #[test]

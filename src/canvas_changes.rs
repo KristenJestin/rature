@@ -88,13 +88,13 @@ impl BoardChanges {
             let (Some(node), was) = (now.node(id), before.node(id)) else {
                 continue;
             };
-            let place = node.rect().map(area);
+            let place = node.rect().and_then(area);
             let mut stop = place;
             let mut words = None;
             if let NodeChange::Changed { content, moved } = change
                 && let Some(was) = was
             {
-                let old = was.rect().map(area);
+                let old = was.rect().and_then(area);
                 if moved && let Some(old) = old {
                     out.places.push(old);
                     stop = Some(stop.map_or(old, |stop| stop.union(old)));
@@ -117,10 +117,10 @@ impl BoardChanges {
             out.cards.insert(id.clone(), Marked { change, words });
         }
         for id in &changes.deleted_nodes {
-            let Some((node, Some(place))) = before.node(id).map(|n| (n, n.rect())) else {
+            let Some((node, Some(place))) = before.node(id).map(|n| (n, n.rect().and_then(area)))
+            else {
                 continue;
             };
-            let place = area(place);
             out.stops.push(place);
             out.gone.push(gone(node, place, ink, folder));
         }
@@ -357,14 +357,9 @@ impl BoardChanges {
     }
 }
 
-/// A node's place and size as an area of the canvas.
-fn area(rect: model::Rect) -> Area {
-    Area {
-        x: rect.x as f32,
-        y: rect.y as f32,
-        width: rect.width as f32,
-        height: rect.height as f32,
-    }
+/// A node's place and size as an area of the canvas; none past what the board draws.
+fn area(rect: model::Rect) -> Option<Area> {
+    canvas_view::board_area(rect)
 }
 
 fn area_of(rect: edges::Rect) -> Area {
@@ -414,14 +409,14 @@ fn ends(edge: &Edge, rects: &HashMap<&str, model::Rect>) -> Option<Area> {
     [edge.source_node(), edge.target_node()]
         .into_iter()
         .flatten()
-        .filter_map(|end| rects.get(end).copied().map(area))
+        .filter_map(|end| rects.get(end).copied().and_then(area))
         .reduce(Area::union)
 }
 
 /// An edge's line between its two cards in `rects`, as the board lays it.
 fn line(edge: &Edge, rects: &HashMap<&str, model::Rect>) -> Option<Line> {
     let rect = |end: Option<&str>| {
-        let a = area(*rects.get(end?)?);
+        let a = area(*rects.get(end?)?)?;
         Some(edges::Rect {
             x: a.x,
             y: a.y,
