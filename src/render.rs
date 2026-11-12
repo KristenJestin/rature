@@ -8,6 +8,10 @@ use std::sync::Arc;
 
 /// The narrowest a CSV column gets.
 const CELL: f32 = 90.;
+/// GPUI's rem, which the reader leaves as it is: it does not follow the zoom.
+const REM: f32 = 16.;
+/// The page's line, in rems at zoom 1.
+pub const LINE: f32 = 1.6;
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -89,6 +93,11 @@ pub fn hex(color: Hsla) -> String {
 /// Whether the theme being shown is dark: diagrams and code take their dark colours.
 pub fn is_dark(cx: &App) -> bool {
     gpui_design_system::theme::target_palette(cx).bg.l < 0.5
+}
+
+/// A line `rems` high at zoom 1, as high as the zoom makes the text: the rem stays put.
+pub fn line_height(rems_at_1: f32, zoom: f32) -> Rems {
+    rems(rems_at_1 * zoom)
 }
 
 /// A heading's size, against the text's.
@@ -442,9 +451,9 @@ fn text_flow(ctx: &Ctx, inlines: &[Inline]) -> AnyElement {
 /// Text with formulas: laid out word by word, a formula kept on the line of what follows it.
 fn word_flow(ctx: &Ctx, inlines: &[Inline]) -> Div {
     let mut row = div().flex().flex_wrap().items_baseline();
-    // Noto Sans: ascent 1.069 em, descent 0.293 em, in a line 1.6 rem high.
     let size = f32::from(ctx.size(1.));
-    let below = (25.6 - 1.362 * size) / 2. + 0.293 * size;
+    let line = f32::from(line_height(LINE, ctx.zoom).to_pixels(px(REM)));
+    let below = formula_drop(size, line);
     // A formula waits for what follows: punctuation right after it stays on its line.
     let mut formula: Option<Div> = None;
     for inline in inlines {
@@ -485,6 +494,13 @@ fn word_flow(ctx: &Ctx, inlines: &[Inline]) -> Div {
         }
     }
     row.children(formula)
+}
+
+/// How far under the text's baseline its line box ends, for text `size` px high on a line
+/// `line` px high: Noto Sans has an ascent of 1.069 em and a descent of 0.293 em, and the line's
+/// leading is split above and below.
+fn formula_drop(size: f32, line: f32) -> f32 {
+    (line - 1.362 * size) / 2. + 0.293 * size
 }
 
 /// The words of a paragraph or a heading that changed, the old ones struck.
@@ -569,7 +585,7 @@ pub fn code(ctx: &Ctx, lang: &str, text: &str) -> Div {
                 .p_4()
                 .font_family(ctx.config.code_font.clone())
                 .text_size(ctx.size(0.875))
-                .line_height(rems(1.45))
+                .line_height(line_height(1.45, ctx.zoom))
                 .flex()
                 .flex_col()
                 .children(text.lines().enumerate().map(|(ix, line)| {
@@ -882,9 +898,42 @@ pub fn image_file(path: &Path) -> AnyElement {
 
 #[cfg(test)]
 mod tests {
-    use super::{data_lines, node_at, one_line};
+    use super::{LINE, REM, data_lines, formula_drop, line_height, node_at, one_line};
     use crate::formats::{Kind, Node, Value};
+    use gpui_kit::{px, rems};
     use std::collections::HashSet;
+
+    fn line_px(zoom: f32) -> f32 {
+        f32::from(line_height(LINE, zoom).to_pixels(px(REM)))
+    }
+
+    #[test]
+    fn the_line_grows_with_the_zoom_and_stays_put_at_zoom_1() {
+        // At zoom 1, the line the page always had: 1.6 rem, 25.6 px.
+        assert_eq!(
+            line_height(LINE, 1.).to_pixels(px(REM)),
+            rems(1.6).to_pixels(px(REM))
+        );
+        assert_eq!(line_px(1.), 25.6);
+        // At the reader's zooms, 0.6 to 2.5, the line stays 1.6 times the text, 16 px at zoom 1:
+        // Noto Sans' glyphs, 1.362 em from top to bottom, fit in it.
+        for zoom in [0.6, 1., 1.1, 1.4641, 2., 2.5] {
+            let size = 16. * zoom;
+            assert!((line_px(zoom) - 1.6 * size).abs() < 1e-3, "zoom {zoom}");
+            assert!(line_px(zoom) > 1.362 * size, "zoom {zoom}");
+        }
+        assert!((line_px(2.5) - 64.).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_formula_sits_as_low_on_its_line_at_every_zoom() {
+        let at_1 = formula_drop(16., line_px(1.));
+        assert_eq!(at_1, (25.6 - 1.362 * 16.) / 2. + 0.293 * 16.);
+        for zoom in [0.6, 1.4641, 2.5] {
+            let drop = formula_drop(16. * zoom, line_px(zoom));
+            assert!((drop - at_1 * zoom).abs() < 1e-3, "zoom {zoom}");
+        }
+    }
 
     fn scalar(key: Option<&str>, text: &str) -> Node {
         Node {
