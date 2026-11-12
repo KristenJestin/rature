@@ -6140,6 +6140,7 @@ dependencies = [
  "gpui-design-system",
  "gpui-kit",
  "ignore",
+ "image",
  "markdown",
  "merman",
  "notify",
@@ -6154,6 +6155,7 @@ dependencies = [
  "syntect",
  "toml 0.8.23",
  "two-face",
+ "usvg 0.46.0",
  "yaml-rust2",
 ]
 

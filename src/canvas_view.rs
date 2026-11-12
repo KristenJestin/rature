@@ -21,6 +21,13 @@
 //! those files are watched, and a file read again when it changes. A link card shows its
 //! address. A double click or a Ctrl-click opens either: the file in the reader, at its heading,
 //! back returning to the board; the address by the desktop, as a link of a page is.
+//!
+//! A file card whose file is a png, a jpeg or an SVG shows the image, contained in the card and
+//! centred: a png or a jpeg decoded by GPUI off the main thread as the reader's images are; an
+//! SVG drawn off the main thread at the size it is seen at once the board rests, so that it
+//! stays sharp, a tinted box until it is. In the light versions, a tinted box. A group's `background` covers it. An image dropped onto
+//! the board from outside the window makes a file card where it was dropped, as wide as
+//! [`model::IMAGE_CARD_WIDTH`] and as high as its aspect makes it.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -42,7 +49,7 @@ use crate::canvas::{self as model, Canvas, Color, Edge, End, Node, NodeKind, Pro
 use crate::canvas_board::{self, Board, Saved, Written};
 use crate::canvas_changes::{self, BoardChanges, OnBoard};
 use crate::canvas_edges::{self as edges, Line};
-use crate::canvas_files::{self, Preview};
+use crate::canvas_files::{self, Picture, Preview};
 use crate::canvas_ops::{Op, Report, Target};
 use crate::config::Config;
 use crate::document::{self, Document, Links};
@@ -399,6 +406,9 @@ pub struct Card {
     /// What the light version shows: a text's first heading, else its first line; a group's
     /// label, a file's path, a link's address.
     pub title: String,
+    /// A group's background image, found from the canvas's folder, drawn to cover it: with
+    /// `backgroundStyle` `cover` or none; `ratio` and `repeat` are not drawn yet.
+    pub background: Option<PathBuf>,
 }
 
 /// A canvas file, read off the main thread and ready to draw.
@@ -629,6 +639,12 @@ fn card(
         Some(NodeKind::Other(kind)) => (CardKind::Other, kind.to_string()),
         None => (CardKind::Other, String::new()),
     };
+    let background = match (&kind, node.background(), node.background_style()) {
+        (CardKind::Group, Some(image), None | Some("cover")) if !image.trim().is_empty() => {
+            Some(model::resolve(folder.unwrap_or(Path::new("")), image))
+        }
+        _ => None,
+    };
     Some(Card {
         index,
         id: node.id().unwrap_or_default().to_string(),
@@ -636,6 +652,7 @@ fn card(
         tint,
         kind,
         title,
+        background,
     })
 }
 
@@ -733,12 +750,51 @@ pub struct CanvasView {
 #[derive(Default)]
 struct Files {
     previews: HashMap<PathBuf, Shown>,
+    /// The SVGs shown, drawn off the main thread at the size they are seen at once the board
+    /// rests, by path.
+    sharp: HashMap<PathBuf, Sharp>,
+    /// Drawings replaced: let go of by the window at its next frame, their textures with them.
+    retired: Vec<Arc<RenderImage>>,
+    /// The pngs and jpegs handed to GPUI by their path, which it keeps decoded: let go of when
+    /// they change or no card shows them any more.
+    loaded: HashSet<PathBuf>,
+    /// Lets go of the SVGs' drawings when the board is let go.
+    release: Option<Subscription>,
     /// The reads asked for: a read's result is put in place only when no read of its file was
     /// asked for after it.
     asked: u64,
     /// The folders of the files, each watched alone: the events, and the worker that adds and
     /// removes the watches off the main thread. Made with the first file card.
     watch: Option<(watch::Folders, Task<()>, Task<()>)>,
+}
+
+/// An SVG drawn at a size of its own.
+#[derive(Default)]
+struct Sharp {
+    /// Its width in device pixels, and its drawing.
+    drawn: Option<(u32, Arc<RenderImage>)>,
+    /// The width of the drawing under way, if one is.
+    asked: Option<u32>,
+    /// The last drawing could not be made: not asked again until the file changes, or comes
+    /// back into sight.
+    failed: bool,
+}
+
+impl Sharp {
+    /// Whether the SVG is drawn again for a width of `width` device pixels: not while a drawing
+    /// near it is under way or done, nor after a drawing failed. One that is too small, or more
+    /// than twice too large, is drawn again.
+    fn wants(&self, width: u32) -> bool {
+        let near = |had: u32| width <= had && width.saturating_mul(2) >= had;
+        if self.failed {
+            return false;
+        }
+        match (self.asked, &self.drawn) {
+            (Some(asked), _) => !near(asked),
+            (None, Some((had, _))) => !near(*had),
+            (None, None) => true,
+        }
+    }
 }
 
 /// A file as its cards show it.
@@ -1106,6 +1162,7 @@ impl CanvasView {
                 area,
                 changed.map(|(border, _)| border).or(color),
                 px(TITLE.max(f32::from(ctx.size(1.)))),
+                self.group_background(card),
                 p,
             ),
             CardKind::Text(doc) => frame
@@ -1140,10 +1197,19 @@ impl CanvasView {
                     (true, None) => p.fail,
                     _ => border,
                 };
-                frame
+                let frame = frame
                     .overflow_hidden()
                     .border_color(border)
-                    .bg(background(color.map_or(p.card, |c| mix(p.card, c, 0.1))))
+                    .bg(background(color.map_or(p.card, |c| mix(p.card, c, 0.1))));
+                if let (false, Some(Preview::Image(picture)), Some(path)) =
+                    (broken, self.preview(file), &file.path)
+                {
+                    let at = image_box(area, edge_width(zoom, changed.is_some()), *picture);
+                    return frame
+                        .child(self.image(path, *picture, at, p))
+                        .into_any_element();
+                }
+                frame
                     .child(render::scaled(
                         ctx.zoom,
                         div()
@@ -1252,26 +1318,27 @@ impl CanvasView {
             (None, _) if file.path.is_none() => out.push(said("This card names no file.".into())),
             (Some(Preview::Folder), _) => out.push(said("A folder, not a file.".into())),
             (Some(Preview::Unread(why)), _) => out.push(said(why.clone())),
-            (Some(Preview::Other | Preview::Markdown(_)), _) | (None, _) => {}
+            (Some(Preview::Other | Preview::Markdown(_) | Preview::Image(_)), _) | (None, _) => {}
         }
         out
     }
 
     /// A card as a coloured box and its title, at a fixed size on screen; in red when it is a
-    /// file card whose file is not there (`broken`).
+    /// file card whose file is not there (`broken`); an `image` as a tinted box alone.
     fn light_card(
         card: &Card,
         camera: Camera,
         p: &Palette,
         changes: &OnBoard,
         broken: bool,
+        image: bool,
     ) -> AnyElement {
         let (area, shown) = changes.risen(&card.id, camera.on_screen(card.area));
         let color = card.tint.map(|t| tint(p, t));
         let changed = changes.changes().and_then(|c| c.card_colors(&card.id, p));
         if let CardKind::Group = card.kind {
             let color = changed.map(|(border, _)| border).or(color);
-            return group(card, area, color, px(TITLE), p);
+            return group(card, area, color, px(TITLE), None, p);
         }
         placed(div().id(("card", card.index)), area)
             .opacity(shown)
@@ -1288,22 +1355,29 @@ impl CanvasView {
             ))
             .bg(changed
                 .and_then(|(_, bg)| bg)
-                .unwrap_or(color.map_or(p.card2, |c| mix(p.card, c, 0.3))))
+                .unwrap_or(match (image, color) {
+                    (true, None) => image_tint(p),
+                    (true, Some(c)) => mix(p.card, c, 0.45),
+                    (false, None) => p.card2,
+                    (false, Some(c)) => mix(p.card, c, 0.3),
+                }))
             .p(px(6.))
             .text_size(px(TITLE))
             .line_height(px(TITLE * 1.3))
             .text_color(if broken { p.fail } else { p.text })
-            .child(card.title.clone())
+            .when(!image, |d| d.child(card.title.clone()))
             .into_any_element()
     }
 
-    /// Every card as a rectangle, in one element; outlined in red when it is `broken`.
+    /// Every card as a rectangle, in one element; outlined in red when it is `broken`, an
+    /// `image` tinted as in the light version.
     fn rects(
         cards: &[&Card],
         camera: Camera,
         p: &Palette,
         changes: Option<&BoardChanges>,
         broken: impl Fn(&Card) -> bool,
+        image: impl Fn(&Card) -> bool,
     ) -> AnyElement {
         let quads: Vec<(Area, Hsla, Hsla)> = cards
             .iter()
@@ -1322,6 +1396,11 @@ impl CanvasView {
                     _ if broken(card) => {
                         (area, color.map_or(p.card2, |c| mix(p.card, c, 0.4)), p.fail)
                     }
+                    _ if image(card) => (
+                        area,
+                        color.map_or(image_tint(p), |c| mix(p.card, c, 0.45)),
+                        color.unwrap_or(p.line2),
+                    ),
                     _ => (
                         area,
                         color.map_or(p.card2, |c| mix(p.card, c, 0.4)),
@@ -2843,9 +2922,23 @@ fn placed(div: Stateful<Div>, area: Area) -> Stateful<Div> {
         .h(px(area.height))
 }
 
-/// A group: a tinted background, its label above its top left corner in `label` type.
-fn group(card: &Card, area: Area, color: Option<Hsla>, label: Pixels, p: &Palette) -> AnyElement {
+/// A group: a tinted background, its `background` image over it when it is drawn, its label
+/// above its top left corner in `label` type.
+fn group(
+    card: &Card,
+    area: Area,
+    color: Option<Hsla>,
+    label: Pixels,
+    background: Option<&Path>,
+    p: &Palette,
+) -> AnyElement {
     let line = label * 1.4;
+    let background = background.map(|path| {
+        img(Arc::<Path>::from(path))
+            .absolute()
+            .size_full()
+            .object_fit(ObjectFit::Cover)
+    });
     div()
         .id(("card", card.index))
         .absolute()
@@ -2870,12 +2963,87 @@ fn group(card: &Card, area: Area, color: Option<Hsla>, label: Pixels, p: &Palett
         .child(
             div()
                 .flex_1()
+                .relative()
+                .overflow_hidden()
                 .rounded(px(6.))
                 .border_1()
                 .border_color(color.map_or(p.line2, |c| c.opacity(0.6)))
-                .bg(color.map_or(p.text.opacity(0.03), |c| c.opacity(0.08))),
+                .bg(color.map_or(p.text.opacity(0.03), |c| c.opacity(0.08)))
+                .children(background),
         )
         .into_any_element()
+}
+
+/// Where an image `picture` is drawn in `area`: as large as it fits, its aspect kept, centred.
+pub fn contained(area: Area, picture: Picture) -> Area {
+    if !(picture.width > 0. && picture.height > 0.) {
+        return area;
+    }
+    let scale = (area.width / picture.width).min(area.height / picture.height);
+    let (width, height) = (picture.width * scale, picture.height * scale);
+    Area {
+        x: area.x + (area.width - width) / 2.,
+        y: area.y + (area.height - height) / 2.,
+        width,
+        height,
+    }
+}
+
+/// Which image a group's background, at `path`, shows: only one read as an image (`preview`), as
+/// a file card's; never a path GPUI would read whatever it is (`/dev/zero`, a pipe).
+fn background_image<'a>(path: Option<&'a Path>, preview: Option<&Preview>) -> Option<&'a Path> {
+    match preview {
+        Some(Preview::Image(_)) => path,
+        _ => None,
+    }
+}
+
+/// The largest an SVG is drawn, in device pixels, across or down.
+const SHARP_MOST: f32 = 4096.;
+
+/// The size an SVG seen `width` by `height` device pixels is drawn at: no more than
+/// [`SHARP_MOST`] either way, its aspect kept, at least a pixel either way (a pixmap of no
+/// height cannot be made).
+fn sharp_size(width: f32, height: f32) -> (u32, u32) {
+    let scale = (SHARP_MOST / width).min(SHARP_MOST / height).min(1.);
+    let side = |side: f32| (side * scale).round().clamp(1., SHARP_MOST) as u32;
+    (side(width), side(height))
+}
+
+/// The SVG at `path` drawn `width` by `height` device pixels, with GPUI's renderer and fonts;
+/// none when it cannot be read, is refused ([`canvas_files::svg`]), or cannot be drawn. Reads
+/// and draws: call it off the main thread.
+fn draw_svg(
+    renderer: &SvgRenderer,
+    path: &Path,
+    width: u32,
+    height: u32,
+) -> Option<Arc<RenderImage>> {
+    // Checked again as it is now: GPUI's parser reads what an SVG names.
+    let (bytes, ..) = canvas_files::svg(path).ok()?;
+    let svg = renderer.parse_svg(&bytes).ok()?;
+    let exact = size(
+        DevicePixels(i32::try_from(width).ok()?),
+        DevicePixels(i32::try_from(height).ok()?),
+    );
+    renderer.render_parsed(&svg, SvgSize::ExactSize(exact)).ok()
+}
+
+/// What an image card is in the light versions: a box of this tint.
+fn image_tint(p: &Palette) -> Hsla {
+    mix(p.card2, p.mute, 0.3)
+}
+
+/// Where a file card's image is drawn, on screen, in the card at `area` on screen with a border
+/// `border` wide: within the border, from the card's corner.
+fn image_box(area: Area, border: f32, picture: Picture) -> Area {
+    let inner = Area {
+        x: 0.,
+        y: 0.,
+        width: (area.width - 2. * border).max(0.),
+        height: (area.height - 2. * border).max(0.),
+    };
+    contained(inner, picture)
 }
 
 /// `position`, in the window, as a point of the board at `bounds`.
@@ -3728,6 +3896,157 @@ impl CanvasView {
         }
     }
 
+    /// Whether `card` is a file card that shows an image.
+    fn is_image(&self, card: &Card) -> bool {
+        match &card.kind {
+            CardKind::File(file) => matches!(self.preview(file), Some(Preview::Image(_))),
+            _ => false,
+        }
+    }
+
+    /// The image at `path`, drawn at `at` in its card: a png or a jpeg by GPUI as the reader's
+    /// images are; an SVG drawn at its size once the board rests, a tinted box until it is (GPUI
+    /// would draw it at twice its own size, and read the files it names).
+    fn image(&self, path: &Path, picture: Picture, at: Area, p: &Palette) -> AnyElement {
+        let place = |element: Div| {
+            element
+                .absolute()
+                .left(px(at.x))
+                .top(px(at.y))
+                .w(px(at.width))
+                .h(px(at.height))
+        };
+        if !picture.svg {
+            return place(div().child(img(Arc::<Path>::from(path)).size_full())).into_any_element();
+        }
+        match self.files.sharp.get(path).and_then(|s| s.drawn.as_ref()) {
+            Some((_, image)) => place(div().child(img(image.clone()).size_full())),
+            None => place(div().bg(image_tint(p))),
+        }
+        .into_any_element()
+    }
+
+    /// The SVGs of the image cards in sight (`seen`), drawn again off the main thread at the
+    /// width, in device pixels, they are seen at, when theirs is too small or more than twice too
+    /// large; those no longer in sight let go.
+    fn sharpen(
+        &mut self,
+        seen: &Area,
+        camera: Camera,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let scale = window.scale_factor();
+        let mut wanted: HashMap<PathBuf, (u32, u32)> = HashMap::new();
+        let mut loaded = Vec::new();
+        for card in self.file.cards.iter().filter(|card| card.area.meets(seen)) {
+            if let Some(path) = self.group_background(card) {
+                loaded.push(path.to_path_buf());
+            }
+            let CardKind::File(file) = &card.kind else {
+                continue;
+            };
+            let (Some(Preview::Image(picture)), Some(path)) = (self.preview(file), &file.path)
+            else {
+                continue;
+            };
+            if !picture.svg {
+                loaded.push(path.clone());
+                continue;
+            }
+            let area = camera.on_screen(card.area);
+            let at = image_box(area, edge_width(camera.zoom, false), *picture);
+            let size = sharp_size(at.width * scale, at.height * scale);
+            let most = wanted.entry(path.clone()).or_default();
+            if size.0 > most.0 {
+                *most = size;
+            }
+        }
+        let files = &mut self.files;
+        files.loaded.extend(loaded);
+        files.sharp.retain(|path, sharp| {
+            let kept = wanted.contains_key(path);
+            if !kept && let Some((_, image)) = sharp.drawn.take() {
+                files.retired.push(image);
+            }
+            kept
+        });
+        for (path, (width, height)) in wanted {
+            let sharp = files.sharp.entry(path.clone()).or_default();
+            if !sharp.wants(width) {
+                continue;
+            }
+            sharp.asked = Some(width);
+            let renderer = cx.svg_renderer();
+            let work = cx.background_executor().spawn(async move {
+                let image = draw_svg(&renderer, &path, width, height);
+                (path, image)
+            });
+            cx.spawn(async move |this, cx| {
+                let (path, image) = work.await;
+                this.update(cx, |this, cx| this.sharpened(path, width, image, cx))
+                    .ok();
+            })
+            .detach();
+        }
+    }
+
+    /// An SVG drawn `width` wide off the main thread, put in place unless another width was
+    /// asked for meanwhile; one that could not be drawn stays a tinted box, and is not asked
+    /// again (each frame would ask for it, and fail, again).
+    fn sharpened(
+        &mut self,
+        path: PathBuf,
+        width: u32,
+        image: Option<Arc<RenderImage>>,
+        cx: &mut Context<Self>,
+    ) {
+        let files = &mut self.files;
+        let Some(sharp) = files.sharp.get_mut(&path) else {
+            if let Some(image) = image {
+                files.retired.push(image);
+            }
+            return;
+        };
+        if sharp.asked != Some(width) {
+            if let Some(image) = image {
+                files.retired.push(image);
+            }
+            return;
+        }
+        sharp.asked = None;
+        let Some(image) = image else {
+            sharp.failed = true;
+            return;
+        };
+        if let Some((_, old)) = sharp.drawn.replace((width, image)) {
+            files.retired.push(old);
+        }
+        cx.notify();
+    }
+
+    /// A group's background image, when it can be drawn: only an image read as one, never the
+    /// path as the canvas has it (`/dev/zero`).
+    fn group_background<'a>(&self, card: &'a Card) -> Option<&'a Path> {
+        let path = card.background.as_deref()?;
+        let shown = self.files.previews.get(path)?;
+        background_image(Some(path), shown.preview.as_ref())
+    }
+
+    /// Lets go of what GPUI keeps of the png or jpeg at `path`, decoded for a card from its
+    /// path: its decoding now, so that it is decoded again the next time it is shown, and its
+    /// texture at the next frame.
+    fn forget_image(files: &mut Files, path: &Path, cx: &mut App) {
+        if !files.loaded.remove(path) {
+            return;
+        }
+        let resource = Resource::from(Arc::<Path>::from(path));
+        if let Some(Ok(image)) = cx.fetch_asset::<ImgResourceLoader>(&resource) {
+            files.retired.push(image);
+        }
+        cx.remove_asset::<ImgResourceLoader>(&resource);
+    }
+
     /// The files the file cards show now: those not read yet are read, those no card shows any
     /// more let go, and their folders watched.
     fn want_files(&mut self, cx: &mut Context<Self>) {
@@ -3737,11 +4056,25 @@ impl CanvasView {
             .iter()
             .filter_map(|card| match &card.kind {
                 CardKind::File(file) => file.path.clone(),
-                _ => None,
+                _ => card.background.clone(),
             })
             .collect();
         let files = &mut self.files;
         files.previews.retain(|path, _| wanted.contains(path));
+        // What no card shows any more is let go of.
+        let gone: Vec<PathBuf> = files
+            .loaded
+            .iter()
+            .chain(files.sharp.keys())
+            .filter(|path| !wanted.contains(*path))
+            .cloned()
+            .collect();
+        for path in &gone {
+            Self::forget_image(files, path, cx);
+            if let Some((_, image)) = files.sharp.remove(path).and_then(|sharp| sharp.drawn) {
+                files.retired.push(image);
+            }
+        }
         let new: Vec<PathBuf> = wanted
             .iter()
             .filter(|path| !files.previews.contains_key(*path))
@@ -3824,6 +4157,15 @@ impl CanvasView {
             .filter(|path| paths.contains(*path))
             .cloned()
             .collect();
+        // GPUI keeps an image decoded by its path: an image changed is decoded again, an SVG
+        // drawn again.
+        let files = &mut self.files;
+        for path in &touched {
+            Self::forget_image(files, path, cx);
+            if let Some((_, image)) = files.sharp.remove(path).and_then(|sharp| sharp.drawn) {
+                files.retired.push(image);
+            }
+        }
         self.read_files(touched, cx);
     }
 
@@ -3890,6 +4232,164 @@ impl CanvasView {
             _ => false,
         }
     }
+}
+
+/// Files dropped onto the board: each image a file card.
+impl CanvasView {
+    /// Files dropped from outside the window (the file manager): their sizes read off the main
+    /// thread, then each image a file card where it was dropped; what is not one said.
+    fn dropped(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(camera), Some(bounds)) = (self.camera, self.bounds) else {
+            return;
+        };
+        let (x, y) = local(window.mouse_position(), bounds);
+        let at = camera.to_canvas(x, y);
+        let (images, others): (Vec<PathBuf>, Vec<PathBuf>) = paths
+            .paths()
+            .iter()
+            .cloned()
+            .partition(|path| formats::is_card_image(path));
+        if !others.is_empty() {
+            toast(
+                Toast::failure(format!(
+                    "Only a png, jpeg or svg image makes a card here: {} left out",
+                    names(&others)
+                )),
+                cx,
+            );
+        }
+        if images.is_empty() {
+            return;
+        }
+        let ink = render::ink(cx);
+        let work = cx.background_executor().spawn(async move {
+            images
+                .into_iter()
+                .map(|path| {
+                    let preview = canvas_files::read(&path, &ink);
+                    (path, preview)
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let read = work.await;
+            this.update(cx, |this, cx| this.drop_images(at, read, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Images dropped at the canvas's point `at`, read: a file card for each, written at once
+    /// and selected, its path from the canvas's folder; one that is not an image it can show
+    /// said.
+    fn drop_images(
+        &mut self,
+        at: (f32, f32),
+        read: Vec<(PathBuf, Preview)>,
+        cx: &mut Context<Self>,
+    ) {
+        let folder = std::path::absolute(&self.edits.path)
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf));
+        let (mut images, mut refused, mut unnamed) = (Vec::new(), Vec::new(), Vec::new());
+        for (path, preview) in read {
+            let named = folder
+                .as_deref()
+                .and_then(|folder| model::relative(folder, &std::path::absolute(&path).ok()?));
+            match (preview, named) {
+                (Preview::Image(picture), Some(named)) => images.push((named, picture)),
+                // The canvas is JSON: a path that is not UTF-8 cannot be written in it.
+                (Preview::Image(_), None) => unnamed.push(path),
+                _ => refused.push(path),
+            }
+        }
+        if !refused.is_empty() {
+            toast(
+                Toast::failure(format!("Not an image it can show: {}", names(&refused))),
+                cx,
+            );
+        }
+        if !unnamed.is_empty() {
+            toast(
+                Toast::failure(format!(
+                    "Its path cannot be written in the canvas, not being UTF-8: {}",
+                    names(&unnamed)
+                )),
+                cx,
+            );
+        }
+        if images.is_empty() || self.edits.held.is_some() {
+            return;
+        }
+        self.stop_typing(cx);
+        let mut ids = Vec::new();
+        let made = self.edit(
+            |canvas| {
+                let nodes = dropped_cards(canvas, at, &images);
+                ids = nodes
+                    .iter()
+                    .filter_map(|node| node.id().map(str::to_string))
+                    .collect();
+                nodes.into_iter().map(Op::add_node).collect()
+            },
+            cx,
+        );
+        if made {
+            self.edits.selected = ids;
+            self.edits.edge = None;
+            self.show_texts(cx);
+            self.save(cx);
+        }
+    }
+}
+
+/// The room between two images dropped together, in the canvas's pixels.
+const DROP_GAP: f32 = 40.;
+
+/// The file cards of images dropped at the canvas's point `at`, each named by its path from the
+/// canvas's folder: [`model::IMAGE_CARD_WIDTH`] wide and as high as its image's aspect makes it,
+/// the first centred on the point, the others in a row to its right, their tops in line.
+pub fn dropped_cards(canvas: &Canvas, at: (f32, f32), images: &[(String, Picture)]) -> Vec<Node> {
+    let mut x = f64::from(at.0) - model::IMAGE_CARD_WIDTH / 2.;
+    let mut top = None;
+    let mut taken = HashSet::new();
+    images
+        .iter()
+        .map(|(file, picture)| {
+            let (width, height) =
+                model::image_card_size(f64::from(picture.width), f64::from(picture.height));
+            let y = *top.get_or_insert((f64::from(at.1) - height / 2.).round());
+            let rect = Rect {
+                x: x.round(),
+                y,
+                width,
+                height,
+            };
+            x += width + f64::from(DROP_GAP);
+            // Made one after the other on the same canvas: an id each.
+            let id = loop {
+                let id = canvas.new_id();
+                if taken.insert(id.clone()) {
+                    break id;
+                }
+            };
+            Node::new_file(&id, file, rect)
+        })
+        .collect()
+}
+
+/// The names of `paths`, for a message: the files' own, without their folders.
+fn names(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| {
+            path.file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A watch on the folders of a canvas's files, its events read on the board; none when the
@@ -4000,6 +4500,11 @@ impl Render for CanvasView {
             .overflow_hidden()
             .bg(p.bg)
             .on_mouse_down(MouseButton::Left, cx.listener(Self::press))
+            .on_drop(cx.listener(Self::dropped))
+            .drag_over::<ExternalPaths>({
+                let tint = mix(p.bg, p.mute, 0.08);
+                move |style, _, _, _| style.bg(tint)
+            })
             .on_scroll_wheel(cx.listener(Self::wheel))
             .on_pinch(cx.listener(Self::pinch))
             .when(self.panning.is_some(), |d| {
@@ -4018,13 +4523,29 @@ impl Render for CanvasView {
             f32::from(bounds.size.height),
             MARGIN,
         );
+        let detail = Detail::at(camera.zoom, self.gesturing);
+        for image in self.files.retired.drain(..) {
+            window.drop_image(image).ok();
+        }
+        // Made here, where the window is known: its textures go with the board.
+        if self.files.release.is_none() {
+            self.files.release = Some(cx.on_release_in(window, |this, window, _| {
+                let files = &mut this.files;
+                let drawn = files.sharp.drain().filter_map(|(_, sharp)| sharp.drawn);
+                for image in drawn.map(|(_, image)| image).chain(files.retired.drain(..)) {
+                    window.drop_image(image).ok();
+                }
+            }));
+        }
+        if matches!(detail, Detail::Full) {
+            self.sharpen(&seen, camera, window, cx);
+        }
         let shown: Vec<&Card> = self
             .file
             .cards
             .iter()
             .filter(|card| card.area.meets(&seen))
             .collect();
-        let detail = Detail::at(camera.zoom, self.gesturing);
         if self.changes.rise(&shown, cx.background_executor().now()) {
             window.request_animation_frame();
         }
@@ -4059,8 +4580,8 @@ impl Render for CanvasView {
                         .iter()
                         .filter(|card| !self.is_typed(card))
                         .map(|card| {
-                            let broken = self.broken(card);
-                            Self::light_card(card, camera, &p, &self.changes, broken)
+                            let (broken, image) = (self.broken(card), self.is_image(card));
+                            Self::light_card(card, camera, &p, &self.changes, broken, image)
                         }),
                 ),
             Detail::Rects => {
@@ -4075,9 +4596,14 @@ impl Render for CanvasView {
                             .into_iter()
                             .flat_map(|m| m.ghosts::<Self>(None, camera, &seen, &p)),
                     )
-                    .child(Self::rects(&shown, camera, &p, marks, |card| {
-                        self.broken(card)
-                    }))
+                    .child(Self::rects(
+                        &shown,
+                        camera,
+                        &p,
+                        marks,
+                        |card| self.broken(card),
+                        |card| self.is_image(card),
+                    ))
             }
         };
         board = board.children(self.typed_card(detail, camera, &p, &config, cx));
@@ -4379,6 +4905,183 @@ mod tests {
         ));
         assert!(matches!(file.cards[2].kind, CardKind::Link));
         assert_eq!(file.cards[2].title, "https://example.org");
+    }
+
+    fn picture(width: f32, height: f32) -> super::Picture {
+        super::Picture {
+            width,
+            height,
+            svg: false,
+        }
+    }
+
+    fn area(x: f32, y: f32, width: f32, height: f32) -> Area {
+        Area {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn an_image_is_contained_and_centred_in_a_card_of_another_aspect() {
+        use super::contained;
+        let card = area(10., 20., 400., 400.);
+        // Wider than the card: as wide, centred down.
+        assert_eq!(
+            contained(card, picture(1600., 900.)),
+            area(10., 107.5, 400., 225.)
+        );
+        // Taller: as high, centred across.
+        assert_eq!(
+            contained(card, picture(300., 600.)),
+            area(110., 20., 200., 400.)
+        );
+        // Of its aspect: the card whole, an image smaller than it grown.
+        assert_eq!(contained(card, picture(40., 40.)), card);
+        let wide = area(0., 0., 600., 200.);
+        assert_eq!(
+            contained(wide, picture(100., 100.)),
+            area(200., 0., 200., 200.)
+        );
+        // An image without a size takes the card.
+        assert_eq!(contained(wide, picture(0., 10.)), wide);
+        // On screen, within the card's border.
+        assert_eq!(
+            super::image_box(area(50., 50., 404., 204.), 2., picture(200., 100.)),
+            area(0., 0., 400., 200.)
+        );
+    }
+
+    #[test]
+    fn an_svg_is_drawn_at_its_size_on_screen_within_a_limit() {
+        use super::sharp_size;
+        let sharp_width = |width, height| sharp_size(width, height).0;
+        assert_eq!(sharp_size(1200.4, 600.), (1200, 600));
+        assert_eq!(sharp_size(0.2, 0.2), (1, 1));
+        // A side under a pixel is a pixel: a pixmap of no height cannot be made (a viewBox of
+        // 1000 by 1 in a card 400 wide).
+        assert_eq!(sharp_size(792., 0.79), (792, 1));
+        assert_eq!(sharp_size(0.4, 300.), (1, 300));
+        assert_eq!(sharp_size(8192., 0.5), (4096, 1));
+        // At most 4096 pixels either way, its aspect kept.
+        assert_eq!(sharp_width(8192., 1000.), 4096);
+        assert_eq!(sharp_width(2000., 8000.), 1024);
+    }
+
+    #[test]
+    fn an_svg_that_could_not_be_drawn_is_not_asked_again() {
+        use super::Sharp;
+        // Never drawn: drawn.
+        assert!(Sharp::default().wants(800));
+        // Under way, or drawn, near enough: not again; too small, or twice too large: again.
+        let asked = Sharp {
+            asked: Some(800),
+            ..Sharp::default()
+        };
+        assert!(!asked.wants(800) && !asked.wants(400));
+        assert!(asked.wants(801) && asked.wants(399));
+        // Failed: not again, whatever the size, until the file changes or comes back into
+        // sight (the entry is made again then). Asking again at each frame, each failing and
+        // asking for a frame, never ended.
+        let failed = Sharp {
+            failed: true,
+            ..Sharp::default()
+        };
+        assert!(!failed.wants(800));
+        assert!(!failed.wants(1));
+        assert!(!failed.wants(u32::MAX));
+    }
+
+    #[test]
+    fn a_groups_background_is_drawn_only_when_read_as_an_image() {
+        use super::background_image;
+        use crate::canvas_files::{Picture, Preview};
+        use std::path::Path;
+        let path = Some(Path::new("/garden/sky.png"));
+        let picture = Preview::Image(Picture {
+            width: 10.,
+            height: 10.,
+            svg: false,
+        });
+        assert_eq!(background_image(path, Some(&picture)), path);
+        // Not read yet, not there, not an image (`/dev/zero`, a pipe, a gif): not drawn, never
+        // read by GPUI.
+        for preview in [
+            None,
+            Some(Preview::Missing),
+            Some(Preview::Folder),
+            Some(Preview::Other),
+            Some(Preview::Unread("It is a device".into())),
+        ] {
+            assert_eq!(background_image(path, preview.as_ref()), None);
+        }
+        assert_eq!(background_image(None, Some(&picture)), None);
+    }
+
+    #[test]
+    fn images_dropped_make_cards_400_wide_as_high_as_their_aspect() {
+        use super::dropped_cards;
+        use crate::canvas::{NodeKind, Rect};
+        let canvas = Canvas::read(BOARD);
+        let images = [
+            ("shots/wide.png".to_string(), picture(1600., 900.)),
+            ("../tall.svg".to_string(), picture(300., 600.)),
+            ("square.jpg".to_string(), picture(64., 64.)),
+        ];
+        let nodes = dropped_cards(&canvas, (1000., 500.), &images);
+        let rects: Vec<Rect> = nodes.iter().map(|node| node.rect().unwrap()).collect();
+        let rect = |x, y, width, height| Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        // The first centred on the point, the others in a row, their tops in line.
+        assert_eq!(
+            rects,
+            [
+                rect(800., 388., 400., 225.),
+                rect(1240., 388., 400., 800.),
+                rect(1680., 388., 400., 400.),
+            ]
+        );
+        let files: Vec<&str> = nodes.iter().filter_map(|node| node.file()).collect();
+        assert_eq!(files, ["shots/wide.png", "../tall.svg", "square.jpg"]);
+        assert!(nodes.iter().all(|node| node.kind() == Some(NodeKind::File)));
+        // An id each, none the canvas has.
+        let ids: std::collections::HashSet<&str> =
+            nodes.iter().filter_map(|node| node.id()).collect();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.iter().all(|id| canvas.node(id).is_none()));
+    }
+
+    #[test]
+    fn a_groups_background_is_found_from_the_canvass_folder_when_it_covers() {
+        use std::path::{Path, PathBuf};
+        let text = r##"{"nodes":[
+            {"id":"g","type":"group","background":"img/sky.png","x":0,"y":0,"width":100,"height":100},
+            {"id":"c","type":"group","background":"sky.png","backgroundStyle":"cover","x":0,"y":0,"width":100,"height":100},
+            {"id":"r","type":"group","background":"sky.png","backgroundStyle":"repeat","x":0,"y":0,"width":100,"height":100},
+            {"id":"t","type":"text","text":"T","background":"sky.png","x":0,"y":0,"width":100,"height":100}
+        ],"edges":[]}"##;
+        let file = CanvasFile::read(text, "#000000", Some(Path::new("/garden/boards"))).unwrap();
+        let backgrounds: Vec<Option<PathBuf>> = file
+            .cards
+            .iter()
+            .map(|card| card.background.clone())
+            .collect();
+        assert_eq!(
+            backgrounds,
+            [
+                Some(PathBuf::from("/garden/boards/img/sky.png")),
+                Some(PathBuf::from("/garden/boards/sky.png")),
+                // `ratio` and `repeat` later; never on a card that is not a group.
+                None,
+                None,
+            ]
+        );
     }
 
     /// Cards `a` and `b`, an edge between them and one from `b` to `c`, and a group `g` holding

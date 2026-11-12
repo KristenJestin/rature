@@ -370,6 +370,20 @@ pub fn default_size(kind: NodeKind<'_>, text: Option<&str>) -> (f64, f64) {
     }
 }
 
+/// How wide a card made from an image is, in the canvas's pixels.
+pub const IMAGE_CARD_WIDTH: f64 = 400.;
+
+/// The size of a card made from an image `width` by `height`: [`IMAGE_CARD_WIDTH`] wide, as high
+/// as the image's aspect makes it, a whole number, never less than 1. An image without a size
+/// gets a file card's default.
+pub fn image_card_size(width: f64, height: f64) -> (f64, f64) {
+    if !(width > 0. && height > 0. && width.is_finite() && height.is_finite()) {
+        return default_size(NodeKind::File, None);
+    }
+    let height = (IMAGE_CARD_WIDTH * height / width).round().max(1.);
+    (IMAGE_CARD_WIDTH, height)
+}
+
 /// Takes the entries of the list at `key` out of `top`, leaving `null` in its place; what is
 /// not a list of objects is told in `broken`, and left out.
 fn take_list(
@@ -583,6 +597,25 @@ impl Node {
         node
     }
 
+    /// A new file card showing `file`, a path as the canvas writes it, its keys in the order
+    /// Obsidian writes them; its place and size rounded.
+    pub fn new_file(id: &str, file: &str, rect: Rect) -> Self {
+        let mut fields = Map::new();
+        fields.insert("id".into(), id.into());
+        fields.insert("type".into(), "file".into());
+        fields.insert("file".into(), file.into());
+        let mut node = Self { fields };
+        for (key, value) in [
+            ("x", rect.x),
+            ("y", rect.y),
+            ("width", rect.width),
+            ("height", rect.height),
+        ] {
+            node.fields.insert(key.into(), integer(value));
+        }
+        node
+    }
+
     /// A node of this object: what it holds is not checked.
     pub(crate) fn from_fields(fields: Map<String, Value>) -> Self {
         Self { fields }
@@ -650,6 +683,16 @@ impl Node {
     /// A group's label.
     pub fn label(&self) -> Option<&str> {
         string(&self.fields, "label")
+    }
+
+    /// A group's background image.
+    pub fn background(&self) -> Option<&str> {
+        string(&self.fields, "background")
+    }
+
+    /// How a group's background image fills it: `cover`, `ratio` or `repeat`.
+    pub fn background_style(&self) -> Option<&str> {
+        string(&self.fields, "backgroundStyle")
     }
 
     /// Moves the node. Each coordinate that changes is rounded to an integer; one that does
@@ -821,6 +864,33 @@ pub fn resolve(folder: &Path, file: &str) -> PathBuf {
         }
     }
     out
+}
+
+/// The path a file card names `file` by, from `folder`, the canvas's own: [`resolve`]'s reverse,
+/// worked out on the paths' text (`.` and `..` taken out first), `/` between its parts. Both are
+/// absolute, or both relative to the same place; otherwise, or when `file` is not UTF-8 (the file
+/// is JSON), none.
+pub fn relative(folder: &Path, file: &Path) -> Option<String> {
+    if folder.is_absolute() != file.is_absolute() {
+        return None;
+    }
+    let folder = resolve(folder, "");
+    let file = resolve(file, "");
+    let (from, to): (Vec<Component>, Vec<Component>) =
+        (folder.components().collect(), file.components().collect());
+    let shared = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    // A relative folder that goes up further than the file: where it is is not known.
+    if from[shared..].contains(&Component::ParentDir) {
+        return None;
+    }
+    let mut parts: Vec<&str> = vec![".."; from.len() - shared];
+    for part in &to[shared..] {
+        parts.push(part.as_os_str().to_str()?);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("/"))
 }
 
 /// What happened to a node since the canvas it is compared to.
@@ -1436,6 +1506,68 @@ mod tests {
             600.
         );
         assert_eq!(default_size(NodeKind::File, None), (400., 400.));
+    }
+
+    #[test]
+    fn a_card_made_from_an_image_is_400_wide_and_as_high_as_its_aspect() {
+        // Landscape, portrait, square.
+        assert_eq!(image_card_size(1600., 900.), (400., 225.));
+        assert_eq!(image_card_size(300., 600.), (400., 800.));
+        assert_eq!(image_card_size(64., 64.), (400., 400.));
+        // Rounded to a whole number, never flat.
+        assert_eq!(image_card_size(1024., 333.), (400., 130.));
+        assert_eq!(image_card_size(100_000., 1.), (400., 1.));
+        // An image without a size: a file card's default.
+        assert_eq!(image_card_size(0., 100.), (400., 400.));
+        assert_eq!(image_card_size(f64::NAN, 100.), (400., 400.));
+    }
+
+    #[test]
+    fn a_files_path_from_the_canvass_folder_finds_it_again() {
+        let folder = Path::new("/home/ann/boards");
+        for (file, written) in [
+            ("/home/ann/boards/shot.png", "shot.png"),
+            ("/home/ann/boards/img/shot.png", "img/shot.png"),
+            ("/home/ann/pictures/shot.png", "../pictures/shot.png"),
+            ("/tmp/shot.png", "../../../tmp/shot.png"),
+            ("/home/ann/boards/./img/../shot.png", "shot.png"),
+        ] {
+            let path = relative(folder, Path::new(file));
+            assert_eq!(path.as_deref(), Some(written), "{file}");
+            assert_eq!(resolve(folder, written), resolve(Path::new(file), ""));
+        }
+        assert_eq!(
+            relative(Path::new("a/b"), Path::new("a/c.png")).as_deref(),
+            Some("../c.png")
+        );
+        // Not the same kind of path, the folder itself, a folder above where it is known.
+        assert_eq!(relative(folder, Path::new("shot.png")), None);
+        assert_eq!(relative(folder, folder), None);
+        assert_eq!(relative(Path::new("../x"), Path::new("y.png")), None);
+    }
+
+    #[test]
+    fn a_new_file_card_has_its_keys_in_obsidians_order() {
+        let rect = Rect {
+            x: -200.4,
+            y: 10.6,
+            width: 400.,
+            height: 225.,
+        };
+        let node = Node::new_file("f1", "img/shot.png", rect);
+        let keys: Vec<&str> = node.fields().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["id", "type", "file", "x", "y", "width", "height"]);
+        assert_eq!(node.kind(), Some(NodeKind::File));
+        assert_eq!(node.file(), Some("img/shot.png"));
+        assert_eq!(
+            node.rect(),
+            Some(Rect {
+                x: -200.,
+                y: 11.,
+                width: 400.,
+                height: 225.
+            })
+        );
     }
 
     /// Three cards, `a` `b` `c`, and two edges, `ab` and `bc`, as last read.

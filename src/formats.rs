@@ -10,7 +10,7 @@ use crate::{fsio, icons};
 use gpui_design_system::Icon;
 
 /// Larger than this, a file is not read: Rature is for reading, not for logs.
-const LARGEST: u64 = 10 * 1024 * 1024;
+pub const LARGEST: u64 = 10 * 1024 * 1024;
 
 pub enum Content {
     /// Shared with the work done off the main thread: "what changed" compares it there.
@@ -50,6 +50,18 @@ pub enum Kind {
 }
 
 const IMAGES: [&str; 8] = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico"];
+
+/// The images a canvas's file card shows, and an image dropped onto the board makes a card of.
+const CARD_IMAGES: [&str; 4] = ["png", "jpg", "jpeg", "svg"];
+
+/// Whether a canvas's file card showing `path` shows it as an image.
+pub fn is_card_image(path: &Path) -> bool {
+    CARD_IMAGES.contains(&extension(path).as_str())
+}
+
+pub fn is_svg(path: &Path) -> bool {
+    extension(path) == "svg"
+}
 
 pub fn is_markdown(path: &Path) -> bool {
     matches!(
