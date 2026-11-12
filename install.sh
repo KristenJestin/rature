@@ -310,6 +310,15 @@ main() {
 
   curl -fsSL -o "$work/$name" -- "$url" || fail "cannot download $url"
   curl -fsSL -o "$work/$name.sha256" -- "$url.sha256" || fail "cannot download $url.sha256"
+  # `sha256sum --check` checks the files its lines name, whatever they are: one line, as
+  # tools/package.sh writes it, naming this very archive, or another file would be checked.
+  awk -v name="$name" '{ line = $0 } END {
+      if (NR != 1 || length(line) != 66 + length(name)) exit 1
+      if (substr(line, 1, 64) !~ /^[0-9a-f]+$/) exit 1
+      mode = substr(line, 65, 2)
+      exit !((mode == "  " || mode == " *") && substr(line, 67) == name)
+    }' "$work/$name.sha256" ||
+    fail "the SHA-256 sum published for $name is not one line naming it: nothing was installed"
   (cd "$work" && sha256sum --check --status "$name.sha256") ||
     fail "the SHA-256 sum of $name is not the one published: nothing was installed"
   mkdir "$work/unpacked"

@@ -326,6 +326,34 @@ check "a wrong sum: exit 1, said" eval 'exited 1 && said "is not the one publish
 check "a wrong sum: nothing installed" eval 'nothing_installed && [ ! -e "$bin/rt" ]'
 check "a wrong sum: the download folder is removed" temp_removed
 
+# A sum's file that would check another file than the archive: refused before sha256sum runs.
+# Its releases are only in the API's tags, so the lists above stay as they are.
+# 0.5.0: the right sum of the API's answer, which install.sh keeps beside the archive.
+make_archive 0.5.0 stable
+release_json 0.5.0 2026-11-07T10:00:00Z >"$tmp/www/api/releases/tags/v0.5.0"
+answer_sum=$(sha256sum <"$tmp/www/api/releases/tags/v0.5.0")
+printf '%s  answer.json\n' "${answer_sum%% *}" \
+  >"$tmp/www/dl/releases/download/v0.5.0/rature-0.5.0-x86_64-linux.tar.gz.sha256"
+# 0.5.1: the archive's own line, twice.
+make_archive 0.5.1 stable
+release_json 0.5.1 2026-11-07T11:00:00Z >"$tmp/www/api/releases/tags/v0.5.1"
+sum_file="$tmp/www/dl/releases/download/v0.5.1/rature-0.5.1-x86_64-linux.tar.gz.sha256"
+cat "$sum_file" "$sum_file" >"$tmp/two-lines"
+mv "$tmp/two-lines" "$sum_file"
+# 0.5.2: the archive's right sum, written by its path rather than its name.
+make_archive 0.5.2 stable
+release_json 0.5.2 2026-11-07T12:00:00Z >"$tmp/www/api/releases/tags/v0.5.2"
+sum_file="$tmp/www/dl/releases/download/v0.5.2/rature-0.5.2-x86_64-linux.tar.gz.sha256"
+sed 's|  rature-|  ./rature-|' "$sum_file" >"$tmp/by-path"
+mv "$tmp/by-path" "$sum_file"
+for version in 0.5.0 0.5.1 0.5.2; do
+  fresh_home "sum-names-$version"
+  install_sh --version "$version"
+  check "a sum's file not one line naming the archive ($version): exit 1, said, nothing installed" \
+    eval 'exited 1 && said "is not one line naming it: nothing was installed" && nothing_installed && [ ! -e "$bin/rt" ]'
+  check "a sum's file not one line naming the archive ($version): the download folder is removed" temp_removed
+done
+
 # 404, network and GitHub failures.
 fresh_home failures
 api_root=empty

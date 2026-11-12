@@ -141,7 +141,9 @@ last line, so a download cut short runs nothing. It follows Flottille's `install
   exits 2. A release that is not there (404), the network failing and GitHub failing are said
   apart.
 - **The sum first**: the archive and its `.sha256` go to a `mktemp -d` folder removed on exit,
-  and `sha256sum --check` runs before anything is installed: a mismatch installs nothing.
+  and `sha256sum --check` runs before anything is installed: a mismatch installs nothing. The
+  `.sha256` must be one line naming that archive, or nothing is installed either: `sha256sum`
+  checks the file a line names, which could be another.
 - **Installed**: the binary is written beside (`~/.local/bin/.rature.new`), then renamed over
   `rature`, so a window already open keeps its own file, and the former version until it is
   closed. `rt` is a relative link to it, never replacing an `rt` that is not Rature's: that is
