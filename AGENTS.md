@@ -121,13 +121,16 @@ Besides `src/`:
 
 ## Branches and releases (non-negotiable)
 
-See `docs/releases.md`, "Branches" and "Releasing".
+See `docs/releases.md`, "Branches", "First publication" and "Releasing".
 
 - **`dev` is the integration branch and the default branch.** A branch starts from `origin/dev`,
   as `feat/<n>-<topic>` or `fix/<n>-<topic>` (`<n>` the issue), and its pull request targets
   `dev`. **These two prefixes are the only ones**, whatever the commit's type: a documentation
   change goes on `feat/<n>-<topic>` or `fix/<n>-<topic>`, and its squash keeps its `docs(...)`
   type.
+- **No `feat/` or `fix/` branch is pushed or deleted before `dev` is GitHub's default branch**:
+  until then the alpha cleanup does not run and the release cannot be started. The order of the
+  first publication is in `docs/releases.md`, "First publication".
 - **Never commit, merge, rebase, push or force-push on `main` or `dev` directly.** On one of them,
   create a branch first.
 - **Pull requests into `dev` are merged by squash only.** The title is a plain Angular subject,

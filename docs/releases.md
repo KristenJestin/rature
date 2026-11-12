@@ -19,6 +19,17 @@ alpha's too.
 `dev` is the default and integration branch. Branches start from `origin/dev` and reach it by
 squash. `main` only gets releases, and stays an ancestor of `dev`.
 
+## First publication
+
+GitHub runs a branch's `delete` workflow, and lets a workflow be started by hand, from the
+default branch's own files only. While `main`, which has neither, is the default,
+`alpha-cleanup.yml` does not run when a branch is deleted, so its alphas stay, and `release.yml`
+cannot be started. So the first time, in this order:
+
+1. Push `dev`.
+2. Make `dev` the default branch on GitHub (the repository's settings, "Default branch").
+3. Only then push or delete `feat/` and `fix/` branches.
+
 ## Releasing
 
 A release does not squash nor merge: **`main` moves forward to a commit of `dev`** (a
