@@ -38,7 +38,8 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 
 | File | What it is |
 |---|---|
-| `main.rs` | The entry: arguments (`--help`, `--version`), the hand-over to a running window, leaving the terminal, starting the window |
+| `main.rs` | The entry: arguments (`--help`, `--version`, `mcp`), the hand-over to a running window, leaving the terminal, starting the window |
+| `mcp.rs` | `rature mcp`: an MCP server on stdin and stdout, both eras (2026-07-28 stateless, 2025-11-25 with `initialize`), reading canvases only inside its allowed folders; no window |
 | `instance.rs` | One window per user: a second `rature` hands its file to the running one over a socket in the runtime folder, and exits |
 | `workspace.rs` | The window: the reader, a folder's tree beside it, and the picker over them |
 | `reader.rs` | The file being read: what it shows, where the reading stands, what changed, the search inside it, the block being edited |

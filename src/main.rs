@@ -1,6 +1,6 @@
 mod cache;
-// The model of `.canvas` files, its operations and its writes: no window uses them before the
-// canvas opens in one (#9).
+// The model of `.canvas` files, its operations and its writes: `rature mcp` reads with them, and
+// no window uses them before the canvas opens in one (#9).
 #[allow(dead_code)]
 mod canvas;
 #[allow(dead_code)]
@@ -22,6 +22,7 @@ mod list;
 mod live;
 mod load;
 mod math;
+mod mcp;
 mod picker;
 mod reader;
 mod render;
@@ -45,11 +46,15 @@ use gpui_kit::*;
 const FOREGROUND: &str = "RATURE_FOREGROUND";
 
 const USAGE: &str = "usage: rature [file or folder]
+       rature mcp [--allow-dir DIR]...
        rature --version
 
 Reads Markdown (and JSON, YAML, CSV, images, code) and follows its changes.
 `rt` is the same. Keys: see the README, or `f` `s` `o` `t` `Ctrl-f` `]c` `m` `i` `e` `q` in the
-window.";
+window.
+
+`rature mcp` serves MCP on stdin and stdout, to read canvases (`rature mcp --help`): no window
+opens. A file named `mcp` opens as `./mcp`.";
 
 /// What `--version` prints: the version, the channel and the commit (`build.rs`).
 fn version() -> String {
@@ -57,6 +62,11 @@ fn version() -> String {
 }
 
 fn main() {
+    // The MCP server: no window, no hand-over to one, the terminal kept.
+    let mut args = std::env::args_os();
+    if args.nth(1).is_some_and(|arg| arg == "mcp") {
+        std::process::exit(mcp::main(args));
+    }
     let started = Instant::now();
     let timed = std::env::var_os("RATURE_TIMING").is_some();
     if timed {
