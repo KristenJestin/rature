@@ -96,8 +96,9 @@ jobs:
           esac
           status=0
           version=$(tools/version.sh "$channel" --branch "$GITHUB_REF_NAME" --at "$at") || status=$?
-          # 3: nothing was committed since the last release, which is then this one, run again.
-          [ "$status" -ne 3 ] || skip "nothing to release since the last stable release"
+          # 3, on every channel: nothing was committed since the last stable release, whose own
+          # commit this is (its stable run again, or dev or a branch still at it).
+          [ "$status" -ne 3 ] || skip "$GITHUB_SHA is the last stable release's own commit, nothing was committed since"
           [ "$status" -eq 0 ] || exit "$status"
           # Every build is its own release, an alpha's too: nothing is ever replaced.
           tag="v$version"

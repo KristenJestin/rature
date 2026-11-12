@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # The version a build gets, computed from the Angular commits since the last release, never
 # typed (docs/releases.md):
-#   tools/version.sh stable [--at <rev>]                  X.Y.Z; exits 3, printing nothing, when
-#                                                         nothing was committed since the release
+#   tools/version.sh stable [--at <rev>]                  X.Y.Z
 #   tools/version.sh beta [--at <rev>]                    X.Y.Z-beta.N
 #   tools/version.sh alpha [--branch <name>] [--at <rev>] X.Y.Z-alpha.<branch>.N
+# The three exit 3, printing nothing, when nothing was committed since the release: the commit
+# is the release's own, and no channel publishes it again.
 #   tools/version.sh base [--at <rev>]                    <tag> <commit> the versions count from
 # `--at` is the commit to compute for, HEAD by default. The last release is the highest stable
 # tag `vX.Y.Z`, wherever it is, and the versions count from its own commit, the commit of dev it
@@ -52,7 +53,9 @@ fi
 range=$at
 if [ -n "$since" ]; then range="$since..$at"; fi
 count=$(git rev-list --count --first-parent "$range")
-if [ "$channel" = stable ] && [ "$count" -eq 0 ]; then
+# The release's own commit: a beta or an alpha of it would be the next version, published on
+# the commit already released.
+if [ "$count" -eq 0 ]; then
   echo "version.sh: nothing to release since ${base:-the first commit}" >&2
   exit 3
 fi

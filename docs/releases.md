@@ -48,7 +48,9 @@ fast-forward), and is then that very commit.
 
 - **It counts from the last release**: the highest stable tag `vX.Y.Z`, compared as versions,
   from its own commit on. Pre-release tags do not count. Without a stable tag, from `0.0.0` and
-  the first commit. `stable` exits 3, printing nothing, when nothing was committed since.
+  the first commit. When nothing was committed since, the commit is the release's own: every
+  channel exits 3, printing nothing, and CI publishes nothing (a beta or an alpha of it would be
+  the next version, on the commit already released).
 - **The next version** follows the Angular commits counted, merges left out: `feat` bumps the
   minor, `fix` and `perf` the patch, a `!` after the type or a `BREAKING CHANGE:` footer the
   major; nothing that bumps is the next patch. **Before 1.0, everything bumps one level less**: a
