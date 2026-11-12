@@ -1179,7 +1179,7 @@ fn op_properties(fields: &[&str]) -> Map<String, Value> {
             "additionalProperties": false,
             "description": "update_node: changes the words `old` of a text card into `new`, only if `old` is in its text once. The safe way to correct a card the user may be editing."
         },
-        "file": {"type": "string", "description": "A file card's file, relative to the vault."},
+        "file": {"type": "string", "description": "A file card's file, relative to the canvas's folder, or absolute."},
         "subpath": {"type": ["string", "null"], "description": "A file card's heading or block, beginning with #."},
         "url": {"type": "string", "description": "A link card's address."},
         "label": {"type": ["string", "null"], "description": "A group's label, or an edge's."},
@@ -1318,6 +1318,22 @@ mod tests {
         assert_eq!(ops.as_object().unwrap().keys().next().unwrap(), "op");
         for field in ADD_NODE.iter().chain(&UPDATE_NODE).chain(&UPDATE_EDGE) {
             assert!(ops.get(*field).is_some(), "{field}");
+        }
+    }
+
+    /// A file card's path is found from the canvas's folder (`canvas::resolve`): the schema
+    /// says so, and names no vault.
+    #[test]
+    fn a_file_cards_path_is_said_relative_to_the_canvass_folder() {
+        let create = canvas_create_tool();
+        let edit = canvas_edit_tool();
+        for file in [
+            &edit["inputSchema"]["properties"]["ops"]["items"]["properties"]["file"],
+            &create["inputSchema"]["properties"]["nodes"]["items"]["properties"]["file"],
+        ] {
+            let said = file["description"].as_str().unwrap();
+            assert!(said.contains("relative to the canvas's folder"), "{said}");
+            assert!(!said.contains("vault"), "{said}");
         }
     }
 }
