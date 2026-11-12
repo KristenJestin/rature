@@ -42,6 +42,9 @@ pub struct Board {
     redo: Vec<Vec<Op>>,
     /// The last action is an edit the next one may join.
     joinable: bool,
+    /// How many of the pending operations, the first ones, a write off the window's thread took
+    /// and has not given back.
+    in_flight: usize,
 }
 
 /// What [`Board::save`] did.
@@ -65,6 +68,9 @@ pub struct Writing {
     path: PathBuf,
     locks: PathBuf,
     ops: Vec<Op>,
+    /// How many of `ops`, the first ones, another write runs too: replayed, their report left
+    /// to it.
+    quiet: usize,
 }
 
 /// What a [`Writing`] did.
@@ -104,6 +110,7 @@ impl Board {
             undo: Vec::new(),
             redo: Vec::new(),
             joinable: false,
+            in_flight: 0,
         })
     }
 
@@ -212,27 +219,51 @@ impl Board {
     /// Writes the operations not yet written: replayed on the file's text as it is now, under
     /// the lock. Blocks while another process writes the canvas (at most [`PATIENCE`]), and for
     /// a write: not on the window's thread.
+    ///
+    /// What a write off the window's thread took is written again, since the process may end
+    /// before that write does (the board left, the window closed): replayed on a file that has
+    /// it already, it changes nothing, and what it could not do is that write's to say.
     pub fn save(&mut self) -> io::Result<Saved> {
-        let written = self.writing().run()?;
-        Ok(self.written(written))
+        self.joinable = false;
+        let writing = Writing {
+            path: self.path.clone(),
+            locks: self.locks.clone(),
+            ops: self.pending.clone(),
+            quiet: std::mem::take(&mut self.in_flight),
+        };
+        let written = writing.run()?;
+        let count = written.count;
+        Ok(self.take_written(written, count))
     }
 
     /// The write of the operations pending now, to [`Writing::run`] off the window's thread.
     /// Those made meanwhile wait for the next one: none joins those being written.
     pub fn writing(&mut self) -> Writing {
         self.joinable = false;
+        self.in_flight = self.pending.len();
         Writing {
             path: self.path.clone(),
             locks: self.locks.clone(),
             ops: self.pending.clone(),
+            quiet: 0,
         }
     }
 
-    /// A write done: the operations it wrote are no more pending, and what the window shows is
-    /// the file as written with those made since replayed on it.
+    /// A write off the window's thread done: the operations it wrote are no more pending, and
+    /// what the window shows is the file as written with those made since replayed on it. None
+    /// is, when a [`Board::save`] meanwhile wrote them already.
     pub fn written(&mut self, written: Written) -> Saved {
-        if let Some(text) = written.text {
-            self.pending.drain(..written.count.min(self.pending.len()));
+        let taken = std::mem::take(&mut self.in_flight);
+        self.take_written(written, taken)
+    }
+
+    /// A write done, the first `taken` of the pending operations its own.
+    fn take_written(&mut self, written: Written, taken: usize) -> Saved {
+        if taken > 0
+            && let Some(text) = written.text
+        {
+            let count = written.count.min(taken).min(self.pending.len());
+            self.pending.drain(..count);
             self.refresh(&text);
         }
         written.saved
@@ -268,7 +299,7 @@ impl Writing {
         }
         // What the last replay found: `update` may ask more than once.
         let mut found = Err(Vec::new());
-        let pending = &self.ops;
+        let (pending, quiet) = (&self.ops, self.quiet);
         let update = update(&self.path, &self.locks, |now| {
             let mut disk = Canvas::read(now);
             let problems = disk.problems();
@@ -277,8 +308,11 @@ impl Writing {
                 return None;
             }
             let mut report = Report::default();
-            for op in pending {
-                op.apply(&mut disk, &mut report);
+            for (i, op) in pending.iter().enumerate() {
+                match i < quiet {
+                    true => op.apply(&mut disk, &mut Report::default()),
+                    false => op.apply(&mut disk, &mut report),
+                }
             }
             match disk.write() {
                 Ok(text) => {
@@ -507,6 +541,43 @@ mod tests {
         // Two moves, two writes: undone one at a time.
         assert!(board.undo());
         assert_eq!(rect(board.canvas().node("a").unwrap()).0, 10.);
+    }
+
+    /// The board left while a write runs off the window's thread: what that write took is
+    /// written again, in case it never ends, but not said twice; its own result, back after,
+    /// leaves nothing to undo.
+    #[test]
+    fn a_write_on_leaving_writes_what_a_running_write_took_without_saying_it_again() {
+        let new = |id: &str| {
+            let rect = Rect {
+                x: 0.,
+                y: 100.,
+                width: 100.,
+                height: 50.,
+            };
+            Op::add_node(Node::new_text(id, "N", rect))
+        };
+        let folder = Folder::new("leaving");
+        let mut board = folder.board();
+        board.edit(new("n"));
+        let writing = board.writing();
+        // Written, its result not back yet when the board is left.
+        let written = writing.run().unwrap();
+        let op = Op::move_node(board.canvas(), "a", 10., 0.).unwrap();
+        board.edit(op);
+        assert!(done(board.save().unwrap()).is_clean(), "n is not said taken");
+        assert!(board.pending().is_empty());
+        assert!(done(board.written(written)).is_clean());
+        assert!(board.pending().is_empty());
+        let disk = folder.disk();
+        let ns = disk.nodes().iter().filter(|n| n.id() == Some("n")).count();
+        assert_eq!(ns, 1);
+        assert_eq!(rect(disk.node("a").unwrap()).0, 10.);
+        // A write that never ends: what it took is written on leaving all the same.
+        board.edit(new("m"));
+        let _never = board.writing();
+        assert!(done(board.save().unwrap()).is_clean());
+        assert!(folder.disk().node("m").is_some());
     }
 
     /// Row 2: the disk changed a field Rature did not: the disk's is kept, nothing said.
