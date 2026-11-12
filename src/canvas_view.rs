@@ -2786,6 +2786,12 @@ fn local(position: Point<Pixels>, bounds: Bounds<Pixels>) -> (f32, f32) {
     (f32::from(at.x), f32::from(at.y))
 }
 
+/// The id of the edge at `i` in `edges`: none for an edge without one, which cannot be changed,
+/// or for a place a frame drawn before the edges changed still names.
+fn edge_id(edges: &[EdgeLine], i: usize) -> Option<String> {
+    Some(edges.get(i)?.id.clone()).filter(|id| !id.is_empty())
+}
+
 /// An edge's line, in the canvas's pixels, and the hovered one's.
 const EDGE_WIDTH: f32 = 2.;
 const HOVERED_WIDTH: f32 = 3.;
@@ -2976,9 +2982,10 @@ impl CanvasView {
             self.edits.edge = None;
         }
         if edges != self.file.edges {
-            if edges.len() != self.file.edges.len() {
-                self.hovered = None;
-            }
+            // Both name edges by their place, which may now be another's or none: drawn again
+            // at the next frame.
+            self.hovered = None;
+            self.labels.borrow_mut().clear();
             Arc::make_mut(&mut self.file).edges = edges;
         }
     }
@@ -3028,8 +3035,7 @@ impl CanvasView {
     /// The id of the edge under `position`, as [`CanvasView::edge_under`] finds it; none for an
     /// edge without one, which cannot be changed.
     fn edge_id_under(&self, position: Point<Pixels>, cx: &App) -> Option<String> {
-        let i = self.edge_under(position, cx)?;
-        Some(self.file.edges[i].id.clone()).filter(|id| !id.is_empty())
+        edge_id(&self.file.edges, self.edge_under(position, cx)?)
     }
 
     /// Where the label of the edge `id` was last drawn, in the window.
@@ -3994,7 +4000,7 @@ mod tests {
     // Not the glob: GPUI's own `test` attribute would come with it.
     use super::{
         Area, Camera, CanvasFile, Corner, Detail, HANDLE, Hit, MAX_ZOOM, MIN_SIZE, MIN_ZOOM, ROOM,
-        STEP, Tint, carried, deleting, handle_at, hit, moved, placing, resized, tint,
+        STEP, Tint, carried, deleting, edge_id, handle_at, hit, moved, placing, resized, tint,
     };
     use super::{lost, write_now};
     use crate::canvas::Canvas;
@@ -4304,6 +4310,15 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// A press may come before the frame after an edge was deleted: the place the frame before
+    /// found names nothing then, and nothing breaks.
+    #[test]
+    fn an_edge_is_found_by_a_place_it_may_no_longer_have() {
+        let (_, file) = board();
+        assert_eq!(edge_id(&file.edges, 0).as_deref(), Some("ab"));
+        assert_eq!(edge_id(&file.edges, file.edges.len()), None);
     }
 
     #[test]
