@@ -782,6 +782,9 @@ struct Typing {
     field: Entity<LiveBlock>,
     /// How many actions undo held before: those done since are one once it ends.
     mark: usize,
+    /// The text the field last had, from the canvas or from the keys: what the next keys
+    /// change.
+    shown: String,
     /// What had the keys before, given them back when it ends.
     before: Option<FocusHandle>,
     window: AnyWindowHandle,
@@ -2210,6 +2213,7 @@ impl CanvasView {
             })
             .unwrap_or_default();
         let links = Rc::new(Links::new(folder.to_path_buf(), anchors));
+        let shown = text.clone();
         let field = cx.new(|cx| LiveBlock::new(text, caret, links, window, cx));
         let events = cx.subscribe_in(
             &field,
@@ -2237,6 +2241,7 @@ impl CanvasView {
             label,
             field,
             mark,
+            shown,
             before,
             window: window.window_handle(),
             _events: events,
@@ -2252,12 +2257,25 @@ impl CanvasView {
             return;
         };
         let (id, text) = (typing.id.clone(), typing.field.read(cx).value().to_string());
-        let label = typing.label;
-        let make = |canvas: &Canvas| match label {
-            true => labelling(canvas, &id, &text),
-            false => typing_ops(canvas, &id, &text),
+        let (label, shown) = (typing.label, typing.shown.clone());
+        let make = |canvas: &Canvas| {
+            let (ops, now) = match label {
+                true => (
+                    labelling(canvas, &id, &text),
+                    find_edge(canvas, &id).and_then(Edge::label),
+                ),
+                false => (
+                    typing_ops(canvas, &id, &text),
+                    canvas.node(&id).and_then(Node::text),
+                ),
+            };
+            rebased(ops, now.unwrap_or_default(), &shown, label)
         };
-        if self.edit(make, cx) {
+        let done = self.edit(make, cx);
+        if let Some(typing) = &mut self.edits.typing {
+            typing.shown = text;
+        }
+        if done {
             self.save_later(TYPING_REST, cx);
         }
     }
@@ -2334,8 +2352,13 @@ impl CanvasView {
             None => {
                 self.end_typing(cx);
             }
-            Some(text) if !waits && text != field.read(cx).value() => {
-                field.update(cx, |field, cx| field.set_value(text, cx));
+            Some(text) if !waits => {
+                if text != field.read(cx).value() {
+                    field.update(cx, |field, cx| field.set_value(text.clone(), cx));
+                }
+                if let Some(typing) = &mut self.edits.typing {
+                    typing.shown = text;
+                }
             }
             Some(_) => {}
         }
@@ -2519,6 +2542,29 @@ pub fn new_card(canvas: &Canvas, x: f32, y: f32) -> Node {
 /// The operation that gives the card `id` of `canvas` the text `text`: none when it has it.
 fn typing_ops(canvas: &Canvas, id: &str, text: &str) -> Vec<Op> {
     Op::set_text(canvas, id, text).into_iter().collect()
+}
+
+/// The operations that set what the keys typed, `now` the canvas's text, `shown` the field's
+/// before the keys: from `shown` when the two differ. A write's conflict left the disk's text
+/// in the canvas while what was typed waited; what is typed next, replayed on it, must not
+/// take it over unsaid.
+fn rebased(mut ops: Vec<Op>, now: &str, shown: &str, label: bool) -> Vec<Op> {
+    if now == shown {
+        return ops;
+    }
+    // As `labelling` gives a label: none when it says nothing.
+    let base = match label {
+        true => (!shown.trim().is_empty()).then(|| shown.into()),
+        false => Some(shown.into()),
+    };
+    for op in &mut ops {
+        if let Op::Set { fields, .. } = op {
+            for field in fields {
+                field.base.clone_from(&base);
+            }
+        }
+    }
+    ops
 }
 
 /// Whether a text typed in the card `id` waits in `pending` to be written.
@@ -4041,7 +4087,8 @@ mod tests {
     // Not the glob: GPUI's own `test` attribute would come with it.
     use super::{
         Area, Camera, CanvasFile, Corner, Detail, HANDLE, Hit, MAX_ZOOM, MIN_SIZE, MIN_ZOOM, ROOM,
-        STEP, Tint, carried, deleting, edge_id, handle_at, hit, moved, placing, resized, tint,
+        STEP, Tint, carried, deleting, edge_id, handle_at, hit, moved, placing, rebased, resized,
+        tint, typing_ops,
     };
     use super::{lost, write_now};
     use crate::canvas::Canvas;
@@ -4384,6 +4431,45 @@ mod tests {
             "{said}"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// A write's conflict leaves the disk's text in the card while what was typed waits; what
+    /// is typed during the next write is made from the field's text, and the disk wins it too.
+    #[test]
+    fn what_is_typed_after_a_conflict_does_not_take_over_the_disks_text() {
+        let folder = std::env::temp_dir().join(format!("rature-view-typed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("a.canvas");
+        std::fs::write(&path, BOARD).unwrap();
+        let mut board = Board::open_with_locks(&path, folder.join("locks")).unwrap();
+        let text = |canvas: &Canvas| canvas.node("a").unwrap().text().unwrap().to_string();
+        // What `typed` does: the field had `shown`, the keys made `typed`.
+        let typed = |board: &mut Board, shown: &str, typed: &str| {
+            let now = text(board.canvas());
+            let ops = rebased(typing_ops(board.canvas(), "a", typed), &now, shown, false);
+            board.edit_all(ops);
+        };
+        typed(&mut board, "A", "A1");
+        let first = board.writing();
+        // Another program changes the text while the first write runs.
+        let theirs = BOARD.replace(r#""text":"A""#, r#""text":"theirs""#);
+        std::fs::write(&path, theirs).unwrap();
+        typed(&mut board, "A1", "A12");
+        let report = |saved| match saved {
+            Saved::Done { report, .. } => report,
+            other => panic!("{other:?}"),
+        };
+        let said = report(board.written(first.run().unwrap()));
+        assert_eq!(said.clipboard, ["A1"]);
+        assert_eq!(text(board.canvas()), "theirs", "the disk's, while A12 waits");
+        let second = board.writing();
+        typed(&mut board, "A12", "A123");
+        assert_eq!(report(board.written(second.run().unwrap())).clipboard, ["A12"]);
+        assert_eq!(report(board.save().unwrap()).clipboard, ["A123"]);
+        let disk = Canvas::read(&std::fs::read_to_string(&path).unwrap());
+        assert_eq!(text(&disk), "theirs");
         let _ = std::fs::remove_dir_all(&folder);
     }
 
