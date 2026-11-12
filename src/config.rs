@@ -54,12 +54,19 @@ impl Config {
     pub fn load() -> Self {
         let path = folder().join("config.toml");
         match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text).unwrap_or_else(|error| {
+            Ok(text) => Self::parse(&text).unwrap_or_else(|error| {
                 eprintln!("rature: {}: {error}", path.display());
                 Self::default()
             }),
             Err(_) => Self::default(),
         }
+    }
+
+    /// A file's text, its text size at least 1 px: a canvas's zoom divides by it.
+    fn parse(text: &str) -> Result<Self, toml::de::Error> {
+        let mut config: Self = toml::from_str(text)?;
+        config.font_size = config.font_size.max(1.);
+        Ok(config)
     }
 }
 
@@ -87,6 +94,14 @@ mod tests {
         assert_eq!(config.font_size, 18.);
         assert_eq!(config.column, 760.);
         assert_eq!(config.font, "Geist");
+    }
+
+    #[test]
+    fn a_text_size_of_nothing_is_one_pixel() {
+        assert_eq!(Config::parse("font_size = 0\n").unwrap().font_size, 1.);
+        assert_eq!(Config::parse("font_size = -4\n").unwrap().font_size, 1.);
+        assert_eq!(Config::parse("font_size = nan\n").unwrap().font_size, 1.);
+        assert_eq!(Config::parse("font_size = 15\n").unwrap().font_size, 15.);
     }
 
     #[test]
