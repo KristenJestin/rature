@@ -235,7 +235,19 @@ impl Board {
     }
 }
 
+impl Written {
+    /// Whether the operations were replayed on the file's text, and are on disk now.
+    pub fn is_done(&self) -> bool {
+        self.text.is_some()
+    }
+}
+
 impl Writing {
+    /// The operations it writes.
+    pub fn ops(&self) -> &[Op] {
+        &self.ops
+    }
+
     /// Replays the operations on the file's text as it is now, under the lock, and writes it.
     /// Blocks while another process writes the canvas (at most [`PATIENCE`]).
     pub fn run(self) -> io::Result<Written> {

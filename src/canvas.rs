@@ -19,9 +19,12 @@
 //!
 //! Edited by operations on ids (`canvas_ops`), written by replaying them on the file's text as
 //! it is then (`canvas_board`).
+//!
+//! Compared to the canvas as it was last read ([`compare`]) by id and by value, never by text:
+//! another writer's layout, its order of keys or of nodes, change nothing.
 
-use std::collections::HashSet;
 use std::collections::hash_map::RandomState;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -233,6 +236,13 @@ impl Canvas {
         if !problems.is_empty() {
             return Err(problems);
         }
+        Ok(self.snapshot())
+    }
+
+    /// The text of the canvas, in Obsidian's layout, even while it is not valid: what is kept of
+    /// it as it was read, which [`Canvas::read`] reads back to the same canvas. Never written over
+    /// the file: [`Canvas::write`] is.
+    pub fn snapshot(&self) -> String {
         let mut out = String::from("{");
         for (index, (key, value)) in self.top.iter().enumerate() {
             out.push_str(if index == 0 { "\n\t" } else { ",\n\t" });
@@ -248,7 +258,7 @@ impl Canvas {
             out.push('\n');
         }
         out.push('}');
-        Ok(out)
+        out
     }
 
     /// Where a new card of this size goes when nobody says: right of `near` (or of all the
@@ -772,6 +782,158 @@ fn set_number(fields: &mut Map<String, Value>, key: &str, value: f64) {
     }
 }
 
+/// The fields of a node that say where it is and how large it is.
+const PLACE: [&str; 4] = ["x", "y", "width", "height"];
+
+/// What happened to a node since the canvas it is compared to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeChange {
+    Added,
+    /// Still there: `content` when a field other than its place and size changed (its text, its
+    /// colour, a plugin's field...), `moved` when its place or its size did.
+    Changed {
+        content: bool,
+        moved: bool,
+    },
+}
+
+/// What happened to an edge since the canvas it is compared to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EdgeChange {
+    Added,
+    /// Still there, a field of it changed: its ends, its sides, its label, its colour...
+    Changed,
+}
+
+/// How a canvas differs from the one it is compared to, node by node and edge by edge, by id.
+/// A node or an edge without an id cannot be followed from one to the other and is left out;
+/// of two with the same id, the first counts, as [`Canvas::node`] finds it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Changes {
+    /// The nodes of the canvas now that are new or changed, by id.
+    pub nodes: HashMap<String, NodeChange>,
+    /// The ids of the nodes the canvas compared to had and this one has not, in its order.
+    pub deleted_nodes: Vec<String>,
+    pub edges: HashMap<String, EdgeChange>,
+    pub deleted_edges: Vec<String>,
+}
+
+impl Changes {
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+            && self.deleted_nodes.is_empty()
+            && self.edges.is_empty()
+            && self.deleted_edges.is_empty()
+    }
+}
+
+/// How `now` differs from `before`, by id and by value: the order of the keys, of the nodes or
+/// of the edges, and the way a number is written (`10` or `10.0`), are no change. The z order is
+/// not compared.
+pub fn compare(before: &Canvas, now: &Canvas) -> Changes {
+    let mut changes = Changes::default();
+    let old = by_id(before.nodes.iter().map(|n| (n.id(), &n.fields)));
+    let new = by_id(now.nodes.iter().map(|n| (n.id(), &n.fields)));
+    for (id, fields) in &new.1 {
+        let change = match old.0.get(id) {
+            None => Some(NodeChange::Added),
+            Some(was) => {
+                let (content, moved) = differences(was, fields);
+                (content || moved).then_some(NodeChange::Changed { content, moved })
+            }
+        };
+        if let Some(change) = change {
+            changes.nodes.insert((*id).into(), change);
+        }
+    }
+    changes.deleted_nodes = gone(&old.1, &new.0);
+    let old = by_id(before.edges.iter().map(|e| (e.id(), &e.fields)));
+    let new = by_id(now.edges.iter().map(|e| (e.id(), &e.fields)));
+    for (id, fields) in &new.1 {
+        let change = match old.0.get(id) {
+            None => Some(EdgeChange::Added),
+            Some(was) => {
+                let (content, moved) = differences(was, fields);
+                (content || moved).then_some(EdgeChange::Changed)
+            }
+        };
+        if let Some(change) = change {
+            changes.edges.insert((*id).into(), change);
+        }
+    }
+    changes.deleted_edges = gone(&old.1, &new.0);
+    changes
+}
+
+/// The entries that have an id, by id, the first of each; and the same, in their order.
+type ById<'a> = (
+    HashMap<&'a str, &'a Map<String, Value>>,
+    Vec<(&'a str, &'a Map<String, Value>)>,
+);
+
+fn by_id<'a>(entries: impl Iterator<Item = (Option<&'a str>, &'a Map<String, Value>)>) -> ById<'a> {
+    let (mut map, mut list) = (HashMap::new(), Vec::new());
+    for (id, fields) in entries {
+        if let Some(id) = id
+            && !map.contains_key(id)
+        {
+            map.insert(id, fields);
+            list.push((id, fields));
+        }
+    }
+    (map, list)
+}
+
+/// The ids of `before`, in its order, that `now` has not.
+fn gone(
+    before: &[(&str, &Map<String, Value>)],
+    now: &HashMap<&str, &Map<String, Value>>,
+) -> Vec<String> {
+    before
+        .iter()
+        .filter(|(id, _)| !now.contains_key(id))
+        .map(|(id, _)| (*id).to_string())
+        .collect()
+}
+
+/// Whether a field other than a place or a size differs between `a` and `b`, and whether a
+/// place or a size does.
+fn differences(a: &Map<String, Value>, b: &Map<String, Value>) -> (bool, bool) {
+    let (mut content, mut moved) = (false, false);
+    for key in a.keys().chain(b.keys()) {
+        let same = match (a.get(key), b.get(key)) {
+            (Some(x), Some(y)) => same_value(x, y),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            if PLACE.contains(&key.as_str()) {
+                moved = true;
+            } else {
+                content = true;
+            }
+        }
+    }
+    (content, moved)
+}
+
+/// Whether two values are the same: numbers by their value, objects whatever the order of
+/// their keys.
+fn same_value(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => x == y || x.as_f64() == y.as_f64(),
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(x, y)| same_value(x, y))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(key, x)| y.get(key).is_some_and(|y| same_value(x, y)))
+        }
+        _ => a == b,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1199,5 +1361,169 @@ mod tests {
             600.
         );
         assert_eq!(default_size(NodeKind::File, None), (400., 400.));
+    }
+
+    /// Three cards, `a` `b` `c`, and two edges, `ab` and `bc`, as last read.
+    const READ: &str = r#"{"nodes":[
+        {"id":"a","type":"text","text":"A","x":0,"y":0,"width":100,"height":50},
+        {"id":"b","type":"text","text":"B","x":200,"y":0,"width":100,"height":50,"color":"2"},
+        {"id":"c","type":"file","file":"c.md","x":400,"y":0,"width":100,"height":50}
+    ],"edges":[
+        {"id":"ab","fromNode":"a","toNode":"b"},
+        {"id":"bc","fromNode":"b","toNode":"c","label":"then"}
+    ]}"#;
+
+    /// What changed from [`READ`] to `now`.
+    fn changed(now: &str) -> Changes {
+        compare(&Canvas::read(READ), &Canvas::read(now))
+    }
+
+    #[test]
+    fn the_same_canvas_written_another_way_has_not_changed() {
+        // Another writer's layout, keys, nodes and edges in another order, numbers written
+        // another way, a plugin's object with its keys in another order: no change.
+        let mut canvas = Canvas::read(READ);
+        canvas.node_mut("a").unwrap().fields_mut().insert(
+            "meta".into(),
+            serde_json::json!({"by": "a plugin", "tags": [1, 2]}),
+        );
+        let now = r#"{
+  "edges": [
+    {"label": "then", "toNode": "c", "fromNode": "b", "id": "bc"},
+    {"toNode": "b", "fromNode": "a", "id": "ab"}
+  ],
+  "nodes": [
+    {"height": 50.0, "width": 100, "y": 0, "x": 400, "file": "c.md", "type": "file", "id": "c"},
+    {"meta": {"tags": [1, 2.0], "by": "a plugin"}, "text": "A", "type": "text", "id": "a", "x": 0, "y": 0, "width": 100, "height": 50},
+    {"color": "2", "id": "b", "type": "text", "text": "B", "x": 200.0, "y": -0.0, "width": 100, "height": 50}
+  ]
+}
+"#;
+        let changes = compare(&canvas, &Canvas::read(now));
+        assert!(changes.is_empty(), "{changes:?}");
+        assert!(changed(READ).is_empty());
+        // Read back from what is kept of it, the canvas is the same.
+        assert!(compare(&canvas, &Canvas::read(&canvas.snapshot())).is_empty());
+    }
+
+    #[test]
+    fn a_card_added_is_added_and_its_edge_too() {
+        let now = READ
+            .replace(
+                r#""height":50}
+    ],"#,
+                r#""height":50},
+        {"id":"d","type":"text","text":"D","x":0,"y":200,"width":100,"height":50}
+    ],"#,
+            )
+            .replace(
+                r#""label":"then"}"#,
+                r#""label":"then"},
+        {"id":"ad","fromNode":"a","toNode":"d"}"#,
+            );
+        let changes = changed(&now);
+        assert_eq!(changes.nodes.len(), 1);
+        assert_eq!(changes.nodes["d"], NodeChange::Added);
+        assert_eq!(changes.edges.len(), 1);
+        assert_eq!(changes.edges["ad"], EdgeChange::Added);
+        assert!(changes.deleted_nodes.is_empty() && changes.deleted_edges.is_empty());
+    }
+
+    #[test]
+    fn a_text_changed_is_a_change_of_content_not_a_move() {
+        let changes = changed(&READ.replace(r#""text":"A""#, r#""text":"A, and more""#));
+        assert_eq!(
+            changes.nodes,
+            HashMap::from([(
+                "a".to_string(),
+                NodeChange::Changed {
+                    content: true,
+                    moved: false
+                }
+            )])
+        );
+        assert!(changes.edges.is_empty());
+        // A colour taken away, a field added: content too.
+        let changes = changed(&READ.replace(r#","color":"2""#, r#","zz":true"#));
+        assert_eq!(
+            changes.nodes["b"],
+            NodeChange::Changed {
+                content: true,
+                moved: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_card_moved_or_resized_is_moved_and_its_edges_unchanged() {
+        let moved = NodeChange::Changed {
+            content: false,
+            moved: true,
+        };
+        let changes = changed(&READ.replace(r#""x":200,"y":0"#, r#""x":260,"y":40"#));
+        assert_eq!(changes.nodes, HashMap::from([("b".to_string(), moved)]));
+        assert!(changes.edges.is_empty(), "an edge follows its card");
+        let changes = changed(&READ.replace(
+            r#""x":400,"y":0,"width":100,"height":50"#,
+            r#""x":400,"y":0,"width":180,"height":50"#,
+        ));
+        assert_eq!(changes.nodes, HashMap::from([("c".to_string(), moved)]));
+        // Moved and rewritten: both.
+        let changes = changed(
+            &READ
+                .replace(r#""text":"A""#, r#""text":"Z""#)
+                .replace(r#""x":0,"y":0"#, r#""x":10,"y":0"#),
+        );
+        assert_eq!(
+            changes.nodes["a"],
+            NodeChange::Changed {
+                content: true,
+                moved: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_card_deleted_goes_with_its_edges() {
+        let now = r#"{"nodes":[
+            {"id":"a","type":"text","text":"A","x":0,"y":0,"width":100,"height":50},
+            {"id":"c","type":"file","file":"c.md","x":400,"y":0,"width":100,"height":50}
+        ],"edges":[]}"#;
+        let changes = changed(now);
+        assert_eq!(changes.deleted_nodes, ["b"]);
+        assert_eq!(changes.deleted_edges, ["ab", "bc"]);
+        assert!(changes.nodes.is_empty() && changes.edges.is_empty());
+    }
+
+    #[test]
+    fn an_edge_relabelled_or_turned_is_changed() {
+        let changes = changed(&READ.replace(r#""label":"then""#, r#""label":"after""#));
+        assert_eq!(
+            changes.edges,
+            HashMap::from([("bc".to_string(), EdgeChange::Changed)])
+        );
+        let changes = changed(&READ.replace(
+            r#""fromNode":"a","toNode":"b""#,
+            r#""fromNode":"a","toNode":"c","toSide":"top""#,
+        ));
+        assert_eq!(changes.edges["ab"], EdgeChange::Changed);
+        assert!(changes.nodes.is_empty());
+        // An edge deleted, alone.
+        let changes = changed(&READ.replace(r#"{"id":"ab","fromNode":"a","toNode":"b"},"#, ""));
+        assert_eq!(changes.deleted_edges, ["ab"]);
+        assert!(changes.deleted_nodes.is_empty());
+    }
+
+    #[test]
+    fn an_invalid_canvas_is_kept_as_read_all_the_same() {
+        let text = r#"{"nodes":[{"id":"a","type":"text","text":"1","x":0,"y":0,"width":1,"height":1},{"id":"a","type":"text","text":"2","x":0,"y":0,"width":1,"height":1}],"edges":[{"id":"e","fromNode":"a","toNode":"z"}]}"#;
+        let canvas = Canvas::read(text);
+        assert!(canvas.write().is_err());
+        let kept = Canvas::read(&canvas.snapshot());
+        assert_eq!(kept, canvas);
+        // The first of two nodes with one id counts.
+        let changes = compare(&kept, &Canvas::read(&text.replacen("\"1\"", "\"9\"", 1)));
+        assert_eq!(changes.nodes.len(), 1);
+        assert!(compare(&kept, &Canvas::read(&text.replace("\"2\"", "\"9\""))).is_empty());
     }
 }

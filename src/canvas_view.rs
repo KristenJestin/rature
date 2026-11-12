@@ -7,6 +7,9 @@
 //! [`crate::canvas_ops`] done on a [`Board`] and written by it, off the window's thread. A double
 //! click on empty space makes a text card there; a text card's Markdown is typed whole in a
 //! [`LiveBlock`], written 800 ms after the last key.
+//!
+//! What changed since the canvas was last read is drawn on it as [`crate::canvas_changes`] has
+//! it: the cards' colours, the ghosts of what was deleted or moved, the cards that rise.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -24,6 +27,7 @@ use gpui_kit::*;
 
 use crate::canvas::{self as model, Canvas, Color, End, Node, NodeKind, Problem, Rect};
 use crate::canvas_board::{self, Board, Saved, Written};
+use crate::canvas_changes::{self, BoardChanges, OnBoard};
 use crate::canvas_edges::{self as edges, Line};
 use crate::canvas_ops::{Op, Report, Target};
 use crate::config::Config;
@@ -373,6 +377,8 @@ pub struct CanvasFile {
 pub struct EdgeLine {
     /// The edge's index in the canvas.
     pub index: usize,
+    /// Its id, empty when it has none: what its change is found by.
+    pub id: String,
     pub line: Line,
     pub tint: Option<Tint>,
     pub label: Option<String>,
@@ -526,6 +532,7 @@ fn lines(canvas: &Canvas, rects: &HashMap<&str, edges::Rect>) -> Vec<EdgeLine> {
                 .map(str::to_string);
             Some(EdgeLine {
                 index,
+                id: edge.id().unwrap_or_default().to_string(),
                 line,
                 tint,
                 label,
@@ -574,7 +581,7 @@ fn card(index: usize, node: &Node, parse: impl FnOnce(&str) -> Document) -> Opti
 }
 
 /// A text card's title: its first heading, else its first line that says something.
-fn title(doc: &Document, text: &str) -> String {
+pub(crate) fn title(doc: &Document, text: &str) -> String {
     if let Some(heading) = doc.headings.first() {
         return heading.text.clone();
     }
@@ -638,6 +645,8 @@ pub struct CanvasView {
     paths: Rc<RefCell<HashMap<usize, Built>>>,
     /// Where each label was last drawn, in the window, by its edge's place in the file's `edges`.
     labels: Labels,
+    /// What changed since the canvas was last read, and the cards rising into place.
+    changes: OnBoard,
 }
 
 /// The selection, what the pointer holds, and the canvas as it is edited.
@@ -741,6 +750,7 @@ impl CanvasView {
             hovered: None,
             paths: Rc::default(),
             labels: Rc::default(),
+            changes: OnBoard::new(cx.background_executor().now()),
         };
         view.set_file(file, cx);
         view
@@ -754,9 +764,41 @@ impl CanvasView {
         self.paths.borrow_mut().clear();
         self.labels.borrow_mut().clear();
         self.hovered = None;
+        let now = cx.background_executor().now();
+        self.changes.arrived(&self.file, &file, now);
         self.file = file;
         self.read_again(cx);
         cx.notify();
+    }
+
+    /// What changed since the canvas was last read, worked out off the main thread.
+    pub fn set_changes(&mut self, changes: Option<Arc<BoardChanges>>, cx: &mut Context<Self>) {
+        self.changes.set(changes);
+        cx.notify();
+    }
+
+    /// `]c` (or `[c`): the camera frames the next change (or the one before), round the end.
+    /// False when there is none.
+    pub fn go_to_change(&mut self, forward: bool, cx: &mut Context<Self>) -> bool {
+        let Some(bounds) = self.bounds else {
+            return false;
+        };
+        let Some(stop) = self.changes.step(forward) else {
+            return false;
+        };
+        let (width, height) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+        self.camera = Some(Camera::framing(stop, width, height));
+        cx.notify();
+        true
+    }
+
+    /// The canvas as the user has it, to mark read: as Rature last wrote it when nothing is
+    /// left to write, else the file as read.
+    pub fn as_read(&self) -> String {
+        match &self.edits.board {
+            Some(board) if board.pending().is_empty() => board.canvas().snapshot(),
+            _ => self.file.canvas.snapshot(),
+        }
     }
 
     pub fn camera(&self) -> Option<Camera> {
@@ -915,18 +957,29 @@ impl CanvasView {
 
     /// A card at its whole Markdown, or a group, at the camera's zoom.
     fn full_card(&self, ctx: &Ctx<Self>, card: &Card, camera: Camera, p: &Palette) -> AnyElement {
-        let area = camera.on_screen(card.area);
+        let (area, shown) = self.changes.risen(&card.id, camera.on_screen(card.area));
         let color = card.tint.map(|t| tint(p, t));
+        let marks = self.changes.changes();
+        let changed = marks.and_then(|c| c.card_colors(&card.id, p));
         let zoom = camera.zoom;
         let frame = placed(div().id(("card", card.index)), area)
+            .opacity(shown)
             .rounded(px(8. * zoom))
-            .border(px((2. * zoom).max(1.)));
+            .border(px(edge_width(zoom, changed.is_some())));
+        let border = changed.map_or(color.unwrap_or(p.line2), |(border, _)| border);
+        let background = |own: Hsla| changed.and_then(|(_, bg)| bg).unwrap_or(own);
         match &card.kind {
-            CardKind::Group => group(card, area, color, px(TITLE.max(f32::from(ctx.size(1.)))), p),
+            CardKind::Group => group(
+                card,
+                area,
+                changed.map(|(border, _)| border).or(color),
+                px(TITLE.max(f32::from(ctx.size(1.)))),
+                p,
+            ),
             CardKind::Text(doc) => frame
                 .overflow_hidden()
-                .border_color(color.unwrap_or(p.line2))
-                .bg(color.map_or(p.card, |c| mix(p.card, c, 0.1)))
+                .border_color(border)
+                .bg(background(color.map_or(p.card, |c| mix(p.card, c, 0.1))))
                 .child(render::scaled(
                     ctx.zoom,
                     div()
@@ -950,8 +1003,8 @@ impl CanvasView {
                 .into_any_element(),
             CardKind::File | CardKind::Link | CardKind::Other => frame
                 .overflow_hidden()
-                .border_color(color.unwrap_or(p.line2))
-                .bg(color.map_or(p.card, |c| mix(p.card, c, 0.1)))
+                .border_color(border)
+                .bg(background(color.map_or(p.card, |c| mix(p.card, c, 0.1))))
                 .p(px(16. * zoom))
                 .text_size(ctx.size(1.))
                 .text_color(p.mute)
@@ -961,18 +1014,23 @@ impl CanvasView {
     }
 
     /// A card as a coloured box and its title, at a fixed size on screen.
-    fn light_card(card: &Card, camera: Camera, p: &Palette) -> AnyElement {
-        let area = camera.on_screen(card.area);
+    fn light_card(card: &Card, camera: Camera, p: &Palette, changes: &OnBoard) -> AnyElement {
+        let (area, shown) = changes.risen(&card.id, camera.on_screen(card.area));
         let color = card.tint.map(|t| tint(p, t));
+        let changed = changes.changes().and_then(|c| c.card_colors(&card.id, p));
         if let CardKind::Group = card.kind {
+            let color = changed.map(|(border, _)| border).or(color);
             return group(card, area, color, px(TITLE), p);
         }
         placed(div().id(("card", card.index)), area)
+            .opacity(shown)
             .overflow_hidden()
             .rounded(px(4.))
-            .border_1()
-            .border_color(color.unwrap_or(p.line2))
-            .bg(color.map_or(p.card2, |c| mix(p.card, c, 0.3)))
+            .border(px(if changed.is_some() { 2. } else { 1. }))
+            .border_color(changed.map_or(color.unwrap_or(p.line2), |(border, _)| border))
+            .bg(changed
+                .and_then(|(_, bg)| bg)
+                .unwrap_or(color.map_or(p.card2, |c| mix(p.card, c, 0.3))))
             .p(px(6.))
             .text_size(px(TITLE))
             .line_height(px(TITLE * 1.3))
@@ -982,12 +1040,20 @@ impl CanvasView {
     }
 
     /// Every card as a rectangle, in one element.
-    fn rects(cards: &[&Card], camera: Camera, p: &Palette) -> AnyElement {
+    fn rects(
+        cards: &[&Card],
+        camera: Camera,
+        p: &Palette,
+        changes: Option<&BoardChanges>,
+    ) -> AnyElement {
         let quads: Vec<(Area, Hsla, Hsla)> = cards
             .iter()
             .map(|card| {
                 let color = card.tint.map(|t| tint(p, t));
                 let area = camera.on_screen(card.area);
+                if let Some((border, bg)) = changes.and_then(|c| c.card_colors(&card.id, p)) {
+                    return (area, bg.unwrap_or(p.card2), border);
+                }
                 match card.kind {
                     CardKind::Group => (
                         area,
@@ -1471,8 +1537,16 @@ impl CanvasView {
             return;
         }
         let writing = board.writing();
+        let (ops, path) = (writing.ops().to_vec(), edits.path.clone());
         edits.writing = true;
-        let work = cx.background_executor().spawn(async move { writing.run() });
+        let work = cx.background_executor().spawn(async move {
+            let written = writing.run();
+            // The user's own change is read already: what shows as changed is what others did.
+            if written.as_ref().is_ok_and(Written::is_done) {
+                canvas_changes::mark_written(&path, &ops);
+            }
+            written
+        });
         // Not kept by the board: a write begun ends, even if the board is let go meanwhile.
         cx.spawn(async move |this, cx| {
             let written = work.await;
@@ -1495,9 +1569,18 @@ impl CanvasView {
     pub fn put_down(&mut self, cx: &mut Context<Self>) {
         self.end_typing(cx);
         self.edits.later = None;
+        let ops = self
+            .edits
+            .board
+            .as_ref()
+            .map(|board| board.pending().to_vec())
+            .unwrap_or_default();
         let Some(saved) = self.edits.board.as_mut().and_then(write_now) else {
             return;
         };
+        if matches!(saved, Ok(Saved::Done { .. })) {
+            canvas_changes::mark_written(&self.edits.path, &ops);
+        }
         match (lost(&saved), saved) {
             (Some(message), _) => toast(Toast::failure(message), cx),
             (None, Ok(Saved::Done { report, .. })) => tell(report, cx),
@@ -1525,7 +1608,15 @@ impl CanvasView {
             }
         };
         match saved {
-            Some(Saved::Done { report, .. }) => tell(report, cx),
+            Some(Saved::Done { report, .. }) => {
+                tell(report, cx);
+                // Compared again once marked read, rather than when the watch tells of the
+                // write: it may have been compared before.
+                let reader = self.reader.clone();
+                cx.defer(move |cx| {
+                    reader.update(cx, |reader, cx| reader.reload(cx)).ok();
+                });
+            }
             Some(Saved::Invalid(problems)) => {
                 self.edits.stalled = true;
                 let why = problems
@@ -1958,7 +2049,7 @@ impl CanvasView {
     }
 
     /// A text card's body: its Markdown read, or the field it is typed in.
-    fn card_text(&self, ctx: &Ctx<Self>, card: &Card, doc: &Document, body: Div) -> Div {
+    fn card_text(&self, ctx: &Ctx<Self>, card: &Card, doc: &Arc<Document>, body: Div) -> Div {
         match &self.edits.typing {
             Some(typing) if typing.id == card.id => body
                 .key_context("CanvasCard")
@@ -1968,7 +2059,18 @@ impl CanvasView {
                 )
                 .on_action(ctx.cx.listener(|this, _: &WriteCard, _, cx| this.save(cx)))
                 .child(typing.field.clone()),
-            _ => body.children(doc.blocks.iter().map(|block| render::block(ctx, block))),
+            // With the marks of what changed in its text since it was read, if it did.
+            _ => body.children(
+                self.changes
+                    .changes()
+                    .and_then(|c| c.blocks(ctx, &card.id, doc))
+                    .unwrap_or_else(|| {
+                        doc.blocks
+                            .iter()
+                            .map(|block| render::block(ctx, block))
+                            .collect()
+                    }),
+            ),
         }
     }
 
@@ -2249,6 +2351,15 @@ fn deleting(canvas: &Canvas, ids: &[String]) -> Vec<Op> {
         .collect()
 }
 
+/// A card's border on screen at `zoom`: thicker when it changed, so that it shows from afar.
+fn edge_width(zoom: f32, changed: bool) -> f32 {
+    if changed {
+        (3. * zoom).max(2.)
+    } else {
+        (2. * zoom).max(1.)
+    }
+}
+
 /// `div` set at `area` of the board.
 fn placed(div: Stateful<Div>, area: Area) -> Stateful<Div> {
     div.absolute()
@@ -2387,7 +2498,11 @@ impl CanvasView {
             .enumerate()
             .filter(|(_, edge)| area(edge.line.bounds).meets(seen))
             .map(|(i, edge)| {
-                let color = edge.tint.map_or(p.mute, |t| tint(p, t));
+                let color = self
+                    .changes
+                    .changes()
+                    .and_then(|c| c.edge_color(&edge.id, p))
+                    .unwrap_or_else(|| edge.tint.map_or(p.mute, |t| tint(p, t)));
                 if self.hovered == Some(i) {
                     (i, lighter(color), HOVERED_WIDTH)
                 } else {
@@ -2580,7 +2695,7 @@ impl Host for CanvasView {
 }
 
 impl Render for CanvasView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let started = timing::on().then(Instant::now);
         let p = palette(cx);
         let config = cx.global::<Config>().clone();
@@ -2636,31 +2751,54 @@ impl Render for CanvasView {
             .filter(|card| card.area.meets(&seen))
             .collect();
         let detail = Detail::at(camera.zoom, self.gesturing);
+        if self.changes.rise(&shown, cx.background_executor().now()) {
+            window.request_animation_frame();
+        }
         board = self.edges(board, &seen, camera, detail, config.font_size, &p, cx);
+        // What was deleted or left its place lies below the cards.
+        let marks = self.changes.changes();
         board = match detail {
             Detail::Full => {
                 let zoom = camera.text_zoom(config.font_size);
                 let ctx = Ctx::new(&p, &config, zoom, &self.drawn, None, cx);
-                board.children(
-                    shown
-                        .iter()
-                        .map(|card| self.full_card(&ctx, card, camera, &p)),
-                )
+                board
+                    .children(
+                        marks
+                            .into_iter()
+                            .flat_map(|m| m.ghosts(Some(&ctx), camera, &seen, &p)),
+                    )
+                    .children(
+                        shown
+                            .iter()
+                            .map(|card| self.full_card(&ctx, card, camera, &p)),
+                    )
             }
             // The card typed in is drawn whole, after them.
-            Detail::Light => board.children(
-                shown
-                    .iter()
-                    .filter(|card| !self.is_typed(card))
-                    .map(|card| Self::light_card(card, camera, &p)),
-            ),
+            Detail::Light => board
+                .children(
+                    marks
+                        .into_iter()
+                        .flat_map(|m| m.ghosts::<Self>(None, camera, &seen, &p)),
+                )
+                .children(
+                    shown
+                        .iter()
+                        .filter(|card| !self.is_typed(card))
+                        .map(|card| Self::light_card(card, camera, &p, &self.changes)),
+                ),
             Detail::Rects => {
                 let shown: Vec<&Card> = shown
                     .iter()
                     .copied()
                     .filter(|card| !self.is_typed(card))
                     .collect();
-                board.child(Self::rects(&shown, camera, &p))
+                board
+                    .children(
+                        marks
+                            .into_iter()
+                            .flat_map(|m| m.ghosts::<Self>(None, camera, &seen, &p)),
+                    )
+                    .child(Self::rects(&shown, camera, &p, marks))
             }
         };
         board = board.children(self.typed_card(detail, camera, &p, &config, cx));

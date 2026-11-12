@@ -14,6 +14,7 @@ use gpui_kit::base::input::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::canvas_changes::BoardChanges;
 use crate::canvas_view::{self, Camera, CanvasView};
 use crate::config::{Config, Side};
 use crate::diff::{Changes, Mark};
@@ -237,6 +238,8 @@ pub struct Reader {
     before: Option<(Arc<Document>, Changes)>,
     /// The version compared to, parsed: the next change of the file does not parse it again.
     old: Option<Old>,
+    /// How the canvas shown differs from its baseline, once compared.
+    canvas_changes: Option<Arc<BoardChanges>>,
     /// The reads of the file asked for, and the comparisons: only the latest result is shown.
     loads: Generation,
     compares: Generation,
@@ -326,6 +329,7 @@ impl Reader {
             baseline: Baseline::LastRead,
             before: None,
             old: None,
+            canvas_changes: None,
             loads: Generation::default(),
             compares: Generation::default(),
             switching: false,
@@ -386,6 +390,7 @@ impl Reader {
         self.watch = None;
         self.before = None;
         self.old = None;
+        self.canvas_changes = None;
         self.loading = false;
         // What was being read is not shown when it comes.
         self.loads.next();
@@ -430,6 +435,7 @@ impl Reader {
         self.editable = false;
         self.before = None;
         self.old = None;
+        self.canvas_changes = None;
         self.prints.clear();
         self.set_content(Content::Empty, Vec::new(), cx);
         self.list.reset(0);
@@ -447,7 +453,7 @@ impl Reader {
     /// checked and compared to its baseline there, put in place here once done, unless the file
     /// was asked for again meanwhile. The reading position is kept: what is above it rarely moves
     /// while a document grows below it.
-    fn reload(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.path.clone() else {
             return;
         };
@@ -667,6 +673,27 @@ impl Reader {
     /// What changed since the baseline, worked out off the main thread.
     fn compare(&mut self, cx: &mut Context<Self>) {
         let generation = self.compares.next();
+        if let (Some(path), Content::Canvas(file)) = (self.path.clone(), &self.content) {
+            let file = file.clone();
+            let (ink, baseline) = (render::ink(cx), self.baseline);
+            let work = cx.background_executor().spawn({
+                let file = file.clone();
+                async move { load::compare_canvas(&path, &file, &ink, baseline) }
+            });
+            cx.spawn(async move |this, cx| {
+                let against = work.await;
+                this.update(cx, |this, cx| {
+                    let same =
+                        matches!(&this.content, Content::Canvas(now) if Arc::ptr_eq(now, &file));
+                    if this.compares.is_current(generation) && same {
+                        this.compared(against, cx);
+                    }
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
         let (Some(path), Content::Markdown(doc)) = (self.path.clone(), &self.content) else {
             return;
         };
@@ -694,6 +721,7 @@ impl Reader {
     /// it is read: nothing changed yet.
     fn compared(&mut self, against: Against, cx: &mut Context<Self>) {
         self.before = None;
+        self.canvas_changes = None;
         let switching = std::mem::take(&mut self.switching);
         match against {
             Against::Nothing => {}
@@ -702,6 +730,10 @@ impl Reader {
                     timing::time("  compared: first read, marked read", || {
                         state::mark_read(path, &doc.source)
                     });
+                }
+                if let (Some(path), Some(board)) = (&self.path, &self.board) {
+                    state::mark_read(path, &board.read(cx).as_read());
+                    self.canvas_changes = Some(Arc::default());
                 }
             }
             Against::NoHead => {
@@ -721,6 +753,16 @@ impl Reader {
                 self.before = Some((old.doc.clone(), changes));
                 self.old = Some(old);
             }
+            Against::Canvas(changes) => {
+                if switching {
+                    self.say("Changes since the last commit", cx);
+                }
+                self.canvas_changes = Some(changes);
+            }
+        }
+        if let Some(board) = &self.board {
+            let changes = self.canvas_changes.clone();
+            board.update(cx, |board, cx| board.set_changes(changes, cx));
         }
         self.relist(cx);
         cx.notify();
@@ -748,6 +790,11 @@ impl Reader {
         }
         if let Some(camera) = self.board.as_ref().and_then(|b| b.read(cx).camera()) {
             cx.global_mut::<State>().set_camera(&path, camera.kept());
+        }
+        // A canvas left: what it showed, and what Rature just wrote of it, is read.
+        if let (Some(board), Some(_)) = (&self.board, &self.canvas_changes) {
+            state::mark_read(&path, &board.read(cx).as_read());
+            cx.emit(ReaderEvent::MarkedRead(path.clone()));
         }
         if let (Content::Markdown(doc), Some(_)) = (&self.content, &self.before) {
             state::mark_read(&path, &doc.source);
@@ -1134,16 +1181,47 @@ impl Reader {
     }
 
     fn next_change(&mut self, _: &NextChange, window: &mut Window, cx: &mut Context<Self>) {
+        if self.board_change(true, cx) {
+            return;
+        }
         let stops = self.changes().map(Changes::stops).unwrap_or_default();
         self.go_through(&stops, true, "Nothing changed", window, cx);
     }
 
     fn previous_change(&mut self, _: &PreviousChange, window: &mut Window, cx: &mut Context<Self>) {
+        if self.board_change(false, cx) {
+            return;
+        }
         let stops = self.changes().map(Changes::stops).unwrap_or_default();
         self.go_through(&stops, false, "Nothing changed", window, cx);
     }
 
+    /// On a canvas, `]c` and `[c` frame its changes one after the other: false on anything
+    /// else.
+    fn board_change(&mut self, forward: bool, cx: &mut Context<Self>) -> bool {
+        let Some(board) = self.board.clone() else {
+            return false;
+        };
+        if !board.update(cx, |board, cx| board.go_to_change(forward, cx)) {
+            self.say("Nothing changed", cx);
+        }
+        true
+    }
+
     fn mark_read(&mut self, _: &MarkRead, _: &mut Window, cx: &mut Context<Self>) {
+        if let (Some(path), Some(board)) = (self.path.clone(), self.board.clone()) {
+            state::mark_read(&path, &board.read(cx).as_read());
+            // Nothing changed since: what a comparison asked for meanwhile finds is let go.
+            self.baseline = Baseline::LastRead;
+            self.switching = false;
+            self.compares.next();
+            self.canvas_changes = Some(Arc::default());
+            let changes = self.canvas_changes.clone();
+            board.update(cx, |board, cx| board.set_changes(changes, cx));
+            self.say("Marked read", cx);
+            cx.emit(ReaderEvent::MarkedRead(path));
+            return;
+        }
         let (Some(path), Content::Markdown(doc)) = (&self.path, &self.content) else {
             return;
         };
@@ -1562,7 +1640,10 @@ impl Reader {
     /// The bar over the page: where the file is, what changed, and the search.
     fn bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
-        let changes = self.changes().map_or(0, Changes::count);
+        let changes = match &self.board {
+            Some(_) => self.canvas_changes.as_ref().map_or(0, |c| c.count()),
+            None => self.changes().map_or(0, Changes::count),
+        };
         let this = cx.entity().downgrade();
         let act = move |id: &'static str, glyph: Icon, tip: &'static str, run: Run| {
             let this = this.clone();

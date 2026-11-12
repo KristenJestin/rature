@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::canvas::Canvas;
+use crate::canvas_changes::BoardChanges;
+use crate::canvas_view::CanvasFile;
 use crate::diff::{self, Changes};
 use crate::document::{self, Document};
 use crate::formats::{self, Content, Loaded};
@@ -57,6 +60,8 @@ pub enum Against {
     /// Not in git, or not committed.
     NoHead,
     Old(Old, Changes),
+    /// A canvas, and how its board differs from the canvas compared to.
+    Canvas(Arc<BoardChanges>),
 }
 
 /// A file read off the main thread.
@@ -80,6 +85,10 @@ pub fn load(path: PathBuf, ink: String, baseline: Baseline, cached: Option<Old>)
             content: Content::Markdown(doc),
             ..
         }) => (compare(&path, doc, &ink, baseline, cached), prints(doc)),
+        Ok(Loaded {
+            content: Content::Canvas(file),
+            ..
+        }) => (compare_canvas(&path, file, &ink, baseline), Vec::new()),
         _ => (Against::Nothing, Vec::new()),
     };
     Done {
@@ -111,6 +120,29 @@ pub fn compare(
     };
     let (old, changes) = against(source, doc, ink, cached);
     Against::Old(old, changes)
+}
+
+/// How the canvas `file`, the file at `path`, differs from its `baseline`, card by card: by id
+/// and by value, so that a canvas another program wrote in its own layout, its keys in another
+/// order, has not changed.
+pub fn compare_canvas(path: &Path, file: &CanvasFile, ink: &str, baseline: Baseline) -> Against {
+    let source = match baseline {
+        Baseline::LastRead => match state::last_read(path) {
+            Some(source) => source,
+            None => return Against::FirstRead,
+        },
+        Baseline::Head => match git_head(path) {
+            Some(source) => source,
+            None => return Against::NoHead,
+        },
+    };
+    let before = Canvas::read(&source);
+    Against::Canvas(Arc::new(BoardChanges::new(
+        &before,
+        file,
+        ink,
+        path.parent(),
+    )))
 }
 
 /// How `doc` differs from `source`, which is parsed unless `cached` is it, in the same ink.
@@ -187,6 +219,14 @@ impl Entrances {
         }
     }
 
+    /// Nothing rises but what arrives from now on: a board opened shows its cards at once.
+    pub fn quiet(now: Instant, play: Duration) -> Self {
+        Self {
+            opened: now.checked_sub(Self::FRESH).unwrap_or(now),
+            ..Self::new(now, play)
+        }
+    }
+
     /// A file opened: all its blocks are new.
     pub fn opened(&mut self, now: Instant) {
         self.opened = now;
@@ -218,6 +258,16 @@ impl Entrances {
             self.drawn.insert(print, now);
         }
         fresh
+    }
+
+    /// How far the block `print`, drawn now, has risen (0 to 1), while it rises.
+    pub fn progress(&mut self, print: u64, now: Instant) -> Option<f32> {
+        if !self.rises(print, now) {
+            return None;
+        }
+        let started = self.drawn.get(&print).copied().unwrap_or(now);
+        let play = self.play.as_secs_f32().max(f32::EPSILON);
+        Some((now.duration_since(started).as_secs_f32() / play).min(1.))
     }
 }
 
@@ -301,5 +351,21 @@ mod tests {
         // Opened again: its blocks are new again.
         entrances.opened(at(5000));
         assert!(entrances.rises(2, at(5010)));
+    }
+
+    #[test]
+    fn on_a_quiet_start_only_what_arrives_rises_and_says_how_far() {
+        let play = Duration::from_millis(200);
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut entrances = Entrances::quiet(t0, play);
+        // There when the board opened: simply there.
+        assert_eq!(entrances.progress(1, at(10)), None);
+        entrances.changed(&[1], &[1, 2], at(1000));
+        assert_eq!(entrances.progress(2, at(1050)), Some(0.));
+        let half = entrances.progress(2, at(1150)).unwrap();
+        assert!((half - 0.5).abs() < 1e-3, "{half}");
+        assert_eq!(entrances.progress(2, at(1300)), None);
+        assert_eq!(entrances.progress(1, at(1050)), None);
     }
 }
