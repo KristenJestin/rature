@@ -689,6 +689,22 @@ impl Edge {
         Self { fields }
     }
 
+    /// A new edge from a side of one node to a side of another, its keys in the order Obsidian
+    /// writes them, with the default ends.
+    pub fn between(id: &str, from: &str, from_side: &str, to: &str, to_side: &str) -> Self {
+        let mut fields = Map::new();
+        for (key, value) in [
+            ("id", id),
+            ("fromNode", from),
+            ("fromSide", from_side),
+            ("toNode", to),
+            ("toSide", to_side),
+        ] {
+            fields.insert(key.into(), value.into());
+        }
+        Self { fields }
+    }
+
     /// An edge of this object: what it holds is not checked.
     pub(crate) fn from_fields(fields: Map<String, Value>) -> Self {
         Self { fields }

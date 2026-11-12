@@ -65,7 +65,17 @@ pub enum Side {
 }
 
 impl Side {
-    const ALL: [Side; 4] = [Side::Top, Side::Right, Side::Bottom, Side::Left];
+    pub const ALL: [Side; 4] = [Side::Top, Side::Right, Side::Bottom, Side::Left];
+
+    /// As the canvas writes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Side::Top => "top",
+            Side::Right => "right",
+            Side::Bottom => "bottom",
+            Side::Left => "left",
+        }
+    }
 
     /// As the canvas names it; a side it does not know is left out.
     pub fn of(side: Option<canvas::Side<'_>>) -> Option<Self> {
@@ -125,6 +135,35 @@ pub fn sides(from: Rect, from_side: Option<Side>, to: Rect, to_side: Option<Side
     // Never empty: a side left out leaves three others.
     let (a, b, _) = best.unwrap_or((Side::Right, Side::Left, 0.));
     (a, b)
+}
+
+/// The side of `rect` nearest `point`, measured to the line each side lies on: the one an edge
+/// let go there reaches. Of two as near, the first of top, right, bottom, left.
+pub fn nearest(rect: Rect, point: Point) -> Side {
+    let gap = |side: Side| match side {
+        Side::Top => (point.y - rect.y).abs(),
+        Side::Right => (point.x - rect.x - rect.width).abs(),
+        Side::Bottom => (point.y - rect.y - rect.height).abs(),
+        Side::Left => (point.x - rect.x).abs(),
+    };
+    Side::ALL
+        .into_iter()
+        .min_by(|a, b| gap(*a).total_cmp(&gap(*b)))
+        .unwrap_or(Side::Top)
+}
+
+/// The side whose way out from `at` points most towards `towards`: the end of an edge being
+/// drawn, which has no card yet, is reached as if through it, so that the curve comes round from
+/// where it starts.
+pub fn facing(at: Point, towards: Point) -> Side {
+    let (dx, dy) = (towards.x - at.x, towards.y - at.y);
+    if dx.abs() >= dy.abs() {
+        if dx >= 0. { Side::Right } else { Side::Left }
+    } else if dy >= 0. {
+        Side::Bottom
+    } else {
+        Side::Top
+    }
 }
 
 /// An edge as it is drawn: its curve, from the base of the arrow at its start (or the side's
@@ -356,6 +395,25 @@ mod tests {
         // A side the canvas does not know is left out.
         assert_eq!(Side::of(Some(canvas::Side::Other("middle"))), None);
         assert_eq!(Side::of(Some(canvas::Side::Top)), Some(Side::Top));
+    }
+
+    #[test]
+    fn an_edge_let_go_on_a_card_reaches_its_nearest_side() {
+        let b = card(400., 0.);
+        assert_eq!(nearest(b, Point::new(402., 30.)), Side::Left);
+        assert_eq!(nearest(b, Point::new(497., 40.)), Side::Right);
+        assert_eq!(nearest(b, Point::new(450., 58.)), Side::Bottom);
+        assert_eq!(nearest(b, Point::new(450., 3.)), Side::Top);
+        // Just outside, still the side it is beside.
+        assert_eq!(nearest(b, Point::new(396., 30.)), Side::Left);
+        // The free end of an edge being drawn faces back where it comes from.
+        let at = Point::new(0., 0.);
+        assert_eq!(facing(at, Point::new(-100., 20.)), Side::Left);
+        assert_eq!(facing(at, Point::new(10., 50.)), Side::Bottom);
+        assert_eq!(facing(at, Point::new(10., -50.)), Side::Top);
+        assert_eq!(facing(at, Point::new(80., -50.)), Side::Right);
+        let names: Vec<&str> = Side::ALL.iter().map(|side| side.name()).collect();
+        assert_eq!(names, ["top", "right", "bottom", "left"]);
     }
 
     #[test]

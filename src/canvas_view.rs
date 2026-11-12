@@ -8,6 +8,11 @@
 //! click on empty space makes a text card there; a text card's Markdown is typed whole in a
 //! [`LiveBlock`], written 800 ms after the last key.
 //!
+//! An edge is drawn from a handle at the middle of a side of the card under the pointer onto
+//! another card, both sides kept. A click selects an edge: its tools give it a colour of the
+//! presets and its ends, its label is typed in a [`LiveBlock`] where it is drawn, `Delete`
+//! deletes it; each change an operation, undone by `Ctrl-z`.
+//!
 //! What changed since the canvas was last read is drawn on it as [`crate::canvas_changes`] has
 //! it: the cards' colours, the ghosts of what was deleted or moved, the cards that rise.
 
@@ -21,11 +26,11 @@ use std::time::{Duration, Instant};
 
 use gpui_design_system::color::mix;
 use gpui_design_system::toast::Toast;
-use gpui_design_system::{Palette, palette, toast};
+use gpui_design_system::{Icon, Palette, icon, palette, toast};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::canvas::{self as model, Canvas, Color, End, Node, NodeKind, Problem, Rect};
+use crate::canvas::{self as model, Canvas, Color, Edge, End, Node, NodeKind, Problem, Rect};
 use crate::canvas_board::{self, Board, Saved, Written};
 use crate::canvas_changes::{self, BoardChanges, OnBoard};
 use crate::canvas_edges::{self as edges, Line};
@@ -641,6 +646,8 @@ pub struct CanvasView {
     edits: Edits,
     /// The edge under the pointer, by its place in the file's `edges`.
     hovered: Option<usize>,
+    /// The card under the pointer, by id: the one whose sides have handles to draw an edge from.
+    hovered_card: Option<String>,
     /// The edges' shapes, by their index in the canvas, kept while the file and the zoom stay.
     paths: Rc<RefCell<HashMap<usize, Built>>>,
     /// Where each label was last drawn, in the window, by its edge's place in the file's `edges`.
@@ -655,6 +662,8 @@ struct Edits {
     path: PathBuf,
     /// The cards selected, by id, in the order they were.
     selected: Vec<String>,
+    /// The edge selected, by id: never with cards.
+    edge: Option<String>,
     /// Cards, or a handle, held by the pointer until it is let go.
     held: Option<Held>,
     /// What a press does if it is let go before the pointer goes past [`SLOP`].
@@ -674,7 +683,9 @@ struct Edits {
 
 /// A text card whose Markdown is typed whole, where it is read.
 struct Typing {
+    /// The card's id, or the edge's when its label is typed.
     id: String,
+    label: bool,
     field: Entity<LiveBlock>,
     /// How many actions undo held before: those done since are one once it ends.
     mark: usize,
@@ -700,6 +711,14 @@ enum Held {
         start: Area,
         corner: Corner,
         now: Area,
+        going: bool,
+    },
+    /// An edge being drawn from the side `side` of the card `id`, its end at `at` in the window.
+    Linking {
+        from: Point<Pixels>,
+        id: String,
+        side: edges::Side,
+        at: Point<Pixels>,
         going: bool,
     },
 }
@@ -738,6 +757,7 @@ impl CanvasView {
             edits: Edits {
                 path,
                 selected: Vec::new(),
+                edge: None,
                 held: None,
                 click: None,
                 board: None,
@@ -748,6 +768,7 @@ impl CanvasView {
                 typing: None,
             },
             hovered: None,
+            hovered_card: None,
             paths: Rc::default(),
             labels: Rc::default(),
             changes: OnBoard::new(cx.background_executor().now()),
@@ -1108,9 +1129,10 @@ impl CanvasView {
         size * 1.4
     }
 
-    /// A press, Space not held: a handle or cards are held, or the selection waits for the
-    /// release to know whether it was a click. True when the press pans: on empty space, or on
-    /// the background of a group not selected.
+    /// A press, Space not held: an edge starts from a side's handle, a handle or cards are held,
+    /// an edge is selected, or the selection waits for the release to know whether it was a
+    /// click. True when the press pans: on empty space, or on the background of a group not
+    /// selected.
     fn press_selection(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) -> bool {
         let (Some(camera), Some(bounds)) = (self.camera, self.bounds) else {
             return false;
@@ -1118,9 +1140,31 @@ impl CanvasView {
         let (x, y) = local(event.position, bounds);
         let label = self.label_line(camera, cx);
         let (at, shift) = (event.position, event.modifiers.shift);
+        self.edits.click = None;
+        let hovered = self.hovered_card.as_deref();
+        if let Some((id, side)) = link_at(&self.file.cards, camera, hovered, x, y) {
+            self.edits.held = Some(Held::Linking {
+                from: at,
+                id,
+                side,
+                at,
+                going: false,
+            });
+            cx.notify();
+            return false;
+        }
+        // Found only where no card is: on empty space or a group's background.
+        if let Some(id) = self.edge_id_under(at, cx) {
+            self.edits.selected.clear();
+            self.edits.edge = Some(id);
+            cx.notify();
+            return false;
+        }
         let edits = &mut self.edits;
-        edits.click = None;
         let hit = hit(&self.file.cards, camera, label, edits.alone(), x, y);
+        if matches!(hit, Hit::Card(_) | Hit::Handle(..)) {
+            edits.edge = None;
+        }
         let pick = |id| match shift {
             true => Pick::Toggle(id),
             false => Pick::Only(id),
@@ -1206,9 +1250,11 @@ impl CanvasView {
             return;
         };
         let (from, going) = match &mut edits.held {
-            Some(Held::Moving { from, going, .. } | Held::Resizing { from, going, .. }) => {
-                (*from, going)
-            }
+            Some(
+                Held::Moving { from, going, .. }
+                | Held::Resizing { from, going, .. }
+                | Held::Linking { from, going, .. },
+            ) => (*from, going),
             None => return,
         };
         let delta = position - from;
@@ -1225,6 +1271,7 @@ impl CanvasView {
             Some(Held::Resizing {
                 start, corner, now, ..
             }) => *now = resized(*start, *corner, dx, dy),
+            Some(Held::Linking { at, .. }) => *at = position,
             None => {}
         }
         self.show_held();
@@ -1245,9 +1292,20 @@ impl CanvasView {
                 },
                 Pick::Clear => edits.selected.clear(),
             }
+            edits.edge = None;
             cx.notify();
         }
         let to: Vec<(String, Area)> = match edits.held.take() {
+            Some(Held::Linking {
+                id,
+                side,
+                at,
+                going: true,
+                ..
+            }) => {
+                self.link(&id, side, at, cx);
+                return;
+            }
             Some(Held::Moving {
                 start,
                 by,
@@ -1276,6 +1334,7 @@ impl CanvasView {
                 Corner::TopLeft | Corner::BottomRight => CursorStyle::ResizeUpLeftDownRight,
                 Corner::TopRight | Corner::BottomLeft => CursorStyle::ResizeUpRightDownLeft,
             }),
+            Some(Held::Linking { .. }) => Some(CursorStyle::Crosshair),
             _ => None,
         }
     }
@@ -1367,9 +1426,21 @@ impl CanvasView {
         }
     }
 
-    /// `Delete`: the selection deleted with its edges, and written.
+    /// `Delete`: the edge selected deleted, or the cards selected with their edges; written.
     fn delete(&mut self, cx: &mut Context<Self>) {
-        if self.edits.selected.is_empty() || self.edits.held.is_some() {
+        if self.edits.held.is_some() {
+            return;
+        }
+        if let Some(id) = self.edits.edge.take() {
+            if self.edit(
+                |canvas| Op::delete_edge(canvas, &id).into_iter().collect(),
+                cx,
+            ) {
+                self.save(cx);
+            }
+            return;
+        }
+        if self.edits.selected.is_empty() {
             return;
         }
         let ids = std::mem::take(&mut self.edits.selected);
@@ -1737,13 +1808,25 @@ impl CanvasView {
         let label = self.label_line(camera, cx);
         let hit = hit(&self.file.cards, camera, label, self.edits.alone(), x, y);
         if let Some(typing) = &self.edits.typing {
-            if hit == Hit::Card(typing.id.clone()) {
+            let inside = if typing.label {
+                self.label_bounds(&typing.id)
+                    .is_some_and(|at| at.contains(&event.position))
+            } else {
+                hit == Hit::Card(typing.id.clone())
+            };
+            if inside {
                 return true;
             }
             self.stop_typing(cx);
         }
         if event.click_count != 2 || event.modifiers.modified() {
             return false;
+        }
+        // On an edge or its label, where no card is: its label is typed.
+        if let Some(id) = self.edge_id_under(event.position, cx) {
+            self.type_label(id, Caret::End, window, cx);
+            window.prevent_default();
+            return true;
         }
         match hit {
             Hit::Card(id) if self.is_text(&id) => {
@@ -1767,9 +1850,14 @@ impl CanvasView {
             .any(|card| card.id == id && matches!(card.kind, CardKind::Text(_)))
     }
 
-    /// Enter: the text card selected alone is typed in, the caret at its end.
+    /// Enter: the label of the edge selected, or the text card selected alone, is typed in, the
+    /// caret at its end.
     fn edit_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.edits.held.is_some() || self.typing() {
+            return;
+        }
+        if let Some(id) = self.edits.edge.clone() {
+            self.type_label(id, Caret::End, window, cx);
             return;
         }
         let Some(id) = self.edits.alone().map(str::to_string) else {
@@ -1790,7 +1878,30 @@ impl CanvasView {
             return;
         };
         let (text, mark) = (text.to_string(), board.actions());
-        self.start_typing(id, text, caret, mark, window, cx);
+        self.start_typing(id, text, caret, false, mark, window, cx);
+    }
+
+    /// The label of the edge `id` typed in, as the canvas being edited has it: empty when it has
+    /// none, the label made by the first key.
+    fn type_label(
+        &mut self,
+        id: String,
+        caret: Caret,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_board(cx);
+        let Some(board) = &self.edits.board else {
+            return;
+        };
+        let Some(edge) = find_edge(board.canvas(), &id) else {
+            return;
+        };
+        let (text, mark) = (
+            edge.label().unwrap_or_default().to_string(),
+            board.actions(),
+        );
+        self.start_typing(id, text, caret, true, mark, window, cx);
     }
 
     /// A text card made at the canvas's point (`x`, `y`), empty, and typed in: written once the
@@ -1808,14 +1919,17 @@ impl CanvasView {
         }
         self.show_texts(cx);
         self.save_later(TYPING_REST, cx);
-        self.start_typing(id, String::new(), Caret::Start, mark, window, cx);
+        self.start_typing(id, String::new(), Caret::Start, false, mark, window, cx);
     }
 
+    /// The text of the card `id`, or the label of the edge `id`, typed in a field.
+    #[allow(clippy::too_many_arguments)]
     fn start_typing(
         &mut self,
         id: String,
         text: String,
         caret: Caret,
+        label: bool,
         mark: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1847,9 +1961,16 @@ impl CanvasView {
         let before = window.focused(cx);
         let focus = field.read(cx).focus_handle().clone();
         window.focus(&focus, cx);
-        self.edits.selected = vec![id.clone()];
+        if label {
+            self.edits.selected.clear();
+            self.edits.edge = Some(id.clone());
+        } else {
+            self.edits.selected = vec![id.clone()];
+            self.edits.edge = None;
+        }
         self.edits.typing = Some(Typing {
             id,
+            label,
             field,
             mark,
             before,
@@ -1867,7 +1988,12 @@ impl CanvasView {
             return;
         };
         let (id, text) = (typing.id.clone(), typing.field.read(cx).value().to_string());
-        if self.edit(|canvas| typing_ops(canvas, &id, &text), cx) {
+        let label = typing.label;
+        let make = |canvas: &Canvas| match label {
+            true => labelling(canvas, &id, &text),
+            false => typing_ops(canvas, &id, &text),
+        };
+        if self.edit(make, cx) {
             self.save_later(TYPING_REST, cx);
         }
     }
@@ -1927,8 +2053,18 @@ impl CanvasView {
         let (Some(typing), Some(board)) = (&self.edits.typing, &self.edits.board) else {
             return;
         };
-        let text = board.canvas().node(&typing.id).and_then(Node::text);
-        let waits = text_waits(board.pending(), &typing.id);
+        let (text, waits) = if typing.label {
+            let edge = find_edge(board.canvas(), &typing.id);
+            (
+                edge.map(|edge| edge.label().unwrap_or_default()),
+                label_waits(board.pending(), &typing.id),
+            )
+        } else {
+            (
+                board.canvas().node(&typing.id).and_then(Node::text),
+                text_waits(board.pending(), &typing.id),
+            )
+        };
         let field = typing.field.clone();
         match text.map(str::to_string) {
             None => {
@@ -1948,7 +2084,12 @@ impl CanvasView {
         let Some(board) = &self.edits.board else {
             return;
         };
-        let typing = self.edits.typing.as_ref().map(|typing| typing.id.as_str());
+        let typing = self
+            .edits
+            .typing
+            .as_ref()
+            .filter(|typing| !typing.label)
+            .map(|typing| typing.id.as_str());
         let (mut added, mut read) = (Vec::new(), Vec::new());
         for (index, node) in board.canvas().nodes().iter().enumerate() {
             let Some(id) = node.id() else {
@@ -2045,13 +2186,13 @@ impl CanvasView {
         self.edits
             .typing
             .as_ref()
-            .is_some_and(|typing| typing.id == card.id)
+            .is_some_and(|typing| !typing.label && typing.id == card.id)
     }
 
     /// A text card's body: its Markdown read, or the field it is typed in.
     fn card_text(&self, ctx: &Ctx<Self>, card: &Card, doc: &Arc<Document>, body: Div) -> Div {
         match &self.edits.typing {
-            Some(typing) if typing.id == card.id => body
+            Some(typing) if !typing.label && typing.id == card.id => body
                 .key_context("CanvasCard")
                 .on_action(
                     ctx.cx
@@ -2084,7 +2225,7 @@ impl CanvasView {
         config: &Config,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let typing = self.edits.typing.as_ref()?;
+        let typing = self.edits.typing.as_ref().filter(|typing| !typing.label)?;
         if detail == Detail::Full {
             return None;
         }
@@ -2115,9 +2256,18 @@ fn typing_ops(canvas: &Canvas, id: &str, text: &str) -> Vec<Op> {
 
 /// Whether a text typed in the card `id` waits in `pending` to be written.
 fn text_waits(pending: &[Op], id: &str) -> bool {
+    field_waits(pending, Target::Node, id, "text")
+}
+
+/// Whether a label typed for the edge `id` waits in `pending` to be written.
+fn label_waits(pending: &[Op], id: &str) -> bool {
+    field_waits(pending, Target::Edge, id, "label")
+}
+
+fn field_waits(pending: &[Op], target: Target, id: &str, key: &str) -> bool {
     pending.iter().any(|op| {
-        matches!(op, Op::Set { target: Target::Node, id: set, fields }
-            if set == id && fields.iter().any(|field| field.key == "text"))
+        matches!(op, Op::Set { target: set_target, id: set, fields }
+            if *set_target == target && set == id && fields.iter().any(|field| field.key == key))
     })
 }
 
@@ -2417,6 +2567,8 @@ const HOVERED_WIDTH: f32 = 3.;
 const HOVER: f32 = 6.;
 /// A label's widest, and the height of the room it is centred in, in the canvas's pixels.
 const LABEL_WIDTH: f32 = 260.;
+/// The narrowest a label being typed is, in the canvas's pixels: room for the caret.
+const LABEL_MIN: f32 = 80.;
 const LABEL_HEIGHT: f32 = 200.;
 
 /// Where labels are drawn, in the window, by their edge's place in the file's `edges`.
@@ -2491,6 +2643,7 @@ impl CanvasView {
         p: &Palette,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
+        let selected = self.edits.edge.as_deref();
         let shown: Vec<(usize, Hsla, f32)> = self
             .file
             .edges
@@ -2503,7 +2656,9 @@ impl CanvasView {
                     .changes()
                     .and_then(|c| c.edge_color(&edge.id, p))
                     .unwrap_or_else(|| edge.tint.map_or(p.mute, |t| tint(p, t)));
-                if self.hovered == Some(i) {
+                if !edge.id.is_empty() && selected == Some(edge.id.as_str()) {
+                    (i, crate::kit::link(p), HOVERED_WIDTH)
+                } else if self.hovered == Some(i) {
                     (i, lighter(color), HOVERED_WIDTH)
                 } else {
                     (i, color, EDGE_WIDTH)
@@ -2511,20 +2666,39 @@ impl CanvasView {
             })
             .collect();
         self.labels.borrow_mut().clear();
-        let labels: Vec<AnyElement> = match detail {
-            Detail::Full => {
-                let size = px(camera.text_zoom(font_size) * font_size);
-                shown
-                    .iter()
-                    .filter_map(|&(i, _, _)| {
-                        let edge = &self.file.edges[i];
-                        let text = edge.label.as_ref()?;
-                        Some(label(i, edge, text, camera, size, p, self.labels.clone()))
-                    })
-                    .collect()
-            }
-            Detail::Light | Detail::Rects => Vec::new(),
-        };
+        // The label typed is drawn at every detail, the others at the full one only.
+        let typed = self.edits.typing.as_ref().filter(|typing| typing.label);
+        let size = px(camera.text_zoom(font_size) * font_size);
+        let labels: Vec<AnyElement> = shown
+            .iter()
+            .filter_map(|&(i, _, _)| {
+                let edge = &self.file.edges[i];
+                let drawn = self.labels.clone();
+                if let Some(typing) = typed.filter(|typing| typing.id == edge.id) {
+                    let field = div()
+                        .key_context("CanvasCard")
+                        .on_action(cx.listener(|this, _: &StopTyping, _, cx| this.stop_typing(cx)))
+                        .on_action(cx.listener(|this, _: &WriteCard, _, cx| this.save(cx)))
+                        .min_w(px(LABEL_MIN * camera.zoom))
+                        .text_left()
+                        .child(typing.field.clone());
+                    return Some(label(
+                        i,
+                        edge,
+                        field.into_any_element(),
+                        camera,
+                        size,
+                        p,
+                        drawn,
+                    ));
+                }
+                if detail != Detail::Full {
+                    return None;
+                }
+                let text = edge.label.clone()?.into_any_element();
+                Some(label(i, edge, text, camera, size, p, drawn))
+            })
+            .collect();
         let (file, paths, this) = (
             self.file.clone(),
             self.paths.clone(),
@@ -2571,6 +2745,10 @@ impl CanvasView {
         let disk = self.file.canvas.clone();
         let canvas = self.edits.board.as_ref().map_or(&*disk, Board::canvas);
         let edges = self.file.laid_edges(canvas);
+        let gone = (self.edits.edge.as_ref()).is_some_and(|id| find_edge(canvas, id).is_none());
+        if gone {
+            self.edits.edge = None;
+        }
         if edges != self.file.edges {
             if edges.len() != self.file.edges.len() {
                 self.hovered = None;
@@ -2587,9 +2765,102 @@ impl CanvasView {
         } else {
             None
         };
-        if hovered != self.hovered {
+        let card = self.card_under(position, cx);
+        if hovered != self.hovered || card != self.hovered_card {
             self.hovered = hovered;
+            self.hovered_card = card;
             cx.notify();
+        }
+    }
+
+    /// The card under `position`, or one of whose side's handles it is on: the card whose
+    /// handles show. None while the pointer pans or holds something.
+    fn card_under(&self, position: Point<Pixels>, cx: &App) -> Option<String> {
+        let (Some(camera), Some(bounds)) = (self.camera, self.bounds) else {
+            return None;
+        };
+        if self.space
+            || self.panning.is_some()
+            || self.edits.held.is_some()
+            || !bounds.contains(&position)
+        {
+            return None;
+        }
+        let (x, y) = local(position, bounds);
+        let cards = &self.file.cards;
+        // Half of a handle lies outside its card.
+        if let Some((id, _)) = link_at(cards, camera, self.hovered_card.as_deref(), x, y) {
+            return Some(id);
+        }
+        let label = self.label_line(camera, cx);
+        match hit(cards, camera, label, self.edits.alone(), x, y) {
+            Hit::Handle(id, _) | Hit::Card(id) | Hit::Group(id) => Some(id),
+            Hit::Empty => None,
+        }
+    }
+
+    /// The id of the edge under `position`, as [`CanvasView::edge_under`] finds it; none for an
+    /// edge without one, which cannot be changed.
+    fn edge_id_under(&self, position: Point<Pixels>, cx: &App) -> Option<String> {
+        let i = self.edge_under(position, cx)?;
+        Some(self.file.edges[i].id.clone()).filter(|id| !id.is_empty())
+    }
+
+    /// Where the label of the edge `id` was last drawn, in the window.
+    fn label_bounds(&self, id: &str) -> Option<Bounds<Pixels>> {
+        let i = self.file.edges.iter().position(|edge| edge.id == id)?;
+        let labels = self.labels.borrow();
+        labels.iter().find(|(j, _)| *j == i).map(|(_, at)| *at)
+    }
+
+    /// An edge drawn from the side `side` of the card `from` let go at `at`, in the window: made
+    /// to the side of the card there nearest the pointer, selected and written. Let go on empty
+    /// space, or on the card it starts from, nothing.
+    fn link(&mut self, from: &str, side: edges::Side, at: Point<Pixels>, cx: &mut Context<Self>) {
+        cx.notify();
+        let (Some(camera), Some(bounds)) = (self.camera, self.bounds) else {
+            return;
+        };
+        let (x, y) = local(at, bounds);
+        let label = self.label_line(camera, cx);
+        let Some((to, to_side)) = target(&self.file.cards, camera, label, from, x, y) else {
+            return;
+        };
+        let mut made = None;
+        let done = self.edit(
+            |canvas| {
+                let op = linking(canvas, from, side, &to, to_side);
+                if let Some(Op::AddEdge { edge, .. }) = &op {
+                    made = edge.id().map(str::to_string);
+                }
+                op.into_iter().collect()
+            },
+            cx,
+        );
+        if done {
+            self.edits.selected.clear();
+            self.edits.edge = made;
+            self.save(cx);
+        }
+    }
+
+    /// The edge selected given a colour of the presets (`1` to `6`), or none; written.
+    fn color_edge(&mut self, color: Option<u8>, cx: &mut Context<Self>) {
+        let Some(id) = self.edits.edge.clone() else {
+            return;
+        };
+        if self.edit(|canvas| coloring(canvas, &id, color), cx) {
+            self.save(cx);
+        }
+    }
+
+    /// The edge selected given these ends; written.
+    fn end_edge(&mut self, ends: Ends, cx: &mut Context<Self>) {
+        let Some(id) = self.edits.edge.clone() else {
+            return;
+        };
+        if self.edit(|canvas| ending(canvas, &id, ends), cx) {
+            self.save(cx);
         }
     }
 
@@ -2607,6 +2878,9 @@ impl CanvasView {
         match hit(&self.file.cards, camera, label, self.edits.alone(), x, y) {
             Hit::Handle(..) | Hit::Card(_) => return None,
             Hit::Group(_) | Hit::Empty => {}
+        }
+        if link_at(&self.file.cards, camera, self.hovered_card.as_deref(), x, y).is_some() {
+            return None;
         }
         let labels = self.labels.borrow();
         if let Some(&(i, _)) = labels.iter().find(|(_, at)| at.contains(&position)) {
@@ -2627,7 +2901,7 @@ fn lighter(color: Hsla) -> Hsla {
 fn label(
     i: usize,
     edge: &EdgeLine,
-    text: &str,
+    content: AnyElement,
     camera: Camera,
     size: Pixels,
     p: &Palette,
@@ -2658,7 +2932,7 @@ fn label(
                 .text_color(p.text)
                 .text_center()
                 .relative()
-                .child(text.to_string())
+                .child(content)
                 .child(
                     canvas(
                         move |bounds, _, _| drawn.borrow_mut().push((i, bounds)),
@@ -2672,6 +2946,423 @@ fn label(
         )
         .into_any_element()
 }
+
+/// A card's area as the edges' geometry has it.
+fn edge_rect(area: Area) -> edges::Rect {
+    edges::Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: area.height,
+    }
+}
+
+/// The edge `id` of `canvas`.
+fn find_edge<'a>(canvas: &'a Canvas, id: &str) -> Option<&'a Edge> {
+    canvas.edges().iter().find(|edge| edge.id() == Some(id))
+}
+
+/// The handle at the middle of a side of the card `hovered` that the board's point (`x`, `y`)
+/// is on: an edge is drawn from it. As a corner's, no handles on a card too small on screen.
+fn link_at(
+    cards: &[Card],
+    camera: Camera,
+    hovered: Option<&str>,
+    x: f32,
+    y: f32,
+) -> Option<(String, edges::Side)> {
+    let hovered = hovered.filter(|id| !id.is_empty())?;
+    let card = cards.iter().find(|card| card.id == hovered)?;
+    let area = camera.on_screen(card.area);
+    if !handles_shown(area) {
+        return None;
+    }
+    let at = edges::Point::new(x, y);
+    edges::Side::ALL
+        .into_iter()
+        .find(|side| side.middle(edge_rect(area)).distance(at) <= REACH)
+        .map(|side| (card.id.clone(), side))
+}
+
+/// The card an edge drawn from the card `from` reaches when let go at the board's point (`x`,
+/// `y`), and its side nearest the pointer: a card under the pointer, or just beside it (as far
+/// as a handle reaches), then a group under it. None on empty space, or on `from` itself.
+fn target(
+    cards: &[Card],
+    camera: Camera,
+    label: f32,
+    from: &str,
+    x: f32,
+    y: f32,
+) -> Option<(String, edges::Side)> {
+    let (at_x, at_y) = camera.to_canvas(x, y);
+    let reach = REACH / camera.zoom;
+    let id = match hit(cards, camera, label, None, x, y) {
+        Hit::Card(id) if id == from => return None,
+        Hit::Card(id) => Some(id),
+        Hit::Group(id) => cards
+            .iter()
+            .rev()
+            .filter(|card| !card.id.is_empty() && card.id != from)
+            .filter(|card| !matches!(card.kind, CardKind::Group))
+            .find(|card| {
+                let a = card.area;
+                (a.x - reach..=a.x + a.width + reach).contains(&at_x)
+                    && (a.y - reach..=a.y + a.height + reach).contains(&at_y)
+            })
+            .map(|card| card.id.clone())
+            .or((id != from).then_some(id)),
+        Hit::Empty | Hit::Handle(..) => cards
+            .iter()
+            .rev()
+            .filter(|card| !card.id.is_empty() && card.id != from)
+            .find(|card| {
+                let a = card.area;
+                (a.x - reach..=a.x + a.width + reach).contains(&at_x)
+                    && (a.y - reach..=a.y + a.height + reach).contains(&at_y)
+            })
+            .map(|card| card.id.clone()),
+    }?;
+    let card = cards.iter().find(|card| card.id == id)?;
+    let side = edges::nearest(edge_rect(card.area), edges::Point::new(at_x, at_y));
+    Some((id, side))
+}
+
+/// The edge from the side `from_side` of the node `from` to the side `to_side` of the node
+/// `to`, its ends the default ones: none unless both nodes are in `canvas`, and two.
+fn linking(
+    canvas: &Canvas,
+    from: &str,
+    from_side: edges::Side,
+    to: &str,
+    to_side: edges::Side,
+) -> Option<Op> {
+    if from == to || canvas.node(from).is_none() || canvas.node(to).is_none() {
+        return None;
+    }
+    let id = canvas.new_id();
+    let edge = Edge::between(&id, from, from_side.name(), to, to_side.name());
+    Some(Op::add_edge(edge))
+}
+
+/// The operation that gives the edge `id` the label `text`: blank, the label is removed.
+fn labelling(canvas: &Canvas, id: &str, text: &str) -> Vec<Op> {
+    let value = (!text.trim().is_empty()).then(|| text.into());
+    Op::set(canvas, Target::Edge, id, [("label", value)])
+        .into_iter()
+        .collect()
+}
+
+/// The operation that gives the edge `id` the preset colour `color` (`1` to `6`), or none.
+fn coloring(canvas: &Canvas, id: &str, color: Option<u8>) -> Vec<Op> {
+    let color = color.map(|n| n.to_string());
+    Op::set_color(canvas, Target::Edge, id, color.as_deref())
+        .into_iter()
+        .collect()
+}
+
+/// The arrows of an edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ends {
+    /// None.
+    Plain,
+    /// At one end, where it goes to unless it has one where it starts.
+    One,
+    Both,
+}
+
+fn ends_of(edge: &Edge) -> Ends {
+    match (
+        edge.source_end() == End::Arrow,
+        edge.target_end() == End::Arrow,
+    ) {
+        (false, false) => Ends::Plain,
+        (true, true) => Ends::Both,
+        _ => Ends::One,
+    }
+}
+
+/// The operation that gives the edge `id` the arrows `ends`: an end that has the arrow wanted
+/// already is left as the file writes it; another is written `arrow` or `none`. One arrow kept
+/// where it is when the edge has one already.
+fn ending(canvas: &Canvas, id: &str, ends: Ends) -> Vec<Op> {
+    let Some(edge) = find_edge(canvas, id) else {
+        return Vec::new();
+    };
+    if ends_of(edge) == ends {
+        return Vec::new();
+    }
+    let (from, to) = match ends {
+        Ends::Plain => (false, false),
+        Ends::One => (false, true),
+        Ends::Both => (true, true),
+    };
+    let end = |key: &'static str, now: bool, wanted: bool| {
+        let value = match now == wanted {
+            true => edge.fields().get(key).cloned(),
+            false => Some(if wanted { "arrow" } else { "none" }.into()),
+        };
+        (key, value)
+    };
+    let changes = [
+        end("fromEnd", edge.source_end() == End::Arrow, from),
+        end("toEnd", edge.target_end() == End::Arrow, to),
+    ];
+    Op::set(canvas, Target::Edge, id, changes)
+        .into_iter()
+        .collect()
+}
+
+/// The handles an edge is drawn from, the edge being drawn, and the tools of the edge selected.
+impl CanvasView {
+    /// The handles at the middle of each side of the card under the pointer; or, while an edge
+    /// is drawn, its curve to the pointer, or to the side of the card it would reach, that card
+    /// outlined. Painted over the cards, in one element.
+    fn link_layer(&self, camera: Camera, p: &Palette, cx: &App) -> Option<AnyElement> {
+        let accent = crate::kit::link(p);
+        let find = |id: &str| self.file.cards.iter().find(|card| card.id == id);
+        let mut handles: Vec<edges::Point> = Vec::new();
+        let mut drawn: Option<(Line, Option<Area>)> = None;
+        match &self.edits.held {
+            Some(Held::Linking {
+                id,
+                side,
+                at,
+                going: true,
+                ..
+            }) => {
+                let card = find(id)?;
+                let (x, y) = local(*at, self.bounds?);
+                let label = self.label_line(camera, cx);
+                let start = side.middle(edge_rect(card.area));
+                let reached = target(&self.file.cards, camera, label, id, x, y)
+                    .and_then(|(to, to_side)| Some((find(&to)?, to_side)));
+                let (to, to_side, outline) = match reached {
+                    Some((to, to_side)) => (edge_rect(to.area), to_side, Some(to.area)),
+                    None => {
+                        let (x, y) = camera.to_canvas(x, y);
+                        let point = edges::Rect {
+                            x,
+                            y,
+                            width: 0.,
+                            height: 0.,
+                        };
+                        let side = edges::facing(edges::Point::new(x, y), start);
+                        (point, side, None)
+                    }
+                };
+                let from = edge_rect(card.area);
+                let line = Line::new(from, Some(*side), to, Some(to_side), false, true);
+                drawn = Some((line, outline.map(|area| camera.on_screen(area))));
+            }
+            None if !self.space && self.panning.is_none() => {
+                let card = find(self.hovered_card.as_deref()?)?;
+                let area = camera.on_screen(card.area);
+                if !handles_shown(area) {
+                    return None;
+                }
+                handles = edges::Side::ALL
+                    .map(|side| side.middle(edge_rect(area)))
+                    .to_vec();
+            }
+            _ => return None,
+        }
+        let fill = p.bg;
+        let element = canvas(
+            |_, _, _| (),
+            move |bounds, (), window, _| {
+                let screen = |p: edges::Point| {
+                    let (x, y) = camera.to_screen(p.x, p.y);
+                    bounds.origin + point(px(x), px(y))
+                };
+                if let Some((line, outline)) = &drawn {
+                    if let Some(area) = outline {
+                        let at = Bounds::new(
+                            bounds.origin + point(px(area.x - 2.), px(area.y - 2.)),
+                            size(px(area.width + 4.), px(area.height + 4.)),
+                        );
+                        let clear = hsla(0., 0., 0., 0.);
+                        window.paint_quad(quad(
+                            at,
+                            px(4.),
+                            clear,
+                            px(2.),
+                            accent,
+                            BorderStyle::Solid,
+                        ));
+                    }
+                    let mut stroke = PathBuilder::stroke(px(EDGE_WIDTH));
+                    stroke.move_to(screen(line.from));
+                    stroke.cubic_bezier_to(screen(line.to), screen(line.c1), screen(line.c2));
+                    if let Ok(path) = stroke.build() {
+                        window.paint_path(path, accent);
+                    }
+                    if let Some(arrow) = line.to_arrow {
+                        let mut fill = PathBuilder::fill();
+                        fill.add_polygon(&arrow.map(screen), true);
+                        if let Ok(path) = fill.build() {
+                            window.paint_path(path, accent);
+                        }
+                    }
+                }
+                let radius = HANDLE / 2. + 1.;
+                for middle in &handles {
+                    let at = Bounds::new(
+                        bounds.origin + point(px(middle.x - radius), px(middle.y - radius)),
+                        size(px(2. * radius), px(2. * radius)),
+                    );
+                    window.paint_quad(quad(
+                        at,
+                        px(radius),
+                        fill,
+                        px(1.5),
+                        accent,
+                        BorderStyle::Solid,
+                    ));
+                }
+            },
+        )
+        .absolute()
+        .size_full();
+        Some(element.into_any_element())
+    }
+
+    /// The tools of the edge selected, above its middle and its label: its colour among the
+    /// presets or none, its ends, its label typed, its deletion. None while it is typed in or
+    /// the pointer holds something.
+    fn edge_tools(
+        &self,
+        camera: Camera,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let id = self.edits.edge.clone()?;
+        let typing_label = self.edits.typing.as_ref().is_some_and(|t| t.label);
+        if self.edits.held.is_some() || typing_label {
+            return None;
+        }
+        let line = self.file.edges.iter().find(|edge| edge.id == id)?;
+        let disk = self.file.canvas.clone();
+        let canvas = self.edits.board.as_ref().map_or(&*disk, Board::canvas);
+        let edge = find_edge(canvas, &id)?;
+        let (ends, color) = (
+            ends_of(edge),
+            match edge.color() {
+                Some(Color::Preset(n)) => Some(n),
+                _ => None,
+            },
+        );
+        let middle = line.line.middle();
+        let (x, y) = camera.to_screen(middle.x, middle.y);
+        // Half the label drawn there, at the full detail: its lines and its box's padding.
+        let font = cx.global::<Config>().font_size;
+        let above = match (&line.label, Detail::at(camera.zoom, self.gesturing)) {
+            (Some(label), Detail::Full) => {
+                let lines = label.lines().count().max(1) as f32;
+                let size = camera.text_zoom(font) * font;
+                (lines * size * 1.4 + 4. * camera.zoom) / 2.
+            }
+            _ => 0.,
+        };
+        let accent = crate::kit::link(p);
+        let swatch = |n: Option<u8>| {
+            let chosen = color == n;
+            div()
+                .id(("edge-color", n.map_or(0, usize::from)))
+                .size(px(16.))
+                .rounded_full()
+                .border(px(if chosen { 2. } else { 1. }))
+                .border_color(if chosen { accent } else { p.line2 })
+                .bg(n.map_or(p.bg, |n| tint(p, Tint::Preset(n))))
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.color_edge(n, cx);
+                    }),
+                )
+        };
+        let tool = |name: &'static str, chosen: bool| {
+            div()
+                .id(name)
+                .h(px(22.))
+                .px(px(6.))
+                .flex()
+                .items_center()
+                .rounded(px(6.))
+                .text_size(px(13.))
+                .text_color(if chosen { p.text } else { p.mute })
+                .when(chosen, |d| d.bg(p.sel))
+                .cursor_pointer()
+        };
+        let end = |name: &'static str, glyph: &'static str, to: Ends| {
+            tool(name, ends == to).child(glyph).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.end_edge(to, cx);
+                }),
+            )
+        };
+        let gap = || div().w(px(1.)).h(px(16.)).mx(px(2.)).bg(p.line2);
+        let typed = id.clone();
+        let tools = div()
+            .id("edge-tools")
+            .occlude()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .p(px(4.))
+            .rounded(px(10.))
+            .border_1()
+            .border_color(p.line2)
+            .bg(p.card)
+            .shadow_md()
+            .children([None, Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)].map(swatch))
+            .child(gap())
+            .child(end("edge-plain", "—", Ends::Plain))
+            .child(end("edge-one", "→", Ends::One))
+            .child(end("edge-both", "↔", Ends::Both))
+            .child(gap())
+            .child(tool("edge-label", false).child("Label").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    // The page, which holds the keys otherwise, would take them back.
+                    window.prevent_default();
+                    this.type_label(typed.clone(), Caret::End, window, cx);
+                }),
+            ))
+            .child(
+                tool("edge-delete", false)
+                    .child(icon(Icon::Trash).size(px(14.)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.delete(cx);
+                        }),
+                    ),
+            );
+        let wide = 480.;
+        Some(
+            div()
+                .absolute()
+                .left(px(x - wide / 2.))
+                .top(px(y - above - TOOLS_ABOVE))
+                .w(px(wide))
+                .flex()
+                .justify_center()
+                .child(tools)
+                .into_any_element(),
+        )
+    }
+}
+
+/// How far above an edge's middle (or its label) its tools stand, on screen: their height and a
+/// gap.
+const TOOLS_ABOVE: f32 = 42.;
 
 impl Host for CanvasView {
     fn link_clicked(&mut self, link: String) {
@@ -2803,6 +3494,8 @@ impl Render for CanvasView {
         };
         board = board.children(self.typed_card(detail, camera, &p, &config, cx));
         board = board.children(self.selection(camera, &p));
+        board = board.children(self.link_layer(camera, &p, cx));
+        board = board.children(self.edge_tools(camera, &p, cx));
         // A pan, or cards held, go on wherever the pointer goes, over the board or not.
         if self.panning.is_some() || self.edits.held.is_some() {
             board = board.child(
@@ -3548,6 +4241,205 @@ mod typing_tests {
         assert!(!text_waits(board.pending(), "a"));
         assert_eq!(board.canvas().node("a").unwrap().text(), Some("A theirs"));
         assert_eq!(told(&Report::default()), None);
+        let _ = fs::remove_dir_all(&folder);
+    }
+}
+
+#[cfg(test)]
+mod edge_tests {
+    use super::{
+        Camera, CanvasFile, Ends, coloring, ending, find_edge, label_waits, labelling, link_at,
+        linking, target, write_now,
+    };
+    use crate::canvas::Canvas;
+    use crate::canvas_board::Board;
+    use crate::canvas_edges::Side;
+    use crate::canvas_ops::{Op, Report};
+    use serde_json::Value;
+    use std::fs;
+
+    /// Cards `a` and `b` side by side, a third `c` below, and an edge from `a` to `b`.
+    const TWO: &str = r##"{"nodes":[
+        {"id":"a","type":"text","text":"A","x":0,"y":0,"width":200,"height":100},
+        {"id":"b","type":"text","text":"B","x":400,"y":0,"width":200,"height":100},
+        {"id":"c","type":"text","text":"C","x":0,"y":300,"width":200,"height":100}
+    ],"edges":[
+        {"id":"ab","fromNode":"a","toNode":"b"}
+    ]}"##;
+
+    const CAMERA: Camera = Camera {
+        x: -100.,
+        y: -100.,
+        zoom: 1.,
+    };
+
+    fn applied(canvas: &Canvas, ops: &[Op]) -> Canvas {
+        let mut canvas = canvas.clone();
+        let mut report = Report::default();
+        for op in ops {
+            op.apply(&mut canvas, &mut report);
+        }
+        assert!(report.is_clean(), "{report:?}");
+        canvas
+    }
+
+    /// The edge drawn from the handle at the board's point `from` to the board's point `to`, as
+    /// the board makes it.
+    fn drawn(file: &CanvasFile, from: (f32, f32), to: (f32, f32)) -> Option<Op> {
+        let (id, side) = link_at(&file.cards, CAMERA, Some("a"), from.0, from.1)?;
+        let (to, to_side) = target(&file.cards, CAMERA, 0., &id, to.0, to.1)?;
+        linking(&file.canvas, &id, side, &to, to_side)
+    }
+
+    #[test]
+    fn a_drag_from_a_side_to_a_card_adds_an_edge_with_both_sides() {
+        let file = CanvasFile::read(TWO, "#000000", None).unwrap();
+        let screen = |x: f32, y: f32| CAMERA.to_screen(x, y);
+        // The handles: at the middle of each side of the card under the pointer, within reach.
+        let (x, y) = screen(200., 50.);
+        assert_eq!(
+            link_at(&file.cards, CAMERA, Some("a"), x + 4., y - 3.),
+            Some(("a".into(), Side::Right))
+        );
+        let (x, y) = screen(100., 100.);
+        assert_eq!(
+            link_at(&file.cards, CAMERA, Some("a"), x, y + 5.),
+            Some(("a".into(), Side::Bottom))
+        );
+        assert_eq!(link_at(&file.cards, CAMERA, Some("a"), x + 20., y), None);
+        assert_eq!(link_at(&file.cards, CAMERA, None, x, y), None);
+        // From a's right side onto b, near its left side: both sides kept.
+        let op = drawn(&file, screen(200., 50.), screen(405., 40.)).unwrap();
+        let Op::AddEdge { edge, .. } = &op else {
+            panic!("{op:?}");
+        };
+        let keys: Vec<&str> = edge.fields().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["id", "fromNode", "fromSide", "toNode", "toSide"]);
+        assert_eq!(edge.source_node(), Some("a"));
+        assert_eq!(edge.fields()["fromSide"], "right");
+        assert_eq!(edge.target_node(), Some("b"));
+        assert_eq!(edge.fields()["toSide"], "left");
+        let id = edge.id().unwrap().to_string();
+        assert!(id != "ab" && id != "a" && id != "b");
+        let added = applied(&file.canvas, std::slice::from_ref(&op));
+        assert_eq!(added.edges().len(), 2);
+        assert!(added.write().is_ok(), "a valid canvas");
+        // The side nearest the pointer: b's bottom, c's top from a's bottom.
+        let op = drawn(&file, screen(200., 50.), screen(500., 96.)).unwrap();
+        assert!(matches!(&op, Op::AddEdge { edge, .. } if edge.fields()["toSide"] == "bottom"));
+        let op = drawn(&file, screen(100., 100.), screen(100., 303.)).unwrap();
+        assert!(matches!(&op, Op::AddEdge { edge, .. }
+            if edge.fields()["fromSide"] == "bottom" && edge.target_node() == Some("c")
+                && edge.fields()["toSide"] == "top"));
+        // Let go just beside a card, within a handle's reach: still on it.
+        let op = drawn(&file, screen(200., 50.), screen(396., 50.)).unwrap();
+        assert!(matches!(&op, Op::AddEdge { edge, .. } if edge.target_node() == Some("b")));
+    }
+
+    #[test]
+    fn a_drag_to_empty_space_or_back_onto_its_card_makes_nothing() {
+        let file = CanvasFile::read(TWO, "#000000", None).unwrap();
+        let screen = |x: f32, y: f32| CAMERA.to_screen(x, y);
+        assert_eq!(drawn(&file, screen(200., 50.), screen(300., 200.)), None);
+        assert_eq!(drawn(&file, screen(200., 50.), screen(1000., 1000.)), None);
+        assert_eq!(drawn(&file, screen(200., 50.), screen(100., 50.)), None);
+        // Never to a node that is not there: the canvas would not be valid.
+        assert_eq!(
+            linking(&file.canvas, "a", Side::Right, "gone", Side::Left),
+            None
+        );
+        assert_eq!(
+            linking(&file.canvas, "a", Side::Right, "a", Side::Left),
+            None
+        );
+    }
+
+    #[test]
+    fn each_change_of_an_edge_is_its_operation_undone_by_its_inverse() {
+        let canvas = Canvas::read(TWO);
+        let field = |canvas: &Canvas, key: &str| {
+            find_edge(canvas, "ab").unwrap().fields().get(key).cloned()
+        };
+        let undone = |ops: &[Op]| {
+            let done = applied(&canvas, ops);
+            let inverse: Vec<Op> = ops.iter().rev().map(Op::inverse).collect();
+            assert_eq!(applied(&done, &inverse), canvas);
+            done
+        };
+        // The label: set, then blank removes it.
+        let ops = labelling(&canvas, "ab", "goes to");
+        assert!(
+            matches!(ops.as_slice(), [Op::Set { fields, .. }] if fields.len() == 1 && fields[0].key == "label")
+        );
+        let labelled = undone(&ops);
+        assert_eq!(field(&labelled, "label"), Some(Value::from("goes to")));
+        assert!(labelling(&canvas, "ab", "  ").is_empty(), "none to remove");
+        let cleared = applied(&labelled, &labelling(&labelled, "ab", " "));
+        assert_eq!(field(&cleared, "label"), None);
+        // The colour: a preset, then none.
+        let ops = coloring(&canvas, "ab", Some(4));
+        assert_eq!(ops.len(), 1);
+        let colored = undone(&ops);
+        assert_eq!(field(&colored, "color"), Some(Value::from("4")));
+        assert!(coloring(&canvas, "ab", None).is_empty());
+        let plain = applied(&colored, &coloring(&colored, "ab", None));
+        assert_eq!(field(&plain, "color"), None);
+        // The ends: by default an arrow where it goes to.
+        assert!(ending(&canvas, "ab", Ends::One).is_empty());
+        let both = undone(&ending(&canvas, "ab", Ends::Both));
+        assert_eq!(field(&both, "fromEnd"), Some(Value::from("arrow")));
+        assert_eq!(field(&both, "toEnd"), None, "an arrow already");
+        let none = undone(&ending(&canvas, "ab", Ends::Plain));
+        assert_eq!(field(&none, "fromEnd"), None, "none already");
+        assert_eq!(field(&none, "toEnd"), Some(Value::from("none")));
+        let back = applied(&none, &ending(&none, "ab", Ends::One));
+        assert_eq!(field(&back, "toEnd"), Some(Value::from("arrow")));
+        // Deleted, and given back where it was.
+        let ops: Vec<Op> = Op::delete_edge(&canvas, "ab").into_iter().collect();
+        assert!(matches!(ops.as_slice(), [Op::DeleteEdge { .. }]));
+        assert!(undone(&ops).edges().is_empty());
+        // An edge no longer there: nothing.
+        assert!(labelling(&canvas, "gone", "x").is_empty());
+        assert!(coloring(&canvas, "gone", Some(1)).is_empty());
+        assert!(ending(&canvas, "gone", Ends::Both).is_empty());
+    }
+
+    #[test]
+    fn edges_drawn_and_changed_are_written_and_undone_with_ctrl_z() {
+        let folder = std::env::temp_dir().join(format!("rature-view-edges-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&folder);
+        fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("a.canvas");
+        fs::write(&path, TWO).unwrap();
+        let on_disk = || Canvas::read(&fs::read_to_string(&path).unwrap());
+        let mut board = Board::open_with_locks(&path, folder.join("locks")).unwrap();
+        let op = linking(board.canvas(), "b", Side::Bottom, "c", Side::Right).unwrap();
+        let id = match &op {
+            Op::AddEdge { edge, .. } => edge.id().unwrap().to_string(),
+            other => panic!("{other:?}"),
+        };
+        board.edit(op);
+        write_now(&mut board).unwrap().unwrap();
+        let edge = find_edge(&on_disk(), &id).cloned().unwrap();
+        assert_eq!(edge.fields()["toSide"], "right");
+        // A label typed key by key: one operation, the edge's.
+        for text in ["n", "ne", "next"] {
+            for op in labelling(board.canvas(), &id, text) {
+                board.edit(op);
+            }
+        }
+        assert_eq!(board.pending().len(), 1);
+        assert!(label_waits(board.pending(), &id));
+        write_now(&mut board).unwrap().unwrap();
+        assert_eq!(find_edge(&on_disk(), &id).unwrap().label(), Some("next"));
+        // Undone: the label, then the edge itself.
+        assert!(board.undo());
+        write_now(&mut board).unwrap().unwrap();
+        assert_eq!(find_edge(&on_disk(), &id).unwrap().label(), None);
+        assert!(board.undo());
+        write_now(&mut board).unwrap().unwrap();
+        assert!(find_edge(&on_disk(), &id).is_none());
+        assert_eq!(on_disk(), Canvas::read(TWO));
         let _ = fs::remove_dir_all(&folder);
     }
 }
