@@ -295,7 +295,15 @@ impl Reader {
             follow_theme(&mut field, cx);
             field
         });
+        let focus = cx.focus_handle();
         let subscriptions = vec![
+            // Space let go where the page does not hear it: a canvas would pan at every drag.
+            cx.on_focus_out(&focus, window, |this, _, _, cx| this.let_go_of_space(cx)),
+            cx.observe_window_activation(window, |this, window, cx| {
+                if !window.is_window_active() {
+                    this.let_go_of_space(cx);
+                }
+            }),
             cx.subscribe_in(
                 &search_field,
                 window,
@@ -344,7 +352,7 @@ impl Reader {
             data_lines: Rc::default(),
             list: ListState::new(0, ListAlignment::Top, px(OVERDRAW)),
             rows: UniformListScrollHandle::new(),
-            focus: cx.focus_handle(),
+            focus,
             watch: None,
             back: Vec::new(),
             forward: Vec::new(),
@@ -365,6 +373,13 @@ impl Reader {
 
     pub fn focus_handle(&self) -> &FocusHandle {
         &self.focus
+    }
+
+    /// The keys went elsewhere: Space, if held on a canvas, is let go there.
+    fn let_go_of_space(&mut self, cx: &mut Context<Self>) {
+        if let Some(board) = &self.board {
+            board.update(cx, |board, cx| board.hold_space(false, cx));
+        }
     }
 
     pub fn set_tree(&mut self, tree: Option<(Side, bool)>, cx: &mut Context<Self>) {
