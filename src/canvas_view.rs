@@ -984,6 +984,19 @@ impl CanvasView {
         self.pan_by(f32::from(delta.x), f32::from(delta.y), cx);
     }
 
+    /// The pointer moved anywhere in the window: what a press holds goes with it, or is let go
+    /// when the button is no longer down, its release missed.
+    fn pointer_moved(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.panning.is_none() && self.edits.held.is_none() && self.edits.click.is_none() {
+            return;
+        }
+        if event.pressed_button == Some(MouseButton::Left) {
+            self.drag(event.position, cx);
+        } else {
+            self.release(cx);
+        }
+    }
+
     fn release(&mut self, cx: &mut Context<Self>) {
         self.release_held(cx);
         if self.panning.take().is_some() {
@@ -1336,6 +1349,8 @@ impl CanvasView {
         let label = self.label_line(camera, cx);
         let (at, shift) = (event.position, event.modifiers.shift);
         self.edits.click = None;
+        // What a press before still held is let go, never written by this one's release.
+        self.edits.held = None;
         let hovered = self.hovered_card.as_deref();
         if let Some((id, side)) = link_at(&self.file.cards, camera, hovered, x, y) {
             self.edits.held = Some(Held::Linking {
@@ -3822,7 +3837,7 @@ impl Render for CanvasView {
         let p = palette(cx);
         let config = cx.global::<Config>().clone();
         let this = cx.entity().downgrade();
-        let watch = this.clone();
+        let (watch, moved, released) = (this.clone(), this.clone(), this);
         // Where the board is: what the camera frames, and the cards it shows.
         let tracker = canvas(
             move |bounds, window, cx| {
@@ -3837,7 +3852,23 @@ impl Render for CanvasView {
                     });
                 }
             },
-            |_, _, _, _| {},
+            // A pan, or cards held, go on wherever the pointer goes, over the board or not.
+            // Listened to at every frame, whatever is held: gpui-fast does not draw between two
+            // events, and a tap's press and release come together.
+            move |_, _, window, _| {
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Bubble {
+                        moved
+                            .update(cx, |this, cx| this.pointer_moved(event, cx))
+                            .ok();
+                    }
+                });
+                window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Bubble && event.button == MouseButton::Left {
+                        released.update(cx, |this, cx| this.release(cx)).ok();
+                    }
+                });
+            },
         )
         .absolute()
         .size_full();
@@ -3932,32 +3963,6 @@ impl Render for CanvasView {
         board = board.children(self.selection(camera, &p));
         board = board.children(self.link_layer(camera, &p, cx));
         board = board.children(self.edge_tools(camera, &p, cx));
-        // A pan, or cards held, go on wherever the pointer goes, over the board or not.
-        if self.panning.is_some() || self.edits.held.is_some() {
-            board = board.child(
-                canvas(
-                    |_, _, _| (),
-                    move |_, (), window, _| {
-                        let moved = this.clone();
-                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
-                            if phase == DispatchPhase::Bubble {
-                                moved
-                                    .update(cx, |this, cx| this.drag(event.position, cx))
-                                    .ok();
-                            }
-                        });
-                        let released = this.clone();
-                        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
-                            if phase == DispatchPhase::Bubble && event.button == MouseButton::Left {
-                                released.update(cx, |this, cx| this.release(cx)).ok();
-                            }
-                        });
-                    },
-                )
-                .absolute()
-                .size_0(),
-            );
-        }
         if let Some(started) = started {
             let (count, total, built) = (shown.len(), self.file.cards.len(), started.elapsed());
             // Painted last: the frame's cost on the main thread, its layout included.

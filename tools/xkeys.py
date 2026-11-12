@@ -56,8 +56,6 @@ for chord in ["shift"] + sys.argv[1:]:
         move(*points[:2])
         time.sleep(0.1)
         button(number, True)
-        # As a hand does: the window draws a frame between the press and the release.
-        time.sleep(0.1)
         if kind == "drag":
             (x, y), (x2, y2) = points[:2], points[2:]
             for step in range(1, 11):
