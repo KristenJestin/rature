@@ -240,6 +240,9 @@ pub struct Reader {
     old: Option<Old>,
     /// How the canvas shown differs from its baseline, once compared.
     canvas_changes: Option<Arc<BoardChanges>>,
+    /// A comparison of the canvas came while its board was writing it: made again once the
+    /// write ends.
+    compare_held: bool,
     /// The reads of the file asked for, and the comparisons: only the latest result is shown.
     loads: Generation,
     compares: Generation,
@@ -338,6 +341,7 @@ impl Reader {
             before: None,
             old: None,
             canvas_changes: None,
+            compare_held: false,
             loads: Generation::default(),
             compares: Generation::default(),
             switching: false,
@@ -744,6 +748,17 @@ impl Reader {
     /// How the file shown differs from its baseline, now known. The first time a file is read,
     /// it is read: nothing changed yet.
     fn compared(&mut self, against: Against, cx: &mut Context<Self>) {
+        // The board's write renames over the file, which the watch tells of at once, before it
+        // marks itself read: compared meanwhile, the user's own change would show as changed
+        // until it does. What was shown stays until the write ends.
+        if matches!(against, Against::Canvas(_))
+            && let Some(board) = &self.board
+            && board.read(cx).writing()
+        {
+            self.compare_held = true;
+            return;
+        }
+        self.compare_held = false;
         self.before = None;
         self.canvas_changes = None;
         let switching = std::mem::take(&mut self.switching);
@@ -790,6 +805,14 @@ impl Reader {
         }
         self.relist(cx);
         cx.notify();
+    }
+
+    /// The board's write ended without writing the file (busy, not a canvas now, or not
+    /// writable): a comparison held while it ran is made now.
+    pub(crate) fn compare_held(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.compare_held) {
+            self.compare(cx);
+        }
     }
 
     fn changes(&self) -> Option<&Changes> {

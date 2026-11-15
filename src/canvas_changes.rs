@@ -6,8 +6,8 @@
 //! outline, a card or an edge deleted as its ghost in red, an edge's stroke in the colour of its
 //! change; a card that arrives while the canvas is shown rises into place.
 //!
-//! What Rature writes itself is marked read at once ([`mark_written`]): what stays marked is
-//! what others wrote.
+//! What Rature writes itself is marked read at once ([`mark_written`]), and the reader holds a
+//! comparison made while the board writes until it is: what stays marked is what others wrote.
 
 use std::collections::HashMap;
 use std::path::Path;

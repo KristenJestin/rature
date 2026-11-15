@@ -978,6 +978,12 @@ impl CanvasView {
         }
     }
 
+    /// Whether a write runs off the window's thread: the file may hold it already, and not yet
+    /// be marked read.
+    pub fn writing(&self) -> bool {
+        self.edits.writing
+    }
+
     pub fn camera(&self) -> Option<Camera> {
         self.camera
     }
@@ -2021,6 +2027,13 @@ impl CanvasView {
         };
         if saved.is_some() {
             self.edits.failed = false;
+        }
+        if !matches!(saved, Some(Saved::Done { .. })) {
+            // Nothing written: a comparison held while the write ran is right as it was made.
+            let reader = self.reader.clone();
+            cx.defer(move |cx| {
+                reader.update(cx, |reader, cx| reader.compare_held(cx)).ok();
+            });
         }
         match saved {
             Some(Saved::Done { report, .. }) => {
